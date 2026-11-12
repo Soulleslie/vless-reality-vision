@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "${1:-}" == --child ]]; then
     # shellcheck source=/dev/null
     source <(sed '$d' "$ROOT/install.sh")
+    SCRIPT_PATH="$ROOT/install.sh"
     TEST_DIR="$(mktemp -d)"
     trap 'rm -rf -- "$TEST_DIR"' EXIT
     CONFIG_DIR="$TEST_DIR/xray"
@@ -41,6 +42,10 @@ if [[ "${1:-}" == --child ]]; then
             return 1
         fi
     }
+    systemd-run() {
+        [[ " $* " == *' --wait '* && " $* " == *' --collect '* ]] || return 1
+        (tfo_apply "${@: -1}")
+    }
     interactive_menu
     exit 0
 fi
@@ -49,6 +54,6 @@ command -v script >/dev/null 2>&1 || { printf '缺少 script 命令\n' >&2; exit
 printf -v child_command 'bash %q --child' "$ROOT/tests/tfo_menu.bash"
 output="$(printf '17\ny\n\n00\n' | script -q -e -c "$child_command" /dev/null)"
 [[ "$output" == *'TCP Fast Open 已开启'* ]]
-[[ "$output" == *'如果当前 SSH 经过此节点，连接可能中断'* ]]
+[[ "$output" == *'如果 SSH 经过此节点，连接可能中断。后台任务会继续执行'* ]]
 [[ "$output" == *'17. 开关 TCP Fast Open'*'17. 开关 TCP Fast Open'* ]]
 printf 'TFO 菜单交互验证通过\n'

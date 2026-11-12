@@ -34,19 +34,19 @@ sysctl() {
     fi
 }
 
-tfo_node on >/dev/null
+tfo_apply on >/dev/null
 config_tfo_enabled
 kernel_tfo_server
 tfo_sysctl_is_ours
 [[ "$(kernel_tfo_value)" == 2 ]]
 [[ "$(tfo_sysctl_field original)" == 0 ]]
-tfo_node off >/dev/null
+tfo_apply off >/dev/null
 if config_tfo_enabled; then exit 1; fi
 [[ "$(kernel_tfo_value)" == 0 && ! -e "$TFO_SYSCTL" ]]
 
 # shellcheck disable=SC2329 # 由 tfo_node 间接调用。
 config_ok() { return 1; }
-if (tfo_node on >/dev/null 2>&1); then
+if (tfo_apply on >/dev/null 2>&1); then
     printf '配置验证失败时应回滚 TFO\n' >&2
     exit 1
 fi
@@ -55,23 +55,23 @@ if config_tfo_enabled; then exit 1; fi
 config_ok() { return 0; }
 
 printf '由其他程序创建\n' > "$TFO_SYSCTL"
-if (tfo_node on >/dev/null 2>&1); then
+if (tfo_apply on >/dev/null 2>&1); then
     printf '内核 TFO 未开启时不得覆盖其他程序的设置文件\n' >&2
     exit 1
 fi
 [[ "$(< "$TFO_SYSCTL")" == '由其他程序创建' ]]
 if config_tfo_enabled; then exit 1; fi
 printf '2' > "$KERNEL_STATE"
-tfo_node on >/dev/null 2>&1
+tfo_apply on >/dev/null 2>&1
 config_tfo_enabled
-tfo_node off >/dev/null
+tfo_apply off >/dev/null
 [[ "$(< "$TFO_SYSCTL")" == '由其他程序创建' && "$(kernel_tfo_value)" == 2 ]]
 rm -f -- "$TFO_SYSCTL"
 printf '0' > "$KERNEL_STATE"
 
-tfo_node on >/dev/null
+tfo_apply on >/dev/null
 sysctl -q -w net.ipv4.tcp_fastopen=3
-tfo_node off >/dev/null
+tfo_apply off >/dev/null
 [[ "$(kernel_tfo_value)" == 3 && ! -e "$TFO_SYSCTL" ]]
 if config_tfo_enabled; then exit 1; fi
 SNI=www.amazon.com

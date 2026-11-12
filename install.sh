@@ -5,7 +5,8 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.4.1'
+SCRIPT_VERSION='1.4.2'
+SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -870,25 +871,12 @@ commit_change() {
     fail '修改后的配置启动或链接保存失败，已恢复原配置。'
 }
 
-tfo_node() {
+tfo_apply() {
     need_root
-    [[ $# -le 1 ]] || fail "用法：$(cmd_name) tfo [on|off]"
+    [[ $# -eq 1 ]] || fail "用法：$(cmd_name) tfo [on|off]"
     load_metadata
     need_command sysctl
     local action="${1:-}" backup old_kernel was_active=0 changed=1 old_foreign=0 rollback_ok=1
-    if [[ -z "$action" ]]; then
-        if config_tfo_enabled && kernel_tfo_server; then
-            say 'TCP Fast Open：已开启'
-            [[ -t 0 ]] || return 0
-            confirm '是否关闭 TCP Fast Open？[y/N]：' || { say '未修改。'; return 0; }
-            action=off
-        else
-            say 'TCP Fast Open：未开启'
-            [[ -t 0 ]] || return 0
-            confirm '是否开启 TCP Fast Open？默认关闭 [y/N]：' || { say '未修改。'; return 0; }
-            action=on
-        fi
-    fi
     case "$action" in
         on)
             if config_tfo_enabled && kernel_tfo_server && tfo_sysctl_is_ours; then
@@ -939,6 +927,47 @@ tfo_node() {
     fi
     rm -rf -- "$backup"
     fail 'TFO 修改或验证失败，已恢复原配置。'
+}
+
+tfo_node() {
+    need_root
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) tfo [on|off]"
+    load_metadata
+    local action="${1:-}" script_path unit
+    if [[ -z "$action" ]]; then
+        if config_tfo_enabled && kernel_tfo_server; then
+            say 'TCP Fast Open：已开启'
+            [[ -t 0 ]] || return 0
+            confirm '是否关闭 TCP Fast Open？[y/N]：' || { say '未修改。'; return 0; }
+            action=off
+        else
+            say 'TCP Fast Open：未开启'
+            [[ -t 0 ]] || return 0
+            confirm '是否开启 TCP Fast Open？默认关闭 [y/N]：' || { say '未修改。'; return 0; }
+            action=on
+        fi
+    fi
+    case "$action" in on|off) ;; *) fail "用法：$(cmd_name) tfo [on|off]" ;; esac
+    need_command systemd-run
+    need_command readlink
+    script_path="$(readlink -f -- "$SCRIPT_PATH")" || fail '无法找到当前管理脚本。'
+    [[ -f "$script_path" && -r "$script_path" ]] || fail '当前管理脚本不是可读取的普通文件。'
+    unit='vless-reality-tfo'
+    warn '切换 TFO 将重启 Xray；如果 SSH 经过此节点，连接可能中断。后台任务会继续执行。'
+    say "后台任务：$unit；重连后可运行 $(cmd_name) status 查看结果。"
+    if systemd-run --quiet --wait --collect --unit="$unit" \
+        --property=SyslogIdentifier=vless-reality-tfo \
+        /bin/bash "$script_path" __tfo-apply "$action"; then
+        if [[ "$action" == on ]] && config_tfo_enabled && kernel_tfo_server; then
+            ok 'TCP Fast Open 已开启。'
+        elif [[ "$action" == off ]] && ! config_tfo_enabled && ! tfo_sysctl_is_ours; then
+            ok 'TCP Fast Open 已关闭。'
+        else
+            fail "后台任务已结束，但 TFO 状态未达到预期；请查看 journalctl -u $unit。"
+        fi
+    else
+        fail "TFO 后台任务失败；请查看 journalctl -u $unit。"
+    fi
 }
 
 change_port() {
@@ -1343,6 +1372,7 @@ main() {
         sni) shift; change_sni "$@" ;;
         sni-best) show_fastest_sni ;;
         tfo) shift; tfo_node "$@" ;;
+        __tfo-apply) shift; tfo_apply "$@" ;;
         uuid) change_uuid ;;
         rotate-keys) rotate_keys ;;
         rename) shift; rename_node "$@" ;;
