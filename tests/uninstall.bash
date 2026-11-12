@@ -45,6 +45,17 @@ XRAY_BIN="$TEST_DIR/xray"
 LINK_FILE="$TEST_DIR/link.txt"
 MANAGER="$TEST_DIR/manager.sh"
 SHORTCUT="$TEST_DIR/shortcut"
+TFO_SYSCTL="$TEST_DIR/tfo.conf"
+KERNEL_STATE="$TEST_DIR/kernel"
+sysctl() {
+    if [[ "$1" == -n ]]; then
+        cat "$KERNEL_STATE"
+    elif [[ "$1" == -q && "$2" == -w && "$3" == net.ipv4.tcp_fastopen=* ]]; then
+        printf '%s' "${3#*=}" > "$KERNEL_STATE"
+    else
+        return 1
+    fi
+}
 
 make_fixture() {
     mkdir -p "$CONFIG_DIR/.change-backup.abcdef"
@@ -55,6 +66,8 @@ make_fixture() {
     touch "$CONFIG_DIR/foreign-file"
     printf '%s\n' 'ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json' > "$SERVICE"
     printf '%s\n' "$SHORTCUT_TAG" > "$SHORTCUT"
+    printf '2' > "$KERNEL_STATE"
+    printf '%s\n# original=0\n# applied=2\nnet.ipv4.tcp_fastopen = 2\n' "$TFO_TAG" > "$TFO_SYSCTL"
 }
 
 make_fixture
@@ -64,6 +77,7 @@ if (uninstall_node >/dev/null 2>&1); then
     exit 1
 fi
 [[ -f "$SERVICE" && -f "$CONFIG" && -f "$MARKER" ]]
+[[ -f "$TFO_SYSCTL" && "$(kernel_tfo_value)" == 2 ]]
 
 stop_fails=0
 uninstall_node >/dev/null
@@ -72,6 +86,7 @@ uninstall_node >/dev/null
 [[ ! -e "${LINK_FILE}.abcdef" && ! -e "$TEST_DIR/.xray-update.abcdef" ]]
 [[ ! -e "$ORPHAN_DIR" ]]
 [[ ! -e "$SNI_ORPHAN_DIR" ]]
+[[ ! -e "$TFO_SYSCTL" && "$(kernel_tfo_value)" == 0 ]]
 [[ ! -e "$CONFIG_DIR/.change-backup.abcdef" && -f "$CONFIG_DIR/foreign-file" ]]
 (( account_present == 0 && group_present == 0 ))
 
@@ -116,4 +131,8 @@ rm -f -- "$CONFIG"
 [[ "$(menu_status)" == *'节点文件不完整'* ]]
 uninstall_node >/dev/null
 [[ ! -e "$MARKER" && ! -e "$MANAGER" && ! -e "$SHORTCUT" ]]
+printf '2' > "$KERNEL_STATE"
+printf '%s\n# original=0\n# applied=2\nnet.ipv4.tcp_fastopen = 2\n' "$TFO_TAG" > "$TFO_SYSCTL"
+uninstall_node >/dev/null
+[[ ! -e "$TFO_SYSCTL" && "$(kernel_tfo_value)" == 0 ]]
 printf '卸载路径验证通过\n'

@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.3.1'
+SCRIPT_VERSION='1.4.0'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -16,6 +16,8 @@ MANAGER='/root/vless-reality-setup.sh'
 SHORTCUT='/usr/local/bin/vless-reality'
 SHORTCUT_TAG='# vless-reality-setup shortcut'
 LINK_FILE='/root/vless-reality-link.txt'
+TFO_SYSCTL='/etc/sysctl.d/99-vless-reality-tfo.conf'
+TFO_TAG='# vless-reality-setup: TCP Fast Open'
 TEMP_DIR=''
 TEMP_BIN=''
 RELEASE_VERSION=''
@@ -30,6 +32,7 @@ SHORT_ID=''
 INSTALL_STARTED=0
 INSTALL_COMMITTED=0
 MANAGER_COPIED=0
+TFO_ENABLED=0
 SNI_CANDIDATES=(
     www.amazon.com www.samsung.com www.nvidia.com
     digitalassets.tesla.com electronics.sony.com www.xbox.com amd.com
@@ -141,6 +144,7 @@ ensure_dependencies() {
     command -v unzip >/dev/null 2>&1 || packages+=(unzip)
     command -v openssl >/dev/null 2>&1 || packages+=(openssl)
     command -v ss >/dev/null 2>&1 || packages+=(iproute2)
+    command -v sysctl >/dev/null 2>&1 || packages+=(procps)
     if ! dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'install ok installed'; then
         packages+=(ca-certificates)
     fi
@@ -149,9 +153,73 @@ ensure_dependencies() {
         apt-get update
         apt-get install -y "${packages[@]}"
     fi
-    for command_name in curl jq unzip openssl ss awk sed sort tr date systemctl sha256sum getent install timeout dpkg; do
+    for command_name in curl jq unzip openssl ss awk sed sort tr date systemctl sysctl sha256sum getent install timeout dpkg; do
         need_command "$command_name"
     done
+}
+
+config_tfo_enabled() {
+    [[ "$(jq -r '[.inbounds[] | select(.protocol == "vless") | .streamSettings.sockopt.tcpFastOpen][0] // false' "$CONFIG" 2>/dev/null)" == true ]]
+}
+kernel_tfo_value() {
+    local value
+    value="$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || cat /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null)" || return 1
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$value"
+}
+kernel_tfo_server() {
+    local value
+    value="$(kernel_tfo_value)" || return 1
+    (( (value & 2) != 0 ))
+}
+tfo_sysctl_is_ours() {
+    [[ -f "$TFO_SYSCTL" && ! -L "$TFO_SYSCTL" ]] \
+        && [[ "$(sed -n '1p' "$TFO_SYSCTL")" == "$TFO_TAG" ]]
+}
+tfo_sysctl_field() {
+    local value
+    value="$(sed -n "s/^# ${1}=\\([0-9]*\\)$/\\1/p" "$TFO_SYSCTL")" || return 1
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$value"
+}
+enable_kernel_tfo() {
+    local current original applied tmp
+    current="$(kernel_tfo_value)" || return 1
+    if tfo_sysctl_is_ours; then
+        original="$(tfo_sysctl_field original)" || return 1
+    elif [[ -e "$TFO_SYSCTL" || -L "$TFO_SYSCTL" ]]; then
+        if (( (current & 2) != 0 )); then
+            warn '内核 TFO 已由其他设置开启；沿用当前内核设置，不修改已有 sysctl 文件。' >&2
+            return 0
+        fi
+        warn "$TFO_SYSCTL 已存在且不属于本脚本，未修改。" >&2
+        return 1
+    else
+        original="$current"
+    fi
+    applied=$((current | 2))
+    tmp="$(mktemp "${TFO_SYSCTL}.XXXXXX")" || return 1
+    if ! printf '%s\n# original=%s\n# applied=%s\nnet.ipv4.tcp_fastopen = %s\n' \
+        "$TFO_TAG" "$original" "$applied" "$applied" > "$tmp" \
+        || ! chmod 644 "$tmp" || ! mv -f -- "$tmp" "$TFO_SYSCTL"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    sysctl -q -w "net.ipv4.tcp_fastopen=$applied" >/dev/null || return 1
+    kernel_tfo_server
+}
+disable_kernel_tfo() {
+    local original applied current
+    tfo_sysctl_is_ours || return 0
+    original="$(tfo_sysctl_field original)" || return 1
+    applied="$(tfo_sysctl_field applied)" || return 1
+    current="$(kernel_tfo_value)" || return 1
+    if (( current == applied && current != original )); then
+        sysctl -q -w "net.ipv4.tcp_fastopen=$original" >/dev/null || return 1
+    elif (( current != applied )); then
+        warn '内核 TFO 值已被其他程序修改；保留当前值，只移除本脚本的持久化设置。' >&2
+    fi
+    rm -f -- "$TFO_SYSCTL"
 }
 
 arch_asset() {
@@ -417,6 +485,7 @@ purge_node_files() {
     if systemctl is-enabled --quiet xray; then
         systemctl disable xray >/dev/null 2>&1 || return 1
     fi
+    disable_kernel_tfo || return 1
     rm -f -- "$SERVICE" || return 1
     systemctl daemon-reload >/dev/null 2>&1 || return 1
     rm -f -- "$XRAY_BIN" "$LINK_FILE" || return 1
@@ -434,11 +503,11 @@ clean_config_residue() (
         unknown=0
         for entry in "$backup"/*; do
             case "${entry##*/}" in
-                config.json|.vless-reality-owned) ;;
+                config.json|.vless-reality-owned|tfo.sysctl) ;;
                 *) unknown=1 ;;
             esac
         done
-        rm -f -- "$backup/config.json" "$backup/.vless-reality-owned" || return 1
+        rm -f -- "$backup/config.json" "$backup/.vless-reality-owned" "$backup/tfo.sysctl" || return 1
         if (( unknown )); then
             warn "保留含有其他文件的备份目录：$backup" >&2
         else
@@ -465,6 +534,13 @@ clean_runtime_residue() (
             warn "临时文件不属于当前用户，已保留：$entry" >&2
             continue
         fi
+        rm -f -- "$entry" || return 1
+    done
+    for entry in "${TFO_SYSCTL}".??????; do
+        [[ -f "$entry" && ! -L "$entry" ]] || continue
+        [[ "$(sed -n '1p' "$entry")" == "$TFO_TAG" ]] || continue
+        owner="$(stat -c %u -- "$entry")" || return 1
+        [[ "$owner" == "$EUID" ]] || continue
         rm -f -- "$entry" || return 1
     done
     for dir in /tmp/vless-reality-install.?????? /tmp/vless-reality-update.?????? /tmp/vless-reality-sni.??????; do
@@ -515,7 +591,7 @@ write_config() {
     local uuid="$1" private_key="$2"
     jq -n \
         --arg uuid "$uuid" --arg privateKey "$private_key" --arg shortId "$SHORT_ID" \
-        --arg sni "$SNI" --argjson port "$PORT" '
+        --arg sni "$SNI" --argjson port "$PORT" --argjson tfo "$TFO_ENABLED" '
         {
           log: {loglevel: "warning"},
           inbounds: [{
@@ -529,6 +605,7 @@ write_config() {
             streamSettings: {
               network: "tcp",
               security: "reality",
+              sockopt: {tcpFastOpen: ($tfo == 1)},
               realitySettings: {
                 show: false,
                 target: ($sni + ":443"),
@@ -548,13 +625,13 @@ write_config() {
 
 install_node() {
     need_root
-    [[ $# -le 3 ]] || fail "用法：$(cmd_name) install [端口] [伪装域名] [节点名称]"
+    [[ $# -le 4 ]] || fail "用法：$(cmd_name) install [端口] [伪装域名] [节点名称] [on|off]"
     [[ -r /etc/os-release ]] || fail '无法识别系统。'
     # shellcheck source=/dev/null
     . /etc/os-release
     [[ "${ID:-}" == debian || "${ID:-}" == ubuntu ]] || fail '这个脚本仅支持 Debian 和 Ubuntu。'
     check_install_eligibility
-    local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0
+    local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0 tfo_choice="${4:-off}"
     default_name="Reality-$(hostname -s)"
 
     if [[ -z "$raw_port" ]]; then
@@ -591,12 +668,22 @@ install_node() {
     valid_node_name "$NODE_NAME" || fail '节点名称不能为空、不能超过 64 个字符或包含换行。'
 
     if (( interactive )); then
+        if confirm '是否开启 TCP Fast Open？默认关闭 [y/N]：'; then tfo_choice=on; fi
+    fi
+    case "$tfo_choice" in
+        on) TFO_ENABLED=1 ;;
+        off) TFO_ENABLED=0 ;;
+        *) fail 'TFO 参数必须为 on 或 off。' ;;
+    esac
+
+    if (( interactive )); then
         say
         step '—————————— 确认安装信息 ——————————'
         say "  协议：VLESS + REALITY + Vision"
         say "  端口：TCP $PORT"
         if (( auto_sni )); then say "  SNI： $SNI:443（自动优选）"; else say "  SNI： $SNI:443"; fi
         say "  名称：$NODE_NAME"
+        if (( TFO_ENABLED )); then say '  TFO： 开启'; else say '  TFO： 关闭'; fi
         warn "  请确认云安全组已放行 TCP ${PORT}，无需开放 TCP 80"
         step '————————————————————————————————'
         confirm '开始安装？[y/N]：' || { say '已取消安装。'; return 0; }
@@ -642,6 +729,9 @@ install_node() {
     SHORT_ID="$(openssl rand -hex 8)"
     write_config "$uuid" "$private_key"
     write_marker
+    if (( TFO_ENABLED )); then
+        enable_kernel_tfo || fail '开启内核 TCP Fast Open 失败；安装将回滚。'
+    fi
     config_ok || fail 'Xray 配置校验失败。'
 
     cat > "$SERVICE" <<'EOF'
@@ -728,6 +818,13 @@ status_node() {
         warn "公网 IPv4 已变化：当前 $current_ip，链接中仍为 $SERVER_IP；请运行 $(cmd_name) refresh-ip。"
     fi
     if target_tls_ok "$SNI"; then ok '伪装站点：TLS 1.3 正常'; else warn '伪装站点：当前验证失败'; fi
+    if config_tfo_enabled && kernel_tfo_server; then
+        ok 'TCP Fast Open：已开启（Xray 与内核均生效）'
+    elif config_tfo_enabled || tfo_sysctl_is_ours; then
+        warn "TCP Fast Open：设置不一致，可运行 $(cmd_name) tfo on 修复或 tfo off 关闭。"
+    else
+        say 'TCP Fast Open：未开启'
+    fi
 }
 
 backup_state() {
@@ -742,6 +839,19 @@ restore_state() {
         systemctl restart xray >/dev/null 2>&1 && wait_service 10 || return 1
     fi
     return 0
+}
+restore_tfo_snapshot() {
+    local backup="$1" old_kernel="$2" old_foreign="$3"
+    if [[ -f "$backup/tfo.sysctl" ]]; then
+        cp -a -- "$backup/tfo.sysctl" "$TFO_SYSCTL" || return 1
+    elif (( old_foreign )); then
+        :
+    elif tfo_sysctl_is_ours; then
+        rm -f -- "$TFO_SYSCTL" || return 1
+    elif [[ -e "$TFO_SYSCTL" || -L "$TFO_SYSCTL" ]]; then
+        return 1
+    fi
+    sysctl -q -w "net.ipv4.tcp_fastopen=$old_kernel" >/dev/null
 }
 commit_change() {
     local backup="$1" old_port="$2" description="$3" was_active="$4"
@@ -758,6 +868,74 @@ commit_change() {
     fi
     rm -rf -- "$backup"
     fail '修改后的配置启动或链接保存失败，已恢复原配置。'
+}
+
+tfo_node() {
+    need_root
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) tfo [on|off]"
+    load_metadata
+    need_command sysctl
+    local action="${1:-}" backup old_kernel was_active=0 changed=1 old_foreign=0 rollback_ok=1
+    if [[ -z "$action" ]]; then
+        if config_tfo_enabled && kernel_tfo_server; then
+            say 'TCP Fast Open：已开启'
+            [[ -t 0 ]] || return 0
+            confirm '是否关闭 TCP Fast Open？[y/N]：' || { say '未修改。'; return 0; }
+            action=off
+        else
+            say 'TCP Fast Open：未开启'
+            [[ -t 0 ]] || return 0
+            confirm '是否开启 TCP Fast Open？默认关闭 [y/N]：' || { say '未修改。'; return 0; }
+            action=on
+        fi
+    fi
+    case "$action" in
+        on)
+            if config_tfo_enabled && kernel_tfo_server && tfo_sysctl_is_ours; then
+                ok 'TCP Fast Open 已开启。'
+                return 0
+            fi
+            ;;
+        off)
+            if ! config_tfo_enabled && ! tfo_sysctl_is_ours; then ok 'TCP Fast Open 已关闭。'; return 0; fi
+            ;;
+        *) fail "用法：$(cmd_name) tfo [on|off]" ;;
+    esac
+    old_kernel="$(kernel_tfo_value)" || fail '无法读取内核 TCP Fast Open 参数。'
+    if [[ -e "$TFO_SYSCTL" || -L "$TFO_SYSCTL" ]] && ! tfo_sysctl_is_ours; then old_foreign=1; fi
+    backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")" || fail '无法创建配置备份。'
+    backup_state "$backup" || fail "备份节点配置失败，备份保留在 $backup。"
+    if tfo_sysctl_is_ours; then
+        cp -a -- "$TFO_SYSCTL" "$backup/tfo.sysctl" || fail "备份 TFO 设置失败，备份保留在 $backup。"
+    fi
+    if systemctl is-active --quiet xray; then was_active=1; fi
+    if [[ "$action" == on ]]; then
+        enable_kernel_tfo || changed=0
+        if (( changed )); then
+            edit_config '(.inbounds[] | select(.protocol == "vless") | .streamSettings.sockopt.tcpFastOpen) = true' || changed=0
+        fi
+    else
+        edit_config '(.inbounds[] | select(.protocol == "vless") | .streamSettings.sockopt.tcpFastOpen) = false' || changed=0
+        if (( changed )); then disable_kernel_tfo || changed=0; fi
+    fi
+    if (( changed )) && config_ok \
+        && { (( was_active == 0 )) || { systemctl restart xray && wait_service 10; }; }; then
+        rm -rf -- "$backup"
+        if [[ "$action" == on ]]; then
+            ok "TCP Fast Open 已开启（内核值 $(kernel_tfo_value)）。"
+        else
+            ok 'TCP Fast Open 已关闭；本脚本修改的内核设置已恢复。'
+        fi
+        say '客户端若支持 TFO，还需要在客户端单独开启。'
+        return 0
+    fi
+    restore_tfo_snapshot "$backup" "$old_kernel" "$old_foreign" || rollback_ok=0
+    restore_state "$backup" "$was_active" || rollback_ok=0
+    if (( rollback_ok == 0 )); then
+        fail "TFO 修改失败且回滚未完成，备份保留在 $backup；请检查 Xray 服务和内核参数。"
+    fi
+    rm -rf -- "$backup"
+    fail 'TFO 修改或验证失败，已恢复原配置。'
 }
 
 change_port() {
@@ -991,12 +1169,16 @@ uninstall_node() {
         if [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]]; then
             shortcut_is_ours || fail '快捷命令不属于本脚本，未删除。'
         fi
-        [[ -e "$MANAGER" || -e "$SHORTCUT" ]] || fail '没有发现本脚本的残留管理入口。'
-        confirm '节点记录已不存在，只清理残留的管理脚本和快捷命令？[y/N]：' \
+        if [[ ! -e "$MANAGER" && ! -e "$SHORTCUT" ]] && ! tfo_sysctl_is_ours; then
+            fail '没有发现本脚本的残留文件。'
+        fi
+        confirm '节点记录已不存在，清理本脚本的残留管理入口和 TFO 设置？[y/N]：' \
             || { say '已取消清理。'; return 0; }
+        disable_kernel_tfo || fail '清理残留 TFO 设置失败。'
+        clean_runtime_residue || fail '清理临时文件失败。'
         if shortcut_is_ours; then rm -f -- "$SHORTCUT" || fail '删除快捷命令失败。'; fi
         if [[ -f "$MANAGER" ]]; then rm -f -- "$MANAGER" || fail '删除管理脚本失败。'; fi
-        ok '残留的管理入口已清理。'
+        ok '本脚本的残留文件已清理。'
         return 0
     fi
     [[ -f "$MARKER" && ! -L "$MARKER" ]] || fail '安装记录异常，已停止以保护现有服务。'
@@ -1013,6 +1195,7 @@ uninstall_node() {
         fail '发现运行中的 xray 服务，但本脚本的服务文件已不存在；未继续删除。'
     fi
     systemctl is-active --quiet xray && fail 'Xray 仍在运行，未继续删除文件。'
+    disable_kernel_tfo || fail '恢复内核 TCP Fast Open 设置失败；保留节点文件以便重试。'
     rm -f -- "$SERVICE" || fail '删除 systemd 服务文件失败。'
     systemctl daemon-reload || fail '刷新 systemd 失败；保留安装记录以便重试。'
     rm -f -- "$XRAY_BIN" "$LINK_FILE" || fail '删除 Xray 程序或节点链接失败。'
@@ -1029,6 +1212,7 @@ uninstall_node() {
     rm -f -- "$MANAGER" || fail '删除管理脚本失败。'
     [[ ! -e "$XRAY_BIN" && ! -e "$SERVICE" && ! -e "$CONFIG" \
         && ! -e "$LINK_FILE" ]] || fail '卸载后仍发现节点文件，请手动检查。'
+    tfo_sysctl_is_ours && fail '卸载后仍发现本脚本的 TFO 设置。'
     if getent passwd xray >/dev/null 2>&1 || getent group xray >/dev/null 2>&1 \
         || systemctl is-active --quiet xray; then
         fail '卸载后仍发现 xray 服务或专用账号，请手动检查。'
@@ -1046,12 +1230,13 @@ print_help() {
     cat <<EOF
 VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
 用法：${cmd} [命令]
-  install [端口] [SNI] [名称]  安装节点
+  install [端口] [SNI] [名称] [on|off]  安装节点（TFO 默认 off）
   show                         显示 vless:// 导入链接
   status                       查看服务、配置、端口和伪装站点状态
   port [新端口]                修改端口
   sni [新域名|auto]            修改或自动优选 REALITY 伪装域名
   sni-best                     查看当前测速延迟最低的域名，不修改节点
+  tfo [on|off]                 查看或切换 TCP Fast Open
   uuid                         重新生成 UUID
   rotate-keys                  轮换 REALITY 密钥和 Short ID
   rename [新名称]              修改节点名称
@@ -1105,6 +1290,7 @@ show_menu() {
     say ' 14. 查看运行状态'
     say ' 15. 查看运行日志'
     say ' 16. 查看当前测速延迟最低的域名'
+    say ' 17. 开关 TCP Fast Open'
     say ' 00. 退出'
     say '=================================='
     menu_status
@@ -1118,7 +1304,8 @@ menu_action() {
         9) warn '操作后旧链接立即失效。'; change_uuid ;;
         10) warn '操作后旧链接立即失效。'; rotate_keys ;;
         11) rename_node ;; 12) refresh_ip ;; 13) show_node ;;
-        14) status_node ;; 15) log_node ;; 16) show_fastest_sni ;; *) return 2 ;;
+        14) status_node ;; 15) log_node ;; 16) show_fastest_sni ;;
+        17) tfo_node ;; *) return 2 ;;
     esac
 }
 interactive_menu() {
@@ -1128,8 +1315,8 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-16，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-6]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-17，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-7]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
@@ -1152,6 +1339,7 @@ main() {
         port) shift; change_port "$@" ;;
         sni) shift; change_sni "$@" ;;
         sni-best) show_fastest_sni ;;
+        tfo) shift; tfo_node "$@" ;;
         uuid) change_uuid ;;
         rotate-keys) rotate_keys ;;
         rename) shift; rename_node "$@" ;;
@@ -1162,7 +1350,7 @@ main() {
         log|logs) shift; log_node "$@" ;;
         update) update_xray ;;
         uninstall) uninstall_node ;;
-        [1-9]|1[0-6]) need_root; menu_action "$1" ;;
+        [1-9]|1[0-7]) need_root; menu_action "$1" ;;
         *) print_help; exit 2 ;;
     esac
 }
