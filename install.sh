@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.0.5'
+SCRIPT_VERSION='1.0.6'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -57,27 +57,32 @@ valid_node_name() {
 }
 port_free() {
     local listeners
-    listeners="$(ss -H -ltn "sport = :$1")" || fail "无法检查本机 TCP ${1}。"
-    [[ -z "$listeners" ]]
-}
-random_port() {
-    local attempt n p
-    for ((attempt = 0; attempt < 50; attempt++)); do
-        n="$(od -An -N2 -tu2 /dev/urandom | tr -d '[:space:]')"
-        p=$((20000 + n % 40001))
-        if ! command -v ss >/dev/null 2>&1 || port_free "$p"; then
-            printf '%s' "$p"
-            return 0
-        fi
-    done
-    return 1
-}
-default_port() {
-    if ! command -v ss >/dev/null 2>&1 || port_free 443; then
-        printf '443'
+    if command -v ss >/dev/null 2>&1; then
+        listeners="$(ss -H -ltn "sport = :$1")" || fail "无法检查本机 TCP ${1}。"
+        [[ -z "$listeners" ]]
     else
-        random_port
+        [[ -r /proc/net/tcp && -r /proc/net/tcp6 ]] || fail '无法检查本机 TCP 端口。'
+        awk -v port="$(printf '%04X' "$1")" \
+            '$4 == "0A" && $2 ~ (":" port "$") { occupied = 1 } END { exit occupied }' \
+            /proc/net/tcp /proc/net/tcp6
     fi
+}
+choose_port() {
+    local raw
+    while true; do
+        read -r -p '请输入节点 TCP 端口（直接回车使用 443）：' raw || fail '已取消输入。'
+        [[ -n "$raw" ]] || raw=443
+        if ! valid_port "$raw"; then
+            warn '端口无效，请输入 1–65535 的数字。' >&2
+            continue
+        fi
+        if ! port_free "$((10#$raw))"; then
+            warn "本机 TCP $((10#$raw)) 已被占用，请输入其他端口（例如 8443）。" >&2
+            continue
+        fi
+        PORT="$((10#$raw))"
+        return 0
+    done
 }
 public_ipv4() {
     local url ip
@@ -119,7 +124,7 @@ ensure_dependencies() {
         apt-get update
         apt-get install -y "${packages[@]}"
     fi
-    for command_name in curl jq unzip openssl ss awk sed od tr systemctl sha256sum getent install timeout dpkg; do
+    for command_name in curl jq unzip openssl ss awk sed tr systemctl sha256sum getent install timeout dpkg; do
         need_command "$command_name"
     done
 }
@@ -428,19 +433,14 @@ install_node() {
     need_root
     [[ $# -le 3 ]] || fail "用法：$(cmd_name) install [端口] [伪装域名] [节点名称]"
     check_install_eligibility
-    local interactive=0 raw_port="${1:-}" answer default_name default_selected
+    local interactive=0 raw_port="${1:-}" answer default_name
     default_name="Reality-$(hostname -s)"
 
     if [[ -z "$raw_port" ]]; then
         [[ -t 0 ]] || fail '非交互运行时，请指定端口、伪装域名和节点名称。'
         interactive=1
-        default_selected="$(default_port)" || fail '无法选择可用端口。'
-        while true; do
-            read -r -p "请输入节点 TCP 端口（直接回车使用 ${default_selected}）：" raw_port || fail '已取消输入。'
-            [[ -n "$raw_port" ]] || raw_port="$default_selected"
-            if valid_port "$raw_port" && (! command -v ss >/dev/null 2>&1 || port_free "$((10#$raw_port))"); then break; fi
-            warn '端口无效或已被占用，请换一个端口。' >&2
-        done
+        choose_port
+        raw_port="$PORT"
     fi
     valid_port "$raw_port" || fail '端口必须是 1–65535 的数字。'
     PORT="$((10#$raw_port))"
