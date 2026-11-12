@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.0.3'
+SCRIPT_VERSION='1.0.4'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -733,6 +733,11 @@ update_xray() {
     fetch_release_metadata latest "$asset"
     if [[ "$current" == "$RELEASE_VERSION" ]]; then
         ok "当前已是官方最新稳定版：$current"
+        return 0
+    fi
+    if [[ "$current" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] \
+        && dpkg --compare-versions "$current" gt "$RELEASE_VERSION"; then
+        warn "当前版本 $current 高于官方最新稳定版 ${RELEASE_VERSION}，未执行降级。"
         return 0
     fi
     say "准备从 ${current:-未知} 升级到 ${RELEASE_VERSION}…"
