@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.3.0'
+SCRIPT_VERSION='1.3.1'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -549,6 +549,10 @@ write_config() {
 install_node() {
     need_root
     [[ $# -le 3 ]] || fail "用法：$(cmd_name) install [端口] [伪装域名] [节点名称]"
+    [[ -r /etc/os-release ]] || fail '无法识别系统。'
+    # shellcheck source=/dev/null
+    . /etc/os-release
+    [[ "${ID:-}" == debian || "${ID:-}" == ubuntu ]] || fail '这个脚本仅支持 Debian 和 Ubuntu。'
     check_install_eligibility
     local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0
     default_name="Reality-$(hostname -s)"
@@ -561,6 +565,7 @@ install_node() {
     fi
     valid_port "$raw_port" || fail '端口必须是 1–65535 的数字。'
     PORT="$((10#$raw_port))"
+    port_free "$PORT" || fail "本机 TCP $PORT 已被占用。"
 
     SNI="${2:-}"
     if [[ -z "$SNI" ]]; then
@@ -572,6 +577,8 @@ install_node() {
     SNI="${SNI,,}"
     if [[ "$SNI" == auto ]]; then
         auto_sni=1
+        ensure_dependencies
+        select_fastest_sni || fail '候选域名均不可用，请手动指定可从 VPS 访问的伪装域名。'
     else
         valid_host "$SNI" || fail '伪装域名格式不正确；只填域名，不要带 https://、端口或路径。'
     fi
@@ -588,7 +595,7 @@ install_node() {
         step '—————————— 确认安装信息 ——————————'
         say "  协议：VLESS + REALITY + Vision"
         say "  端口：TCP $PORT"
-        if (( auto_sni )); then say '  SNI： 自动优选'; else say "  SNI： $SNI:443"; fi
+        if (( auto_sni )); then say "  SNI： $SNI:443（自动优选）"; else say "  SNI： $SNI:443"; fi
         say "  名称：$NODE_NAME"
         warn "  请确认云安全组已放行 TCP ${PORT}，无需开放 TCP 80"
         step '————————————————————————————————'
@@ -596,21 +603,12 @@ install_node() {
     fi
 
     step '[1/5] 检查系统和安装环境…'
-    [[ -r /etc/os-release ]] || fail '无法识别系统。'
-    # shellcheck source=/dev/null
-    . /etc/os-release
-    [[ "${ID:-}" == debian || "${ID:-}" == ubuntu ]] || fail '这个脚本仅支持 Debian 和 Ubuntu。'
     ensure_dependencies
     check_install_eligibility
     port_free "$PORT" || fail "本机 TCP $PORT 已被占用。"
     SERVER_IP="$(public_ipv4)" || fail '无法查询此 VPS 的公网 IPv4。'
     step '[2/5] 验证 REALITY 伪装站点…'
-    if (( auto_sni )); then
-        select_fastest_sni || fail '候选域名均不可用，请手动指定可从 VPS 访问的伪装域名。'
-    fi
-    if (( ! auto_sni )); then
-        target_tls_ok "$SNI" || fail "$SNI:443 未通过 TLS 1.3 与证书校验，请更换可从本机访问的伪装域名。"
-    fi
+    target_tls_ok "$SNI" || fail "$SNI:443 未通过 TLS 1.3 与证书校验，请更换可从本机访问的伪装域名。"
     ok "伪装站点可用：$SNI:443（TLS 1.3）"
 
     trap finish_install EXIT
