@@ -301,6 +301,31 @@ purge_node_files() {
     if getent passwd xray >/dev/null 2>&1; then userdel xray >/dev/null 2>&1 || true; fi
     if getent group xray >/dev/null 2>&1; then groupdel xray >/dev/null 2>&1 || true; fi
 }
+# 卸载时只处理脚本创建的文件；目录里新增的其他内容留给管理员。
+clean_config_residue() (
+    local backup entry unknown
+    shopt -s nullglob dotglob
+    for backup in "$CONFIG_DIR"/.change-backup.??????; do
+        [[ -d "$backup" && ! -L "$backup" ]] || continue
+        unknown=0
+        for entry in "$backup"/*; do
+            case "${entry##*/}" in
+                config.json|.vless-reality-owned) ;;
+                *) unknown=1 ;;
+            esac
+        done
+        rm -f -- "$backup/config.json" "$backup/.vless-reality-owned" || return 1
+        if (( unknown )); then
+            warn "保留含有其他文件的备份目录：$backup" >&2
+        else
+            rmdir -- "$backup" || return 1
+        fi
+    done
+    for entry in "$CONFIG_DIR"/.config.json.??????; do
+        [[ -f "$entry" && ! -L "$entry" ]] || continue
+        rm -f -- "$entry" || return 1
+    done
+)
 finish_install() {
     local result=$?
     trap - EXIT
@@ -715,12 +740,44 @@ log_node() {
 
 uninstall_node() {
     need_root
-    [[ -f "$MARKER" ]] || fail '未发现本脚本安装的节点，已停止以保护现有服务。'
+    [[ -f "$MARKER" && ! -L "$MARKER" ]] || fail '未发现本脚本安装的节点，已停止以保护现有服务。'
     confirm '确定卸载节点并清理本脚本创建的全部文件？[y/N]：' || { say '已取消卸载。'; return 0; }
-    purge_node_files
-    shortcut_is_ours && rm -f -- "$SHORTCUT"
-    rm -f -- "$MANAGER"
-    ok '卸载完成。云安全组规则和客户端中的旧节点需要自行删除。'
+    if [[ -e "$SERVICE" ]]; then
+        [[ -f "$SERVICE" && ! -L "$SERVICE" ]] || fail '服务文件不是普通文件，已停止以保护现有服务。'
+        grep -qFx 'ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json' "$SERVICE" \
+            || fail '服务文件已被其他程序修改，已停止以保护现有服务。'
+        systemctl stop xray || fail '停止 Xray 失败；未继续删除文件，请检查 systemctl status xray。'
+        if systemctl is-enabled --quiet xray; then
+            systemctl disable xray || fail '禁用 Xray 开机启动失败；未继续删除文件。'
+        fi
+    elif systemctl is-active --quiet xray; then
+        fail '发现运行中的 xray 服务，但本脚本的服务文件已不存在；未继续删除。'
+    fi
+    systemctl is-active --quiet xray && fail 'Xray 仍在运行，未继续删除文件。'
+    rm -f -- "$SERVICE" || fail '删除 systemd 服务文件失败。'
+    systemctl daemon-reload || fail '刷新 systemd 失败；保留安装记录以便重试。'
+    rm -f -- "$XRAY_BIN" "$LINK_FILE" || fail '删除 Xray 程序或节点链接失败。'
+    rm -f -- "$CONFIG" || fail '删除节点配置失败。'
+    clean_config_residue || fail '清理配置备份失败；保留安装记录以便重试。'
+    if getent passwd xray >/dev/null 2>&1; then
+        userdel xray || fail '删除 xray 用户失败；保留安装记录以便重试。'
+    fi
+    if getent group xray >/dev/null 2>&1; then
+        groupdel xray || fail '删除 xray 用户组失败；保留安装记录以便重试。'
+    fi
+    rm -f -- "$MARKER" || fail '删除安装记录失败。'
+    if ! rmdir -- "$CONFIG_DIR" 2>/dev/null; then
+        warn "$CONFIG_DIR 中还有其他文件，已保留该目录及其中内容。"
+    fi
+    if shortcut_is_ours; then rm -f -- "$SHORTCUT" || fail '删除快捷命令失败。'; fi
+    rm -f -- "$MANAGER" || fail '删除管理脚本失败。'
+    [[ ! -e "$XRAY_BIN" && ! -e "$SERVICE" && ! -e "$CONFIG" && ! -e "$MARKER" \
+        && ! -e "$LINK_FILE" ]] || fail '卸载后仍发现节点文件，请手动检查。'
+    if getent passwd xray >/dev/null 2>&1 || getent group xray >/dev/null 2>&1 \
+        || systemctl is-active --quiet xray; then
+        fail '卸载后仍发现 xray 服务或专用账号，请手动检查。'
+    fi
+    ok '节点和本脚本创建的文件已清理。云安全组规则、客户端节点、基础工具和系统日志未改动。'
 }
 
 print_help() {
