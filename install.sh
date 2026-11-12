@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.0.0'
+SCRIPT_VERSION='1.0.1'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -288,8 +288,13 @@ check_install_eligibility() {
         fail '检测到已有 xray.service；本脚本不会覆盖现有服务。'
     fi
     [[ ! -e "$LINK_FILE" ]] || fail "$LINK_FILE 已存在；为避免覆盖，已停止。"
-    getent passwd xray >/dev/null 2>&1 && fail '系统中已存在 xray 用户；为避免误用或卸载时误删，已停止。'
-    getent group xray >/dev/null 2>&1 && fail '系统中已存在 xray 用户组；为避免误用或卸载时误删，已停止。'
+    if getent passwd xray >/dev/null 2>&1; then
+        fail '系统中已存在 xray 用户；为避免误用或卸载时误删，已停止。'
+    fi
+    if getent group xray >/dev/null 2>&1; then
+        fail '系统中已存在 xray 用户组；为避免误用或卸载时误删，已停止。'
+    fi
+    return 0
 }
 
 purge_node_files() {

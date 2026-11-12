@@ -44,6 +44,8 @@ curl -fL -o /root/vless-reality-setup.sh https://raw.githubusercontent.com/Soull
 vless-reality
 ```
 
+如果旧版脚本在菜单选择 `1` 后直接返回主菜单，请重新执行上面的下载命令获取 v1.0.1。该版本修正了安装前检查在正常机器上错误退出的问题。
+
 ## 非交互安装
 
 参数顺序为端口、伪装域名、节点名称：
