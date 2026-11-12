@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.0.1'
+SCRIPT_VERSION='1.0.2'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -17,6 +17,7 @@ SHORTCUT='/usr/local/bin/vless-reality'
 SHORTCUT_TAG='# vless-reality-setup shortcut'
 LINK_FILE='/root/vless-reality-link.txt'
 TEMP_DIR=''
+TEMP_BIN=''
 RELEASE_VERSION=''
 RELEASE_URL=''
 RELEASE_SHA256=''
@@ -197,10 +198,15 @@ generate_reality_keys() {
 }
 
 write_marker() {
-    printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
-        "$PORT" "$SNI" "$NODE_NAME" "$SERVER_IP" "$PUBLIC_KEY" "$SHORT_ID" > "$MARKER"
-    chown root:xray "$MARKER"
-    chmod 640 "$MARKER"
+    local tmp
+    tmp="$(mktemp "$CONFIG_DIR/.marker.XXXXXX")" || return 1
+    if printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$PORT" "$SNI" "$NODE_NAME" "$SERVER_IP" "$PUBLIC_KEY" "$SHORT_ID" > "$tmp" \
+        && chown root:xray "$tmp" && chmod 640 "$tmp" && mv -f -- "$tmp" "$MARKER"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
 }
 
 load_metadata() {
@@ -327,6 +333,10 @@ clean_config_residue() (
         fi
     done
     for entry in "$CONFIG_DIR"/.config.json.??????; do
+        [[ -f "$entry" && ! -L "$entry" ]] || continue
+        rm -f -- "$entry" || return 1
+    done
+    for entry in "$CONFIG_DIR"/.marker.??????; do
         [[ -f "$entry" && ! -L "$entry" ]] || continue
         rm -f -- "$entry" || return 1
     done
@@ -506,13 +516,13 @@ EOF
     systemctl daemon-reload
     systemctl enable --now xray
     wait_service 10 || fail "Xray 未正常监听 TCP $PORT；请查看 journalctl -u xray。"
+    show_node
     ensure_shortcut || true
     INSTALL_COMMITTED=1
     trap - EXIT
     rm -rf -- "$TEMP_DIR"
     TEMP_DIR=''
     ok "安装完成：Xray ${RELEASE_VERSION} 正在监听 TCP ${PORT}。"
-    show_node
     warn "请确认云安全组已放行 TCP ${PORT}。导入链接包含 UUID，请勿公开分享。"
 }
 
@@ -558,9 +568,9 @@ backup_state() {
 }
 restore_state() {
     local dir="$1"
-    cp -a -- "$dir/config.json" "$CONFIG"
-    cp -a -- "$dir/.vless-reality-owned" "$MARKER"
-    systemctl restart xray >/dev/null 2>&1 || true
+    cp -a -- "$dir/config.json" "$CONFIG" || return 1
+    cp -a -- "$dir/.vless-reality-owned" "$MARKER" || return 1
+    systemctl restart xray >/dev/null 2>&1 && wait_service 10
 }
 commit_change() {
     local backup="$1" old_port="$2" description="$3"
@@ -571,7 +581,9 @@ commit_change() {
         return 0
     fi
     PORT="$old_port"
-    restore_state "$backup"
+    if ! restore_state "$backup"; then
+        fail "恢复旧配置或服务失败，备份保留在 $backup；请立即检查服务状态。"
+    fi
     rm -rf -- "$backup"
     fail '修改后的配置未能正常启动，已恢复原配置。'
 }
@@ -591,9 +603,13 @@ change_port() {
     port_free "$PORT" || fail "本机 TCP $PORT 已被占用。"
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
     backup_state "$backup"
-    edit_config --argjson port "$PORT" '(.inbounds[] | select(.protocol == "vless") | .port) = $port' \
-        || { restore_state "$backup"; fail '写入配置失败。'; }
-    write_marker
+    if ! edit_config --argjson port "$PORT" '(.inbounds[] | select(.protocol == "vless") | .port) = $port' \
+        || ! write_marker; then
+        PORT="$old_port"
+        restore_state "$backup" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
+        rm -rf -- "$backup"
+        fail '修改端口文件失败，已恢复原配置。'
+    fi
     commit_change "$backup" "$old_port" "端口已改为 TCP $PORT；请放行新端口，确认可用后再关闭旧端口 $old_port。"
 }
 
@@ -613,11 +629,14 @@ change_sni() {
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
     backup_state "$backup"
     SNI="$new"
-    edit_config --arg sni "$SNI" \
+    if ! edit_config --arg sni "$SNI" \
         '(.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.target) = ($sni + ":443") |
          (.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.serverNames) = [$sni]' \
-        || { restore_state "$backup"; fail '写入配置失败。'; }
-    write_marker
+        || ! write_marker; then
+        restore_state "$backup" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
+        rm -rf -- "$backup"
+        fail '修改 SNI 文件失败，已恢复原配置。'
+    fi
     commit_change "$backup" "$old_port" "REALITY 伪装域名已改为 $SNI。"
 }
 
@@ -645,11 +664,14 @@ rotate_keys() {
     SHORT_ID="$(openssl rand -hex 8)"
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
     backup_state "$backup"
-    edit_config --arg private "$private" --arg sid "$SHORT_ID" \
+    if ! edit_config --arg private "$private" --arg sid "$SHORT_ID" \
         '(.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.privateKey) = $private |
          (.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.shortIds) = [$sid]' \
-        || { restore_state "$backup"; fail '写入配置失败。'; }
-    write_marker
+        || ! write_marker; then
+        restore_state "$backup" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
+        rm -rf -- "$backup"
+        fail '修改 REALITY 密钥文件失败，已恢复原配置。'
+    fi
     commit_change "$backup" "$old_port" 'REALITY 密钥和 Short ID 已轮换，旧链接立即失效。'
 }
 
@@ -685,10 +707,10 @@ update_xray() {
     need_root
     load_metadata
     ensure_dependencies
-    local current asset archive candidate backup
+    local current asset archive candidate backup was_active=0
     current="$(installed_version)"
     TEMP_DIR="$(mktemp -d)"
-    trap 'rm -rf -- "$TEMP_DIR"' EXIT
+    trap '[[ -z "$TEMP_BIN" ]] || rm -f -- "$TEMP_BIN"; [[ -z "$TEMP_DIR" ]] || rm -rf -- "$TEMP_DIR"' EXIT
     asset="$(arch_asset)"
     archive="$TEMP_DIR/xray.zip"
     fetch_release_metadata latest "$asset"
@@ -704,13 +726,26 @@ update_xray() {
     "$candidate" run -test -config "$CONFIG" >/dev/null || fail '新版 Xray 不接受当前配置，已停止升级。'
     backup="$TEMP_DIR/xray.old"
     cp -a -- "$XRAY_BIN" "$backup"
-    install -m 755 "$candidate" "$XRAY_BIN"
-    if systemctl restart xray && wait_service 10; then
+    if systemctl is-active --quiet xray; then was_active=1; fi
+    TEMP_BIN="$(mktemp /usr/local/bin/.xray-update.XXXXXX)"
+    install -m 755 "$candidate" "$TEMP_BIN" || fail '准备新版 Xray 程序失败，旧版本未修改。'
+    mv -f -- "$TEMP_BIN" "$XRAY_BIN" || fail '替换 Xray 程序失败，旧版本未修改。'
+    TEMP_BIN=''
+    if (( was_active == 0 )) || { systemctl restart xray && wait_service 10; }; then
         ok "Xray 已升级到 ${RELEASE_VERSION}。"
         return 0
     fi
-    install -m 755 "$backup" "$XRAY_BIN"
-    systemctl restart xray >/dev/null 2>&1 || true
+    TEMP_BIN="$(mktemp /usr/local/bin/.xray-update.XXXXXX)"
+    if ! install -m 755 "$backup" "$TEMP_BIN" || ! mv -f -- "$TEMP_BIN" "$XRAY_BIN"; then
+        trap - EXIT
+        rm -f -- "$TEMP_BIN"
+        fail "升级失败且自动恢复程序失败；旧版本备份保留在 $backup，请手动恢复。"
+    fi
+    TEMP_BIN=''
+    if ! systemctl restart xray || ! wait_service 10; then
+        trap - EXIT
+        fail "旧版程序已恢复，但服务仍无法启动；备份保留在 $backup，请检查日志。"
+    fi
     fail "升级后服务未正常运行，已恢复 Xray ${current:-旧版本}。"
 }
 
