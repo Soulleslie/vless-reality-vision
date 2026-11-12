@@ -77,4 +77,23 @@ make_fixture
 rm -f -- "$CONFIG_DIR/foreign-file"
 uninstall_node >/dev/null
 [[ ! -e "$CONFIG_DIR" ]]
+
+make_fixture
+rm() {
+    for arg in "$@"; do [[ "$arg" != "$MANAGER" ]] || return 1; done
+    command rm "$@"
+}
+if (uninstall_node >/dev/null 2>&1); then
+    printf '管理脚本删除失败时应报告失败\n' >&2
+    exit 1
+fi
+unset -f rm
+[[ -f "$MARKER" && -f "$MANAGER" ]]
+uninstall_node >/dev/null
+[[ ! -e "$MARKER" && ! -e "$MANAGER" ]]
+
+printf 'VLESS + REALITY + Vision 节点管理脚本\n' > "$MANAGER"
+printf '%s\n' "$SHORTCUT_TAG" > "$SHORTCUT"
+uninstall_node >/dev/null
+[[ ! -e "$SHORTCUT" && ! -e "$MANAGER" ]]
 printf '卸载路径验证通过\n'
