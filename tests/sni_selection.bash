@@ -35,4 +35,29 @@ if select_fastest_sni >/dev/null 2>&1; then
     printf '所有候选站点失效时应停止自动选择\n' >&2
     exit 1
 fi
+
+MOCK_DIR="$(mktemp -d)"
+trap 'rm -rf -- "$MOCK_DIR"' EXIT
+SNI_CANDIDATES=(a.example.com b.example.com c.example.com d.example.com e.example.com f.example.com)
+probe_target_latency() {
+    if [[ ! -e "$MOCK_DIR/$1" ]]; then
+        touch "$MOCK_DIR/$1"
+        case "$1" in
+            a.example.com) printf '1' ;;
+            b.example.com) printf '2' ;;
+            c.example.com) printf '3' ;;
+            d.example.com) printf '4' ;;
+            e.example.com) printf '5' ;;
+            f.example.com) printf '6' ;;
+        esac
+    else
+        case "$1" in
+            f.example.com) printf '1' ;;
+            *) printf '100' ;;
+        esac
+    fi
+}
+SNI=''
+select_fastest_sni >/dev/null
+[[ "$SNI" == f.example.com ]]
 printf 'SNI 自动优选验证通过\n'

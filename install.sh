@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.2.0'
+SCRIPT_VERSION='1.2.1'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -226,8 +226,8 @@ probe_target_latency() {
     printf '%s' "$((end - start))"
 }
 select_fastest_sni() {
-    local host first second score index pid line probe_dir best_score=-1 best_host=''
-    local -a pids=() ranked=() finalists=()
+    local host first second score index pid line probe_dir count=0
+    local -a pids=() valid_indices=() ranked=() finalists=()
     say "正在从 VPS 并发初筛 ${#SNI_CANDIDATES[@]} 个域名（TLS 1.3 与证书校验）…"
     probe_dir="$(mktemp -d /tmp/vless-reality-sni.XXXXXX)" || return 1
     if ! printf '%s\n' vless-reality-setup > "$probe_dir/.vless-reality-owned"; then
@@ -238,7 +238,7 @@ select_fastest_sni() {
         host="${SNI_CANDIDATES[index]}"
         (probe_target_latency "$host" > "$probe_dir/result.$index") &
         pids+=("$!")
-        if (( ${#pids[@]} >= 8 || index == ${#SNI_CANDIDATES[@]} - 1 )); then
+        if (( ${#pids[@]} >= 16 || index == ${#SNI_CANDIDATES[@]} - 1 )); then
             for pid in "${pids[@]}"; do wait "$pid" || true; done
             pids=()
             say "  已初筛 $((index + 1))/${#SNI_CANDIDATES[@]} 个域名"
@@ -248,32 +248,41 @@ select_fastest_sni() {
         [[ -f "$probe_dir/result.$index" ]] || continue
         first="$(< "$probe_dir/result.$index")"
         [[ "$first" =~ ^[0-9]+$ ]] || continue
-        ranked+=("$first ${SNI_CANDIDATES[index]}")
+        valid_indices+=("$index")
     done
-    if (( ${#ranked[@]} == 0 )); then
+    if (( ${#valid_indices[@]} == 0 )); then
         rm -rf -- "$probe_dir"
         return 1
     fi
-    mapfile -t finalists < <(printf '%s\n' "${ranked[@]}" | sort -n | sed -n '1,5p')
-    say "初筛通过 ${#ranked[@]} 个域名；复测最快的 ${#finalists[@]} 个…"
-    for line in "${finalists[@]}"; do
-        first="${line%% *}"
-        host="${line#* }"
-        if second="$(probe_target_latency "$host")" && [[ "$second" =~ ^[0-9]+$ ]]; then
-            score=$(((first + second) / 2))
-            say "  $host：约 ${score} ms"
-            if (( best_score < 0 || score < best_score )); then
-                best_score="$score"
-                best_host="$host"
-            fi
-        else
-            warn "  $host：复测未通过，跳过。"
+    say "初筛通过 ${#valid_indices[@]} 个域名；正在并发复测全部可用候选…"
+    for index in "${valid_indices[@]}"; do
+        host="${SNI_CANDIDATES[index]}"
+        (probe_target_latency "$host" > "$probe_dir/result2.$index") &
+        pids+=("$!")
+        count=$((count + 1))
+        if (( ${#pids[@]} >= 16 || count == ${#valid_indices[@]} )); then
+            for pid in "${pids[@]}"; do wait "$pid" || true; done
+            pids=()
+            say "  已复测 $count/${#valid_indices[@]} 个域名"
         fi
     done
+    for index in "${valid_indices[@]}"; do
+        [[ -f "$probe_dir/result2.$index" ]] || continue
+        second="$(< "$probe_dir/result2.$index")"
+        [[ "$second" =~ ^[0-9]+$ ]] || continue
+        first="$(< "$probe_dir/result.$index")"
+        score=$(((first + second) / 2))
+        ranked+=("$score ${SNI_CANDIDATES[index]}")
+    done
     rm -rf -- "$probe_dir"
-    [[ -n "$best_host" ]] || return 1
-    SNI="$best_host"
-    ok "已选择：$SNI（约 ${best_score} ms）"
+    (( ${#ranked[@]} > 0 )) || return 1
+    mapfile -t finalists < <(printf '%s\n' "${ranked[@]}" | sort -n | sed -n '1,5p')
+    say '平均握手耗时最低的候选：'
+    for line in "${finalists[@]}"; do
+        say "  ${line#* }：约 ${line%% *} ms"
+    done
+    SNI="${finalists[0]#* }"
+    ok "已选择：$SNI（约 ${finalists[0]%% *} ms）"
 }
 
 generate_reality_keys() {
@@ -467,7 +476,7 @@ clean_runtime_residue() (
             rm -f -- "$entry" || return 1
         done
         if [[ "$dir" == /tmp/vless-reality-sni.?????? ]]; then
-            for entry in "$dir"/result.*; do
+            for entry in "$dir"/result.* "$dir"/result2.*; do
                 [[ -f "$entry" && ! -L "$entry" ]] || continue
                 rm -f -- "$entry" || return 1
             done
@@ -548,7 +557,7 @@ install_node() {
     if [[ -z "$SNI" ]]; then
         [[ -t 0 ]] || fail '非交互运行时，请指定伪装域名或 auto。'
         interactive=1
-        read -r -p '请输入 REALITY 伪装域名（直接回车自动优选）：' SNI || fail '已取消输入。'
+        read -r -p 'REALITY 伪装域名（直接回车默认选实测延迟最低的域名，或输入自定义域名）：' SNI || fail '已取消输入。'
         SNI="${SNI:-auto}"
     fi
     SNI="${SNI,,}"
