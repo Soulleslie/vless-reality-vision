@@ -4,6 +4,16 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source <(sed '$d' "$ROOT/install.sh")
 
+[[ ${#SNI_CANDIDATES[@]} -eq 68 ]]
+declare -A seen=()
+for candidate in "${SNI_CANDIDATES[@]}"; do
+    valid_host "$candidate"
+    [[ ! -v seen[$candidate] ]]
+    seen[$candidate]=1
+done
+[[ -v seen[api.company-target.com] && -v seen[visualstudio.microsoft.com] ]]
+SNI_CANDIDATES=(www.amazon.com www.samsung.com www.nvidia.com)
+
 probe_target_latency() {
     case "$1" in
         www.amazon.com) printf '72' ;;

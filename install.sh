@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.1.0'
+SCRIPT_VERSION='1.2.0'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -30,6 +30,31 @@ SHORT_ID=''
 INSTALL_STARTED=0
 INSTALL_COMMITTED=0
 MANAGER_COPIED=0
+SNI_CANDIDATES=(
+    www.amazon.com www.samsung.com www.nvidia.com
+    digitalassets.tesla.com electronics.sony.com www.xbox.com amd.com
+    assets-xbxweb.xbox.com s7mbrstream.scene7.com d.impactradius-event.com
+    www.oracle.com acctcdn.msftauth.net cdn-dynmedia-1.microsoft.com
+    j.6sc.co lpcdn.lpsnmedia.net ds-aksb-a.akamaihd.net
+    gray-config-prod.api.arc-cdn.net img-prod-cms-rt-microsoft-com.akamaized.net
+    vscjava.gallerycdn.vsassets.io th.bing.com d2c.aws.amazon.com
+    gsp-ssl.ls.apple.com rum.hlx.page www.wowt.com www.amd.com
+    sisu.xboxlive.com cdn.userway.org assets.adobedtm.com www.tesla.com
+    catalog.gamepass.com cdnssl.clicktale.net aws.com res-1.cdn.office.net
+    www.aws.com ts3.tc.mm.bing.net beacon.gtv-pub.com
+    d3agakyjgjv5i8.cloudfront.net drivers.amd.com fpinit.itunes.apple.com
+    api.company-target.com tag-logger.demandbase.com cua-chat-ui.tesla.com
+    store-images.s-microsoft.com gray-wowt-prod.gtv-cdn.com www.sony.com
+    cdn77.api.userway.org downloadmirror.intel.com c.6sc.co
+    downloaddispatch.itunes.apple.com devblogs.microsoft.com
+    static.cloud.coveo.com a.b.cdn.console.awsstatic.com cdn.bizible.com
+    apps.mzstatic.com gray.video-player.arcpublishing.com www.xilinx.com
+    prod.us-east-1.ui.gcr-chat.marketing.aws.dev snap.licdn.com
+    gray-config-prod.api.cdn.arcpublishing.com c.s-microsoft.com
+    aadcdn.msftauth.net www.bing.com cdn.bizibly.com s.go-mpulse.net
+    publisher.liveperson.net mscom.demdex.net prod.log.shortbread.aws.dev
+    visualstudio.microsoft.com
+)
 
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
     GREEN=$'\033[32m' RED=$'\033[31m' YELLOW=$'\033[33m' BOLD=$'\033[1m' RESET=$'\033[0m'
@@ -124,7 +149,7 @@ ensure_dependencies() {
         apt-get update
         apt-get install -y "${packages[@]}"
     fi
-    for command_name in curl jq unzip openssl ss awk sed tr date systemctl sha256sum getent install timeout dpkg; do
+    for command_name in curl jq unzip openssl ss awk sed sort tr date systemctl sha256sum getent install timeout dpkg; do
         need_command "$command_name"
     done
 }
@@ -186,8 +211,8 @@ installed_version() {
 }
 
 target_tls_ok() {
-    local host="$1" output
-    output="$(timeout 10 openssl s_client -connect "${host}:443" -servername "$host" \
+    local host="$1" timeout_seconds="${2:-10}" output
+    output="$(timeout "$timeout_seconds" openssl s_client -connect "${host}:443" -servername "$host" \
         -tls1_3 -verify_hostname "$host" -verify_return_error -CApath /etc/ssl/certs \
         </dev/null 2>&1 || true)"
     [[ "$output" == *'Verify return code: 0 (ok)'* && "$output" == *'TLSv1.3'* ]]
@@ -195,17 +220,46 @@ target_tls_ok() {
 probe_target_latency() {
     local host="$1" start end
     start="$(date +%s%3N)" || return 1
-    target_tls_ok "$host" || return 1
+    target_tls_ok "$host" 5 || return 1
     end="$(date +%s%3N)" || return 1
     [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$end" -ge "$start" ]] || return 1
     printf '%s' "$((end - start))"
 }
 select_fastest_sni() {
-    local host first second score best_score=-1 best_host=''
-    local candidates=(www.amazon.com www.samsung.com www.nvidia.com)
-    say '正在从 VPS 测试伪装站点 TLS 1.3 握手耗时（每站两次）…'
-    for host in "${candidates[@]}"; do
-        if first="$(probe_target_latency "$host")" && second="$(probe_target_latency "$host")"; then
+    local host first second score index pid line probe_dir best_score=-1 best_host=''
+    local -a pids=() ranked=() finalists=()
+    say "正在从 VPS 并发初筛 ${#SNI_CANDIDATES[@]} 个域名（TLS 1.3 与证书校验）…"
+    probe_dir="$(mktemp -d /tmp/vless-reality-sni.XXXXXX)" || return 1
+    if ! printf '%s\n' vless-reality-setup > "$probe_dir/.vless-reality-owned"; then
+        rm -rf -- "$probe_dir"
+        return 1
+    fi
+    for ((index = 0; index < ${#SNI_CANDIDATES[@]}; index++)); do
+        host="${SNI_CANDIDATES[index]}"
+        (probe_target_latency "$host" > "$probe_dir/result.$index") &
+        pids+=("$!")
+        if (( ${#pids[@]} >= 8 || index == ${#SNI_CANDIDATES[@]} - 1 )); then
+            for pid in "${pids[@]}"; do wait "$pid" || true; done
+            pids=()
+            say "  已初筛 $((index + 1))/${#SNI_CANDIDATES[@]} 个域名"
+        fi
+    done
+    for ((index = 0; index < ${#SNI_CANDIDATES[@]}; index++)); do
+        [[ -f "$probe_dir/result.$index" ]] || continue
+        first="$(< "$probe_dir/result.$index")"
+        [[ "$first" =~ ^[0-9]+$ ]] || continue
+        ranked+=("$first ${SNI_CANDIDATES[index]}")
+    done
+    if (( ${#ranked[@]} == 0 )); then
+        rm -rf -- "$probe_dir"
+        return 1
+    fi
+    mapfile -t finalists < <(printf '%s\n' "${ranked[@]}" | sort -n | sed -n '1,5p')
+    say "初筛通过 ${#ranked[@]} 个域名；复测最快的 ${#finalists[@]} 个…"
+    for line in "${finalists[@]}"; do
+        first="${line%% *}"
+        host="${line#* }"
+        if second="$(probe_target_latency "$host")" && [[ "$second" =~ ^[0-9]+$ ]]; then
             score=$(((first + second) / 2))
             say "  $host：约 ${score} ms"
             if (( best_score < 0 || score < best_score )); then
@@ -213,9 +267,10 @@ select_fastest_sni() {
                 best_host="$host"
             fi
         else
-            warn "  $host：无法完成 TLS 1.3 或证书验证，跳过。"
+            warn "  $host：复测未通过，跳过。"
         fi
     done
+    rm -rf -- "$probe_dir"
     [[ -n "$best_host" ]] || return 1
     SNI="$best_host"
     ok "已选择：$SNI（约 ${best_score} ms）"
@@ -394,7 +449,7 @@ clean_runtime_residue() (
         fi
         rm -f -- "$entry" || return 1
     done
-    for dir in /tmp/vless-reality-install.?????? /tmp/vless-reality-update.??????; do
+    for dir in /tmp/vless-reality-install.?????? /tmp/vless-reality-update.?????? /tmp/vless-reality-sni.??????; do
         [[ -d "$dir" && ! -L "$dir" ]] || continue
         owner="$(stat -c %u -- "$dir")" || return 1
         if [[ "$owner" != "$EUID" ]]; then
@@ -411,6 +466,12 @@ clean_runtime_residue() (
             [[ -f "$entry" && ! -L "$entry" ]] || continue
             rm -f -- "$entry" || return 1
         done
+        if [[ "$dir" == /tmp/vless-reality-sni.?????? ]]; then
+            for entry in "$dir"/result.*; do
+                [[ -f "$entry" && ! -L "$entry" ]] || continue
+                rm -f -- "$entry" || return 1
+            done
+        fi
         rm -f -- "$dir/.vless-reality-owned" || return 1
         rmdir -- "$dir" 2>/dev/null || warn "临时目录含有其他文件，已保留：$dir" >&2
     done

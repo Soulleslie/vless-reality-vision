@@ -30,9 +30,12 @@ groupdel() { group_present=0; }
 
 TEST_DIR="$(mktemp -d)"
 ORPHAN_DIR="$(mktemp -d /tmp/vless-reality-update.XXXXXX)"
-trap 'rm -rf -- "$TEST_DIR" "$ORPHAN_DIR"' EXIT
+SNI_ORPHAN_DIR="$(mktemp -d /tmp/vless-reality-sni.XXXXXX)"
+trap 'rm -rf -- "$TEST_DIR" "$ORPHAN_DIR" "$SNI_ORPHAN_DIR"' EXIT
 printf 'vless-reality-setup\n' > "$ORPHAN_DIR/.vless-reality-owned"
 touch "$ORPHAN_DIR/xray.zip"
+printf 'vless-reality-setup\n' > "$SNI_ORPHAN_DIR/.vless-reality-owned"
+printf '42' > "$SNI_ORPHAN_DIR/result.0"
 CONFIG_DIR="$TEST_DIR/etc/xray"
 CONFIG="$CONFIG_DIR/config.json"
 MARKER="$CONFIG_DIR/.vless-reality-owned"
@@ -67,6 +70,7 @@ uninstall_node >/dev/null
 [[ ! -e "$XRAY_BIN" && ! -e "$LINK_FILE" && ! -e "$MANAGER" && ! -e "$SHORTCUT" ]]
 [[ ! -e "${LINK_FILE}.abcdef" && ! -e "$TEST_DIR/.xray-update.abcdef" ]]
 [[ ! -e "$ORPHAN_DIR" ]]
+[[ ! -e "$SNI_ORPHAN_DIR" ]]
 [[ ! -e "$CONFIG_DIR/.change-backup.abcdef" && -f "$CONFIG_DIR/foreign-file" ]]
 (( account_present == 0 && group_present == 0 ))
 
