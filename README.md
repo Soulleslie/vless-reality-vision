@@ -11,6 +11,7 @@
 - 支持 `amd64` 和 `arm64` 的 Debian/Ubuntu
 - 安装前检测现有 Xray 文件和服务，不覆盖已有配置
 - 自动生成 UUID、X25519 密钥和 Short ID
+- 自动比较候选伪装域名的 TLS 1.3 握手耗时，选择可用且较快的 SNI
 - 输出标准 `vless://` 客户端导入链接
 - 中文菜单管理启动、停止、重启、日志和状态
 - 修改端口、SNI、UUID、REALITY 密钥和节点名称
@@ -22,7 +23,7 @@
 1. 使用带公网 IPv4 的 Debian 或 Ubuntu VPS，以 root 身份执行。
 2. 在云服务商安全组中放行准备使用的 TCP 端口。若使用系统防火墙，也需放行该端口。
 3. 选择端口时直接回车使用 TCP 443；若已占用，脚本会提示重新输入其他端口（例如 8443）。
-4. 准备一个支持 TLS 1.3 的伪装站点域名。直接回车时使用 `www.amazon.com`，脚本会在安装前实际验证。更理想的选择是与你的 VPS 网络位置相近、长期稳定且不使用 Cloudflare CDN 的大型站点。
+4. 安装时伪装域名直接回车会自动优选；也可以手动输入一个支持 TLS 1.3 的域名。自动优选依次验证 `www.amazon.com`、`www.samsung.com`、`www.nvidia.com` 的证书与 TLS 1.3 握手，每站测两次后比较平均耗时。这个耗时是 **VPS 到伪装站点** 的耗时，不是客户端到 VPS 的延迟。
 
 ## 一键安装
 
@@ -60,12 +61,20 @@ v1.0.7 修正卸载中途失败时安装记录过早删除的问题；若节点�
 
 v1.0.8 支持清理只剩管理脚本或只剩快捷命令的状态；配置缺失时仍可进入菜单重试卸载。首次安装失败的回滚会先确认服务停止，避免删除仍在运行的节点文件。
 
+v1.1.0 增加伪装域名自动优选；全部候选不可用时会停止并提示手动指定域名。
+
 ## 非交互安装
 
 参数顺序为端口、伪装域名、节点名称：
 
 ```bash
 /root/vless-reality-setup.sh install 443 www.amazon.com Reality-SG
+```
+
+需要自动优选 SNI 时，将第二个参数改为 `auto`：
+
+```bash
+/root/vless-reality-setup.sh install 443 auto Reality-SG
 ```
 
 ## 常用命令
@@ -75,6 +84,7 @@ vless-reality show                 显示 vless:// 导入链接
 vless-reality status               检查服务、配置、端口和伪装站点
 vless-reality port 8443            修改监听端口
 vless-reality sni www.apple.com    修改 REALITY 伪装域名
+vless-reality sni auto             重新测量并优选伪装域名
 vless-reality uuid                 重新生成 UUID
 vless-reality rotate-keys          轮换 REALITY 密钥和 Short ID
 vless-reality rename Reality-US    修改节点名称

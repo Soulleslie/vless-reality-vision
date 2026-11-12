@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.0.8'
+SCRIPT_VERSION='1.1.0'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -124,7 +124,7 @@ ensure_dependencies() {
         apt-get update
         apt-get install -y "${packages[@]}"
     fi
-    for command_name in curl jq unzip openssl ss awk sed tr systemctl sha256sum getent install timeout dpkg; do
+    for command_name in curl jq unzip openssl ss awk sed tr date systemctl sha256sum getent install timeout dpkg; do
         need_command "$command_name"
     done
 }
@@ -191,6 +191,34 @@ target_tls_ok() {
         -tls1_3 -verify_hostname "$host" -verify_return_error -CApath /etc/ssl/certs \
         </dev/null 2>&1 || true)"
     [[ "$output" == *'Verify return code: 0 (ok)'* && "$output" == *'TLSv1.3'* ]]
+}
+probe_target_latency() {
+    local host="$1" start end
+    start="$(date +%s%3N)" || return 1
+    target_tls_ok "$host" || return 1
+    end="$(date +%s%3N)" || return 1
+    [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$end" -ge "$start" ]] || return 1
+    printf '%s' "$((end - start))"
+}
+select_fastest_sni() {
+    local host first second score best_score=-1 best_host=''
+    local candidates=(www.amazon.com www.samsung.com www.nvidia.com)
+    say '正在从 VPS 测试伪装站点 TLS 1.3 握手耗时（每站两次）…'
+    for host in "${candidates[@]}"; do
+        if first="$(probe_target_latency "$host")" && second="$(probe_target_latency "$host")"; then
+            score=$(((first + second) / 2))
+            say "  $host：约 ${score} ms"
+            if (( best_score < 0 || score < best_score )); then
+                best_score="$score"
+                best_host="$host"
+            fi
+        else
+            warn "  $host：无法完成 TLS 1.3 或证书验证，跳过。"
+        fi
+    done
+    [[ -n "$best_host" ]] || return 1
+    SNI="$best_host"
+    ok "已选择：$SNI（约 ${best_score} ms）"
 }
 
 generate_reality_keys() {
@@ -443,7 +471,7 @@ install_node() {
     need_root
     [[ $# -le 3 ]] || fail "用法：$(cmd_name) install [端口] [伪装域名] [节点名称]"
     check_install_eligibility
-    local interactive=0 raw_port="${1:-}" answer default_name
+    local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0
     default_name="Reality-$(hostname -s)"
 
     if [[ -z "$raw_port" ]]; then
@@ -457,13 +485,17 @@ install_node() {
 
     SNI="${2:-}"
     if [[ -z "$SNI" ]]; then
-        [[ -t 0 ]] || fail '非交互运行时，请指定伪装域名。'
+        [[ -t 0 ]] || fail '非交互运行时，请指定伪装域名或 auto。'
         interactive=1
-        read -r -p '请输入 REALITY 伪装域名（直接回车使用 www.amazon.com）：' SNI || fail '已取消输入。'
-        SNI="${SNI:-www.amazon.com}"
+        read -r -p '请输入 REALITY 伪装域名（直接回车自动优选）：' SNI || fail '已取消输入。'
+        SNI="${SNI:-auto}"
     fi
     SNI="${SNI,,}"
-    valid_host "$SNI" || fail '伪装域名格式不正确；只填域名，不要带 https://、端口或路径。'
+    if [[ "$SNI" == auto ]]; then
+        auto_sni=1
+    else
+        valid_host "$SNI" || fail '伪装域名格式不正确；只填域名，不要带 https://、端口或路径。'
+    fi
 
     NODE_NAME="${3:-$default_name}"
     if (( interactive )); then
@@ -477,7 +509,7 @@ install_node() {
         step '—————————— 确认安装信息 ——————————'
         say "  协议：VLESS + REALITY + Vision"
         say "  端口：TCP $PORT"
-        say "  SNI： $SNI:443"
+        if (( auto_sni )); then say '  SNI： 自动优选'; else say "  SNI： $SNI:443"; fi
         say "  名称：$NODE_NAME"
         warn "  请确认云安全组已放行 TCP ${PORT}，无需开放 TCP 80"
         step '————————————————————————————————'
@@ -494,7 +526,12 @@ install_node() {
     port_free "$PORT" || fail "本机 TCP $PORT 已被占用。"
     SERVER_IP="$(public_ipv4)" || fail '无法查询此 VPS 的公网 IPv4。'
     step '[2/5] 验证 REALITY 伪装站点…'
-    target_tls_ok "$SNI" || fail "$SNI:443 未通过 TLS 1.3 与证书校验，请更换可从本机访问的伪装域名。"
+    if (( auto_sni )); then
+        select_fastest_sni || fail '候选域名均不可用，请手动指定可从 VPS 访问的伪装域名。'
+    fi
+    if (( ! auto_sni )); then
+        target_tls_ok "$SNI" || fail "$SNI:443 未通过 TLS 1.3 与证书校验，请更换可从本机访问的伪装域名。"
+    fi
     ok "伪装站点可用：$SNI:443（TLS 1.3）"
 
     trap finish_install EXIT
@@ -676,15 +713,28 @@ change_sni() {
     need_root
     [[ $# -le 1 ]] || fail "用法：$(cmd_name) sni [新域名]"
     load_metadata
-    local new="${1:-}" old_port="$PORT" backup was_active=0
+    local new="${1:-}" old_port="$PORT" old_sni="$SNI" backup was_active=0 auto_sni=0
     if [[ -z "$new" ]]; then
         [[ -t 0 ]] || fail '非交互运行时请指定新伪装域名。'
-        read -r -p "当前 SNI $SNI，请输入新伪装域名：" new || fail '已取消输入。'
+        read -r -p "当前 SNI $SNI，请输入新域名（回车自动优选）：" new || fail '已取消输入。'
+        new="${new:-auto}"
     fi
     new="${new,,}"
-    valid_host "$new" || fail '伪装域名格式不正确。'
-    [[ "$new" != "$SNI" ]] || fail '新域名与当前域名相同。'
-    target_tls_ok "$new" || fail "$new:443 未通过 TLS 1.3 与证书校验。"
+    if [[ "$new" == auto ]]; then
+        auto_sni=1
+        select_fastest_sni || fail '候选域名均不可用，请手动指定伪装域名。'
+        new="$SNI"
+        SNI="$old_sni"
+    else
+        valid_host "$new" || fail '伪装域名格式不正确。'
+    fi
+    if [[ "$new" == "$SNI" ]]; then
+        if (( auto_sni )); then ok "当前域名 $SNI 已是本次测试的最优选项，无需修改。"; return 0; fi
+        fail '新域名与当前域名相同。'
+    fi
+    if (( ! auto_sni )); then
+        target_tls_ok "$new" || fail "$new:443 未通过 TLS 1.3 与证书校验。"
+    fi
     if systemctl is-active --quiet xray; then was_active=1; fi
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
     backup_state "$backup"
@@ -923,7 +973,7 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   show                         显示 vless:// 导入链接
   status                       查看服务、配置、端口和伪装站点状态
   port [新端口]                修改端口
-  sni [新域名]                 修改 REALITY 伪装域名
+  sni [新域名|auto]            修改或自动优选 REALITY 伪装域名
   uuid                         重新生成 UUID
   rotate-keys                  轮换 REALITY 密钥和 Short ID
   rename [新名称]              修改节点名称
@@ -967,7 +1017,7 @@ show_menu() {
     say '  6. 重启服务'
     say '----------------------------------'
     say '  7. 修改端口'
-    say '  8. 修改伪装域名（SNI）'
+    say '  8. 修改伪装域名（支持自动优选）'
     say '  9. 重新生成 UUID'
     say ' 10. 轮换 REALITY 密钥'
     say ' 11. 修改节点名称'
