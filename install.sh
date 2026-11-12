@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.4.0'
+SCRIPT_VERSION='1.4.1'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -909,6 +909,9 @@ tfo_node() {
         cp -a -- "$TFO_SYSCTL" "$backup/tfo.sysctl" || fail "备份 TFO 设置失败，备份保留在 $backup。"
     fi
     if systemctl is-active --quiet xray; then was_active=1; fi
+    if (( was_active )); then
+        warn '即将重启 Xray；如果当前 SSH 经过此节点，连接可能中断。请使用 VPS 直连 SSH 操作。'
+    fi
     if [[ "$action" == on ]]; then
         enable_kernel_tfo || changed=0
         if (( changed )); then
