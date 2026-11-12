@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.0.7'
+SCRIPT_VERSION='1.0.8'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -309,13 +309,20 @@ check_install_eligibility() {
 }
 
 purge_node_files() {
-    systemctl disable --now xray >/dev/null 2>&1 || true
-    rm -f -- "$SERVICE"
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    rm -f -- "$XRAY_BIN" "$LINK_FILE"
-    rm -rf -- "$CONFIG_DIR"
-    if getent passwd xray >/dev/null 2>&1; then userdel xray >/dev/null 2>&1 || true; fi
-    if getent group xray >/dev/null 2>&1; then groupdel xray >/dev/null 2>&1 || true; fi
+    if systemctl is-active --quiet xray; then
+        systemctl stop xray >/dev/null 2>&1 || return 1
+    fi
+    systemctl is-active --quiet xray && return 1
+    if systemctl is-enabled --quiet xray; then
+        systemctl disable xray >/dev/null 2>&1 || return 1
+    fi
+    rm -f -- "$SERVICE" || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    rm -f -- "$XRAY_BIN" "$LINK_FILE" || return 1
+    if getent passwd xray >/dev/null 2>&1; then userdel xray >/dev/null 2>&1 || return 1; fi
+    if getent group xray >/dev/null 2>&1; then groupdel xray >/dev/null 2>&1 || return 1; fi
+    rm -rf -- "$CONFIG_DIR" || return 1
+    return 0
 }
 # 卸载时只处理脚本创建的文件；目录里新增的其他内容留给管理员。
 clean_config_residue() (
@@ -381,14 +388,17 @@ clean_runtime_residue() (
     done
 )
 finish_install() {
-    local result=$?
+    local result=$? cleanup_ok=1
     trap - EXIT
     if (( INSTALL_COMMITTED == 0 )); then
         if (( INSTALL_STARTED )); then
             warn '安装未完成，正在撤销本次创建的服务和文件…' >&2
-            purge_node_files
+            if ! purge_node_files; then
+                cleanup_ok=0
+                warn '自动回滚未完成；已保留管理脚本，请检查 Xray 服务和节点文件。' >&2
+            fi
         fi
-        if (( MANAGER_COPIED )); then rm -f -- "$MANAGER"; fi
+        if (( MANAGER_COPIED && cleanup_ok )); then rm -f -- "$MANAGER" || true; fi
     fi
     [[ -z "$TEMP_DIR" ]] || rm -rf -- "$TEMP_DIR"
     return "$result"
@@ -845,15 +855,20 @@ uninstall_node() {
             || getent group xray >/dev/null 2>&1; then
             fail '安装记录已不存在，但仍发现 Xray 服务或账号；无法确认归属，已停止。'
         fi
-        if [[ ! -f "$MANAGER" || -L "$MANAGER" ]] \
-            || ! grep -qF 'VLESS + REALITY + Vision 节点管理脚本' "$MANAGER"; then
-            fail '未发现可确认属于本脚本的残留管理文件。'
+        if [[ -e "$MANAGER" || -L "$MANAGER" ]]; then
+            if [[ ! -f "$MANAGER" || -L "$MANAGER" ]] \
+                || ! grep -qF 'VLESS + REALITY + Vision 节点管理脚本' "$MANAGER"; then
+                fail '管理脚本文件无法确认归属，未删除。'
+            fi
         fi
-        shortcut_is_ours || fail '快捷命令不属于本脚本，未删除。'
+        if [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]]; then
+            shortcut_is_ours || fail '快捷命令不属于本脚本，未删除。'
+        fi
+        [[ -e "$MANAGER" || -e "$SHORTCUT" ]] || fail '没有发现本脚本的残留管理入口。'
         confirm '节点记录已不存在，只清理残留的管理脚本和快捷命令？[y/N]：' \
             || { say '已取消清理。'; return 0; }
-        rm -f -- "$SHORTCUT" || fail '删除快捷命令失败。'
-        rm -f -- "$MANAGER" || fail '删除管理脚本失败。'
+        if shortcut_is_ours; then rm -f -- "$SHORTCUT" || fail '删除快捷命令失败。'; fi
+        if [[ -f "$MANAGER" ]]; then rm -f -- "$MANAGER" || fail '删除管理脚本失败。'; fi
         ok '残留的管理入口已清理。'
         return 0
     fi
@@ -922,6 +937,10 @@ EOF
 
 menu_status() {
     if [[ ! -f "$MARKER" ]]; then say " 当前状态：${RED}● 未安装${RESET}"; return 0; fi
+    if [[ ! -f "$CONFIG" ]]; then
+        warn ' 当前状态：● 节点文件不完整；可选择 2 重试卸载'
+        return 0
+    fi
     local state color label
     state="$(systemctl is-active xray 2>/dev/null || true)"
     case "$state" in
@@ -976,7 +995,7 @@ menu_action() {
 interactive_menu() {
     if [[ ! -t 0 ]]; then print_help; return 0; fi
     need_root
-    ensure_shortcut quiet || true
+    if [[ -f "$MARKER" ]]; then ensure_shortcut quiet || true; fi
     local choice rc
     while true; do
         show_menu

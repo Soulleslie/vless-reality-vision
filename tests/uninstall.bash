@@ -96,4 +96,19 @@ printf 'VLESS + REALITY + Vision 节点管理脚本\n' > "$MANAGER"
 printf '%s\n' "$SHORTCUT_TAG" > "$SHORTCUT"
 uninstall_node >/dev/null
 [[ ! -e "$SHORTCUT" && ! -e "$MANAGER" ]]
+
+printf 'VLESS + REALITY + Vision 节点管理脚本\n' > "$MANAGER"
+uninstall_node >/dev/null
+[[ ! -e "$MANAGER" ]]
+printf '%s\n' "$SHORTCUT_TAG" > "$SHORTCUT"
+uninstall_node >/dev/null
+[[ ! -e "$SHORTCUT" ]]
+
+account_present=1
+group_present=1
+make_fixture
+rm -f -- "$CONFIG"
+[[ "$(menu_status)" == *'节点文件不完整'* ]]
+uninstall_node >/dev/null
+[[ ! -e "$MARKER" && ! -e "$MANAGER" && ! -e "$SHORTCUT" ]]
 printf '卸载路径验证通过\n'
