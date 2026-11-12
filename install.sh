@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.0.2'
+SCRIPT_VERSION='1.0.3'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -529,12 +529,16 @@ EOF
 show_node() {
     need_root
     load_metadata
-    local uuid label link
+    local uuid label link tmp
     uuid="$(config_uuid)" || fail '无法从配置读取 UUID。'
-    label="$(jq -rn --arg v "$NODE_NAME" '$v | @uri')"
+    label="$(jq -rn --arg v "$NODE_NAME" '$v | @uri')" || return 1
     link="vless://${uuid}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${label}"
-    printf '%s\n' "$link" > "$LINK_FILE"
-    chmod 600 "$LINK_FILE"
+    tmp="$(mktemp "${LINK_FILE}.XXXXXX")" || return 1
+    if ! printf '%s\n' "$link" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$LINK_FILE"; then
+        rm -f -- "$tmp"
+        warn '保存客户端导入链接失败。' >&2
+        return 1
+    fi
     say
     say 'VLESS 导入链接：'
     printf '%s%s%s\n' "$BOLD" "$link" "$RESET"
@@ -545,14 +549,19 @@ show_node() {
 status_node() {
     need_root
     load_metadata
-    local state current_ip version
+    local state current_ip version flow
     state="$(systemctl is-active xray 2>/dev/null || true)"
     version="$(installed_version)"
     say "服务状态：$state"
     say "Xray 版本：${version:-未知}"
     say "监听地址：${SERVER_IP}:${PORT}/TCP"
     say "REALITY SNI：${SNI}:443"
-    say "Vision flow：xtls-rprx-vision"
+    flow="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.clients[0].flow][0] // empty' "$CONFIG" 2>/dev/null || true)"
+    if [[ "$flow" == xtls-rprx-vision ]]; then
+        ok 'Vision flow：xtls-rprx-vision'
+    else
+        warn "Vision flow：${flow:-未配置}"
+    fi
     if config_ok; then ok '配置检查：通过'; else warn '配置检查：失败'; fi
     if [[ -n "$(ss -H -ltn "sport = :$PORT" 2>/dev/null)" ]]; then ok '端口监听：正常'; else warn '端口监听：未发现'; fi
     current_ip="$(public_ipv4 || true)"
@@ -567,32 +576,36 @@ backup_state() {
     cp -a -- "$CONFIG" "$MARKER" "$dir/"
 }
 restore_state() {
-    local dir="$1"
+    local dir="$1" was_active="$2"
     cp -a -- "$dir/config.json" "$CONFIG" || return 1
     cp -a -- "$dir/.vless-reality-owned" "$MARKER" || return 1
-    systemctl restart xray >/dev/null 2>&1 && wait_service 10
+    if (( was_active )); then
+        systemctl restart xray >/dev/null 2>&1 && wait_service 10 || return 1
+    fi
+    return 0
 }
 commit_change() {
-    local backup="$1" old_port="$2" description="$3"
-    if config_ok && systemctl restart xray && wait_service 10; then
-        rm -rf -- "$backup"
-        ok "$description"
-        show_node
-        return 0
+    local backup="$1" old_port="$2" description="$3" was_active="$4"
+    if config_ok && { (( was_active == 0 )) || { systemctl restart xray && wait_service 10; }; }; then
+        if show_node; then
+            rm -rf -- "$backup"
+            ok "$description"
+            return 0
+        fi
     fi
     PORT="$old_port"
-    if ! restore_state "$backup"; then
+    if ! restore_state "$backup" "$was_active"; then
         fail "恢复旧配置或服务失败，备份保留在 $backup；请立即检查服务状态。"
     fi
     rm -rf -- "$backup"
-    fail '修改后的配置未能正常启动，已恢复原配置。'
+    fail '修改后的配置启动或链接保存失败，已恢复原配置。'
 }
 
 change_port() {
     need_root
     [[ $# -le 1 ]] || fail "用法：$(cmd_name) port [新端口]"
     load_metadata
-    local raw="${1:-}" old_port="$PORT" backup
+    local raw="${1:-}" old_port="$PORT" backup was_active=0
     if [[ -z "$raw" ]]; then
         [[ -t 0 ]] || fail '非交互运行时请指定新端口。'
         read -r -p "当前端口 $PORT，请输入新端口：" raw || fail '已取消输入。'
@@ -601,23 +614,24 @@ change_port() {
     PORT="$((10#$raw))"
     (( PORT != old_port )) || fail '新端口与当前端口相同。'
     port_free "$PORT" || fail "本机 TCP $PORT 已被占用。"
+    if systemctl is-active --quiet xray; then was_active=1; fi
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
     backup_state "$backup"
     if ! edit_config --argjson port "$PORT" '(.inbounds[] | select(.protocol == "vless") | .port) = $port' \
         || ! write_marker; then
         PORT="$old_port"
-        restore_state "$backup" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
+        restore_state "$backup" "$was_active" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
         rm -rf -- "$backup"
         fail '修改端口文件失败，已恢复原配置。'
     fi
-    commit_change "$backup" "$old_port" "端口已改为 TCP $PORT；请放行新端口，确认可用后再关闭旧端口 $old_port。"
+    commit_change "$backup" "$old_port" "端口已改为 TCP $PORT；请放行新端口，确认可用后再关闭旧端口 $old_port。" "$was_active"
 }
 
 change_sni() {
     need_root
     [[ $# -le 1 ]] || fail "用法：$(cmd_name) sni [新域名]"
     load_metadata
-    local new="${1:-}" old_port="$PORT" backup
+    local new="${1:-}" old_port="$PORT" backup was_active=0
     if [[ -z "$new" ]]; then
         [[ -t 0 ]] || fail '非交互运行时请指定新伪装域名。'
         read -r -p "当前 SNI $SNI，请输入新伪装域名：" new || fail '已取消输入。'
@@ -626,6 +640,7 @@ change_sni() {
     valid_host "$new" || fail '伪装域名格式不正确。'
     [[ "$new" != "$SNI" ]] || fail '新域名与当前域名相同。'
     target_tls_ok "$new" || fail "$new:443 未通过 TLS 1.3 与证书校验。"
+    if systemctl is-active --quiet xray; then was_active=1; fi
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
     backup_state "$backup"
     SNI="$new"
@@ -633,46 +648,48 @@ change_sni() {
         '(.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.target) = ($sni + ":443") |
          (.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.serverNames) = [$sni]' \
         || ! write_marker; then
-        restore_state "$backup" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
+        restore_state "$backup" "$was_active" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
         rm -rf -- "$backup"
         fail '修改 SNI 文件失败，已恢复原配置。'
     fi
-    commit_change "$backup" "$old_port" "REALITY 伪装域名已改为 $SNI。"
+    commit_change "$backup" "$old_port" "REALITY 伪装域名已改为 $SNI。" "$was_active"
 }
 
 change_uuid() {
     need_root
     load_metadata
-    local new old_port="$PORT" backup
+    local new old_port="$PORT" backup was_active=0
     new="$($XRAY_BIN uuid)"
+    if systemctl is-active --quiet xray; then was_active=1; fi
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
     backup_state "$backup"
     edit_config --arg id "$new" \
         '(.inbounds[] | select(.protocol == "vless") | .settings.clients[] | select(.flow == "xtls-rprx-vision") | .id) = $id' \
-        || { restore_state "$backup"; fail '写入配置失败。'; }
-    commit_change "$backup" "$old_port" 'UUID 已重新生成，旧链接立即失效。'
+        || { restore_state "$backup" "$was_active" || fail "恢复失败，备份保留在 $backup。"; fail '写入配置失败。'; }
+    commit_change "$backup" "$old_port" 'UUID 已重新生成，旧链接立即失效。' "$was_active"
 }
 
 rotate_keys() {
     need_root
     load_metadata
-    local key_lines private old_port="$PORT" backup
+    local key_lines private old_port="$PORT" backup was_active=0
     mapfile -t key_lines < <(generate_reality_keys)
     (( ${#key_lines[@]} == 2 )) || fail 'REALITY 密钥生成失败。'
     private="${key_lines[0]}"
     PUBLIC_KEY="${key_lines[1]}"
     SHORT_ID="$(openssl rand -hex 8)"
+    if systemctl is-active --quiet xray; then was_active=1; fi
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
     backup_state "$backup"
     if ! edit_config --arg private "$private" --arg sid "$SHORT_ID" \
         '(.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.privateKey) = $private |
          (.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.shortIds) = [$sid]' \
         || ! write_marker; then
-        restore_state "$backup" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
+        restore_state "$backup" "$was_active" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
         rm -rf -- "$backup"
         fail '修改 REALITY 密钥文件失败，已恢复原配置。'
     fi
-    commit_change "$backup" "$old_port" 'REALITY 密钥和 Short ID 已轮换，旧链接立即失效。'
+    commit_change "$backup" "$old_port" 'REALITY 密钥和 Short ID 已轮换，旧链接立即失效。' "$was_active"
 }
 
 rename_node() {
