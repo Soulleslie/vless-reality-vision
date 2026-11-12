@@ -25,6 +25,14 @@ SNI=''
 select_fastest_sni >/dev/null
 [[ "$SNI" == www.samsung.com ]]
 
+OUTPUT_FILE="$(mktemp)"
+trap 'rm -f -- "$OUTPUT_FILE"' EXIT
+SNI=www.amazon.com
+menu_action 16 > "$OUTPUT_FILE"
+[[ "$(< "$OUTPUT_FILE")" == *'实测延迟最低的域名：www.samsung.com'* ]]
+[[ "$(< "$OUTPUT_FILE")" == *'不修改节点配置'* ]]
+[[ "$SNI" == www.amazon.com ]]
+
 need_root() { :; }
 load_metadata() { SNI=www.samsung.com; PORT=443; }
 change_sni auto >/dev/null
@@ -37,7 +45,7 @@ if select_fastest_sni >/dev/null 2>&1; then
 fi
 
 MOCK_DIR="$(mktemp -d)"
-trap 'rm -rf -- "$MOCK_DIR"' EXIT
+trap 'rm -rf -- "$MOCK_DIR"; rm -f -- "$OUTPUT_FILE"' EXIT
 SNI_CANDIDATES=(a.example.com b.example.com c.example.com d.example.com e.example.com f.example.com)
 probe_target_latency() {
     if [[ ! -e "$MOCK_DIR/$1" ]]; then

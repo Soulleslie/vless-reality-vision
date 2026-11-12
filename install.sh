@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.2.1'
+SCRIPT_VERSION='1.3.0'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -282,8 +282,17 @@ select_fastest_sni() {
         say "  ${line#* }：约 ${line%% *} ms"
     done
     SNI="${finalists[0]#* }"
-    ok "已选择：$SNI（约 ${finalists[0]%% *} ms）"
+    ok "实测延迟最低的域名：$SNI（约 ${finalists[0]%% *} ms）"
 }
+
+show_fastest_sni() (
+    local command_name
+    for command_name in openssl timeout date sort sed mktemp; do
+        need_command "$command_name"
+    done
+    select_fastest_sni || fail '候选域名均不可用，请检查 VPS 网络或手动指定伪装域名。'
+    say '此操作只显示测速结果，不修改节点配置。'
+)
 
 generate_reality_keys() {
     local output private public
@@ -1044,6 +1053,7 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   status                       查看服务、配置、端口和伪装站点状态
   port [新端口]                修改端口
   sni [新域名|auto]            修改或自动优选 REALITY 伪装域名
+  sni-best                     查看当前测速延迟最低的域名，不修改节点
   uuid                         重新生成 UUID
   rotate-keys                  轮换 REALITY 密钥和 Short ID
   rename [新名称]              修改节点名称
@@ -1096,6 +1106,7 @@ show_menu() {
     say ' 13. 查看导入链接'
     say ' 14. 查看运行状态'
     say ' 15. 查看运行日志'
+    say ' 16. 查看当前测速延迟最低的域名'
     say ' 00. 退出'
     say '=================================='
     menu_status
@@ -1109,7 +1120,7 @@ menu_action() {
         9) warn '操作后旧链接立即失效。'; change_uuid ;;
         10) warn '操作后旧链接立即失效。'; rotate_keys ;;
         11) rename_node ;; 12) refresh_ip ;; 13) show_node ;;
-        14) status_node ;; 15) log_node ;; *) return 2 ;;
+        14) status_node ;; 15) log_node ;; 16) show_fastest_sni ;; *) return 2 ;;
     esac
 }
 interactive_menu() {
@@ -1119,8 +1130,8 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-15，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-5]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-16，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-6]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
@@ -1142,6 +1153,7 @@ main() {
         status) status_node ;;
         port) shift; change_port "$@" ;;
         sni) shift; change_sni "$@" ;;
+        sni-best) show_fastest_sni ;;
         uuid) change_uuid ;;
         rotate-keys) rotate_keys ;;
         rename) shift; rename_node "$@" ;;
@@ -1152,7 +1164,7 @@ main() {
         log|logs) shift; log_node "$@" ;;
         update) update_xray ;;
         uninstall) uninstall_node ;;
-        [1-9]|1[0-5]) need_root; menu_action "$1" ;;
+        [1-9]|1[0-6]) need_root; menu_action "$1" ;;
         *) print_help; exit 2 ;;
     esac
 }

@@ -12,6 +12,7 @@
 - 安装前检测现有 Xray 文件和服务，不覆盖已有配置
 - 自动生成 UUID、X25519 密钥和 Short ID
 - 自动比较候选伪装域名的 TLS 1.3 握手耗时，选择可用且较快的 SNI
+- 可单独查看当前 VPS 实测延迟最低的候选域名，不修改节点
 - 输出标准 `vless://` 客户端导入链接
 - 中文菜单管理启动、停止、重启、日志和状态
 - 修改端口、SNI、UUID、REALITY 密钥和节点名称
@@ -67,6 +68,8 @@ v1.2.0 加入 65 个候选域名，共 68 个；自动优选改为限量并发�
 
 v1.2.1 自动优选会复测所有通过初筛的域名，并选择平均握手耗时最低的站点；安装提示明确说明直接回车与手动填写域名的选择。
 
+v1.3.0 增加菜单“查看当前测速延迟最低的域名”和 `sni-best` 命令；显示域名与两次握手的平均耗时，不修改节点配置。
+
 ## 非交互安装
 
 参数顺序为端口、伪装域名、节点名称：
@@ -89,6 +92,7 @@ vless-reality status               检查服务、配置、端口和伪装站点
 vless-reality port 8443            修改监听端口
 vless-reality sni www.apple.com    修改 REALITY 伪装域名
 vless-reality sni auto             重新测量并优选伪装域名
+vless-reality sni-best             显示当前测速延迟最低的域名，不修改节点
 vless-reality uuid                 重新生成 UUID
 vless-reality rotate-keys          轮换 REALITY 密钥和 Short ID
 vless-reality rename Reality-US    修改节点名称
@@ -97,6 +101,8 @@ vless-reality update               升级 Xray-core
 vless-reality log -f               实时查看日志
 vless-reality uninstall            卸载并清理
 ```
+
+安装前也可以运行 `/root/vless-reality-setup.sh sni-best` 查看测速结果；该命令只显示候选域名，不会安装或修改节点。
 
 卸载会先停止并禁用本脚本创建的 Xray 服务，然后删除程序、配置、安装记录、节点链接、管理脚本、快捷命令、配置备份和可识别的中断临时文件，最后核验服务与专用账号是否仍存在。任一步失败会报错，并尽可能保留安装记录，便于修正问题后重试。
 
