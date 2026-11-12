@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.0.4'
+SCRIPT_VERSION='1.0.5'
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
 CONFIG_DIR='/usr/local/etc/xray'
@@ -341,6 +341,40 @@ clean_config_residue() (
         rm -f -- "$entry" || return 1
     done
 )
+# 清理被中断的链接写入或程序升级留下的、当前用户创建的临时文件。
+clean_runtime_residue() (
+    local entry owner dir file
+    shopt -s nullglob
+    for entry in "${LINK_FILE}".?????? "${XRAY_BIN%/*}"/.xray-update.??????; do
+        [[ -f "$entry" && ! -L "$entry" ]] || continue
+        owner="$(stat -c %u -- "$entry")" || return 1
+        if [[ "$owner" != "$EUID" ]]; then
+            warn "临时文件不属于当前用户，已保留：$entry" >&2
+            continue
+        fi
+        rm -f -- "$entry" || return 1
+    done
+    for dir in /tmp/vless-reality-install.?????? /tmp/vless-reality-update.??????; do
+        [[ -d "$dir" && ! -L "$dir" ]] || continue
+        owner="$(stat -c %u -- "$dir")" || return 1
+        if [[ "$owner" != "$EUID" ]]; then
+            warn "临时目录不属于当前用户，已保留：$dir" >&2
+            continue
+        fi
+        if [[ ! -f "$dir/.vless-reality-owned" || -L "$dir/.vless-reality-owned" \
+            || "$(< "$dir/.vless-reality-owned")" != vless-reality-setup ]]; then
+            warn "临时目录没有本脚本的标记，已保留：$dir" >&2
+            continue
+        fi
+        for file in release.json xray.zip xray xray.old; do
+            entry="$dir/$file"
+            [[ -f "$entry" && ! -L "$entry" ]] || continue
+            rm -f -- "$entry" || return 1
+        done
+        rm -f -- "$dir/.vless-reality-owned" || return 1
+        rmdir -- "$dir" 2>/dev/null || warn "临时目录含有其他文件，已保留：$dir" >&2
+    done
+)
 finish_install() {
     local result=$?
     trap - EXIT
@@ -455,7 +489,8 @@ install_node() {
 
     trap finish_install EXIT
     save_manager
-    TEMP_DIR="$(mktemp -d)"
+    TEMP_DIR="$(mktemp -d /tmp/vless-reality-install.XXXXXX)"
+    printf 'vless-reality-setup\n' > "$TEMP_DIR/.vless-reality-owned"
     INSTALL_STARTED=1
     step '[3/5] 下载并校验 Xray-core 官方稳定版…'
     local asset archive
@@ -726,7 +761,8 @@ update_xray() {
     ensure_dependencies
     local current asset archive candidate backup was_active=0
     current="$(installed_version)"
-    TEMP_DIR="$(mktemp -d)"
+    TEMP_DIR="$(mktemp -d /tmp/vless-reality-update.XXXXXX)"
+    printf 'vless-reality-setup\n' > "$TEMP_DIR/.vless-reality-owned"
     trap '[[ -z "$TEMP_BIN" ]] || rm -f -- "$TEMP_BIN"; [[ -z "$TEMP_DIR" ]] || rm -rf -- "$TEMP_DIR"' EXIT
     asset="$(arch_asset)"
     archive="$TEMP_DIR/xray.zip"
@@ -749,7 +785,7 @@ update_xray() {
     backup="$TEMP_DIR/xray.old"
     cp -a -- "$XRAY_BIN" "$backup"
     if systemctl is-active --quiet xray; then was_active=1; fi
-    TEMP_BIN="$(mktemp /usr/local/bin/.xray-update.XXXXXX)"
+    TEMP_BIN="$(mktemp "${XRAY_BIN%/*}/.xray-update.XXXXXX")"
     install -m 755 "$candidate" "$TEMP_BIN" || fail '准备新版 Xray 程序失败，旧版本未修改。'
     mv -f -- "$TEMP_BIN" "$XRAY_BIN" || fail '替换 Xray 程序失败，旧版本未修改。'
     TEMP_BIN=''
@@ -757,7 +793,7 @@ update_xray() {
         ok "Xray 已升级到 ${RELEASE_VERSION}。"
         return 0
     fi
-    TEMP_BIN="$(mktemp /usr/local/bin/.xray-update.XXXXXX)"
+    TEMP_BIN="$(mktemp "${XRAY_BIN%/*}/.xray-update.XXXXXX")"
     if ! install -m 755 "$backup" "$TEMP_BIN" || ! mv -f -- "$TEMP_BIN" "$XRAY_BIN"; then
         trap - EXIT
         rm -f -- "$TEMP_BIN"
@@ -821,6 +857,7 @@ uninstall_node() {
     rm -f -- "$XRAY_BIN" "$LINK_FILE" || fail '删除 Xray 程序或节点链接失败。'
     rm -f -- "$CONFIG" || fail '删除节点配置失败。'
     clean_config_residue || fail '清理配置备份失败；保留安装记录以便重试。'
+    clean_runtime_residue || fail '清理临时文件失败；保留安装记录以便重试。'
     if getent passwd xray >/dev/null 2>&1; then
         userdel xray || fail '删除 xray 用户失败；保留安装记录以便重试。'
     fi

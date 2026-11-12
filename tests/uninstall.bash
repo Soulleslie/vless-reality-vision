@@ -29,7 +29,10 @@ userdel() { account_present=0; }
 groupdel() { group_present=0; }
 
 TEST_DIR="$(mktemp -d)"
-trap 'rm -rf -- "$TEST_DIR"' EXIT
+ORPHAN_DIR="$(mktemp -d /tmp/vless-reality-update.XXXXXX)"
+trap 'rm -rf -- "$TEST_DIR" "$ORPHAN_DIR"' EXIT
+printf 'vless-reality-setup\n' > "$ORPHAN_DIR/.vless-reality-owned"
+touch "$ORPHAN_DIR/xray.zip"
 CONFIG_DIR="$TEST_DIR/etc/xray"
 CONFIG="$CONFIG_DIR/config.json"
 MARKER="$CONFIG_DIR/.vless-reality-owned"
@@ -42,6 +45,7 @@ SHORTCUT="$TEST_DIR/shortcut"
 make_fixture() {
     mkdir -p "$CONFIG_DIR/.change-backup.abcdef"
     touch "$CONFIG" "$MARKER" "$XRAY_BIN" "$LINK_FILE" "$MANAGER"
+    touch "${LINK_FILE}.abcdef" "$TEST_DIR/.xray-update.abcdef"
     touch "$CONFIG_DIR/.change-backup.abcdef/config.json"
     touch "$CONFIG_DIR/.change-backup.abcdef/.vless-reality-owned"
     touch "$CONFIG_DIR/foreign-file"
@@ -61,6 +65,8 @@ stop_fails=0
 uninstall_node >/dev/null
 [[ ! -e "$SERVICE" && ! -e "$CONFIG" && ! -e "$MARKER" ]]
 [[ ! -e "$XRAY_BIN" && ! -e "$LINK_FILE" && ! -e "$MANAGER" && ! -e "$SHORTCUT" ]]
+[[ ! -e "${LINK_FILE}.abcdef" && ! -e "$TEST_DIR/.xray-update.abcdef" ]]
+[[ ! -e "$ORPHAN_DIR" ]]
 [[ ! -e "$CONFIG_DIR/.change-backup.abcdef" && -f "$CONFIG_DIR/foreign-file" ]]
 (( account_present == 0 && group_present == 0 ))
 
