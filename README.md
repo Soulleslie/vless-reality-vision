@@ -12,6 +12,7 @@
 - 安装前检测现有 Xray 文件和服务，不覆盖已有配置
 - 自动生成 UUID、X25519 密钥和 Short ID
 - 从用户提供的同网段候选域名中筛选 REALITY 伪装目标，再按 VPS 实测延迟优选
+- 手动输入域名时检查 TLS 1.3、X25519、H2、证书和跳转，并显示握手耗时
 - 可单独查看筛选结果，不修改节点
 - 输出标准 `vless://` 客户端导入链接
 - 中文菜单管理启动、停止、重启、日志和状态
@@ -25,7 +26,7 @@
 1. 使用带公网 IPv4 的 Debian 或 Ubuntu VPS，以 root 身份执行。
 2. 在云服务商安全组中放行准备使用的 TCP 端口。若使用系统防火墙，也需放行该端口。
 3. 选择端口时直接回车使用 TCP 443；若已占用，脚本会提示重新输入其他端口（例如 8443）。
-4. 在伪装域名处直接回车，可逐行粘贴从 bgp.tools Forward DNS 找到的候选域名，以空行结束；也可以直接输入一个自定义域名。脚本不会自行扫描整个网段或抓取 bgp.tools 网页。导入后会从 VPS 核对域名的全部 IPv4 地址是否仍在本机同一个 `/24` 网段，并跳过有 IPv6 地址的域名，避免实际目标落到其他网络；再检查 TLS 1.3、X25519、H2、证书、跳转和明显的 Cloudflare 响应标志。通过后按两次握手平均耗时选最低值。这个耗时是 **VPS 到目标站点** 的耗时，不是客户端到 VPS 的延迟。
+4. 在伪装域名处直接回车，可逐行粘贴从 bgp.tools Forward DNS 找到的候选域名，以空行结束；也可以直接输入一个自定义域名。脚本不会自行扫描整个网段或抓取 bgp.tools 网页。导入后会从 VPS 核对域名的全部 IPv4 地址是否仍在本机同一个 `/24` 网段，并跳过有 IPv6 地址的域名，避免实际目标落到其他网络；再检查 TLS 1.3、X25519、H2、证书、跳转和明显的 Cloudflare 响应标志。手动输入的域名也会检查这些 TLS 和网站条件，但不要求同网段。通过后会显示 VPS 到目标站点的握手耗时；导入多个候选时按两次握手平均耗时选最低值。这个耗时不是客户端到 VPS 的延迟。
 5. 选择是否开启 TCP Fast Open；直接回车默认关闭。安装后可通过菜单第 17 项切换。
 
 ## 一键安装
@@ -82,6 +83,8 @@ v1.4.2 通过 systemd 后台任务切换 TFO；即使 SSH 因 Xray 重启而断�
 
 v1.5.0 移除内置域名列表和 `auto` 优选；新增导入同网段候选的 `nearby` 流程与 `sni-nearby` 命令。
 
+v1.6.0 手动安装、修改 SNI 时加入完整目标检查；新增只读 `sni-check` 和菜单第 18 项。跨域跳转会提示跳转目标域名，不会自动改用或请求该域名。
+
 ## 非交互安装
 
 参数顺序为端口、伪装域名、节点名称：
@@ -113,6 +116,7 @@ vless-reality port 8443            修改监听端口
 vless-reality sni 目标域名          修改 REALITY 伪装域名
 vless-reality sni nearby:/root/reality-neighbors.txt  优选后修改 SNI
 vless-reality sni-nearby /root/reality-neighbors.txt  仅查看同网段优选结果
+vless-reality sni-check example.com  检查单个伪装域名，不修改节点
 vless-reality tfo                  显示状态，交互式切换 TFO
 vless-reality tfo on               开启 TFO
 vless-reality tfo off              关闭 TFO
@@ -126,6 +130,8 @@ vless-reality uninstall            卸载并清理
 ```
 
 安装前也可以运行 `/root/vless-reality-setup.sh sni-nearby /root/reality-neighbors.txt` 查看筛选结果；该命令不安装或修改节点。菜单第 16 项可直接逐行粘贴候选域名。旧的 `auto` 参数已移除；用户自行创建的候选文件不会在卸载时删除。
+
+单独检查一个域名可运行 `/root/vless-reality-setup.sh sni-check example.com`，或在菜单选第 18 项。脚本从 VPS 验证 TLS 1.3、X25519 密钥交换、H2 协商、证书域名及信任链，并检查最多三次同域 HTTPS 跳转。若跳至其他域名，脚本会提示首个跨域跳转目标；重新输入并检查，直至不再跨域跳转。响应头中的 CDN/缓存线索和少数常见大型站点名称只会触发提示；不能可靠判断所有 CDN 或网站热度。测速结果是当前 VPS 的两次 TLS 握手耗时，DNS 和站点状态以后可能改变。网页内的 JavaScript 跳转无法通过 HTTP 响应头检查发现。
 
 修改已安装节点的 SNI 会重启 Xray；如果当前 SSH 经过这个节点，请先改用 VPS 直连 SSH。修改后运行 `vless-reality show`，更新客户端中的 SNI 和导入链接。
 

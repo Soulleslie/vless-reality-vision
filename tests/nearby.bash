@@ -26,9 +26,9 @@ openssl() {
 }
 curl() {
     case "${@: -1}" in
-        *cf.example.com/*) printf 'HTTP/2 200\ncf-ray: test\n\nFINAL_URL:https://cf.example.com/\n' ;;
-        *redirect.example.com/*) printf 'HTTP/2 302\n\nFINAL_URL:https://other.example.com/\n' ;;
-        *) printf 'HTTP/2 200\nserver: nginx\n\nFINAL_URL:%s\n' "${@: -1}" ;;
+        *cf.example.com/*) printf 'HTTP/2 200\ncf-ray: test\n\nFINAL_STATUS:200\n' ;;
+        *redirect.example.com/*) printf 'HTTP/2 302\nlocation: https://other.example.com/\n\nFINAL_STATUS:302\n' ;;
+        *) printf 'HTTP/2 200\nserver: nginx\n\nFINAL_STATUS:200\n' ;;
     esac
 }
 

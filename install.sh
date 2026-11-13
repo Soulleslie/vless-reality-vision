@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.5.0'
+SCRIPT_VERSION='1.6.0'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -265,7 +265,7 @@ target_tls_ok() {
 probe_target_latency() {
     local host="$1" start end
     start="$(date +%s%3N)" || return 1
-    target_tls_ok "$host" 5 || return 1
+    reality_tls_ok "$host" 5 || return 1
     end="$(date +%s%3N)" || return 1
     [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$end" -ge "$start" ]] || return 1
     printf '%s' "$((end - start))"
@@ -276,8 +276,100 @@ warned_reality_name() {
         *) return 1 ;;
     esac
 }
+reality_tls_ok() {
+    local host="$1" timeout_seconds="${2:-10}" output
+    output="$(timeout "$timeout_seconds" openssl s_client -4 -connect "${host}:443" -servername "$host" \
+        -tls1_3 -groups X25519 -alpn h2 -verify_hostname "$host" -verify_return_error \
+        -CApath /etc/ssl/certs -brief </dev/null 2>&1)" || return 1
+    [[ "$output" == *'Protocol version: TLSv1.3'* \
+        && "$output" == *'ALPN protocol: h2'* \
+        && "$output" == *'Verification: OK'* ]]
+}
+target_http_check() {
+    local host="$1" url="https://$1/" response status location line authority attempt
+    TARGET_HTTP_HEADERS=''
+    TARGET_REDIRECT_HOST=''
+    for ((attempt = 0; attempt < 4; attempt++)); do
+        # Follow only HTTPS redirects to the original hostname; never fetch another host.
+        response="$(curl -4sSI --noproxy '*' --connect-timeout 5 --max-time 8 \
+            -w $'\nFINAL_STATUS:%{http_code}\n' "$url" 2>/dev/null)" || return 1
+        TARGET_HTTP_HEADERS+=$'\n'"$response"
+        status="${response##*FINAL_STATUS:}"
+        status="${status%%$'\n'*}"
+        [[ "$status" =~ ^[0-9]{3}$ ]] || return 1
+        [[ "$status" == 3?? ]] || return 0
+        location=''
+        while IFS= read -r line; do
+            if [[ "${line,,}" == location:* ]]; then
+                location="${line#*:}"
+                location="${location#"${location%%[![:space:]]*}"}"
+                location="${location%$'\r'}"
+                break
+            fi
+        done <<< "$response"
+        [[ -n "$location" ]] || return 1
+        case "$location" in
+            https://*) url="$location" ;;
+            //*) url="https:$location" ;;
+            /*) url="https://$host$location" ;;
+            \?*) url="${url%%\?*}$location" ;;
+            *://*) return 1 ;;
+            *) url="${url%/*}/$location" ;;
+        esac
+        [[ "$url" =~ ^https://([^/?#]+) ]] || return 1
+        authority="${BASH_REMATCH[1],,}"
+        if [[ "$authority" != "$host" && "$authority" != "$host:443" ]]; then
+            TARGET_REDIRECT_HOST="${authority%:443}"
+            return 2
+        fi
+    done
+    return 1
+}
+popular_target_name() {
+    case "$1" in
+        google.com|*.google.com|youtube.com|*.youtube.com|amazon.com|*.amazon.com|\
+        microsoft.com|*.microsoft.com|apple.com|*.apple.com|facebook.com|*.facebook.com|\
+        netflix.com|*.netflix.com|cloudflare.com|*.cloudflare.com) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+check_sni_target() {
+    local host="$1" http_rc first second
+    valid_host "$host" || { warn '域名格式不正确；只填纯域名。' >&2; return 1; }
+    need_root
+    ensure_dependencies
+    say "正在从 VPS 检查 $host:443 的 TLS 1.3、X25519、H2、证书与跳转…"
+    reality_tls_ok "$host" || { warn 'TLS 1.3、X25519、H2 或证书域名校验未通过。' >&2; return 1; }
+    if target_http_check "$host"; then
+        :
+    else
+        http_rc=$?
+        if (( http_rc == 2 )); then
+            warn "该域名会跳转到 $TARGET_REDIRECT_HOST；请改用该目标域名重新检查，直至不再跨域跳转。" >&2
+        else
+            warn '网站响应或 HTTPS 跳转检查失败。' >&2
+        fi
+        return 1
+    fi
+    ok "必需条件通过：TLS 1.3、X25519、H2、证书匹配，未跳转到其他域名。"
+    if warned_reality_name "$host"; then
+        warn '该域名可能触发 Xray 的 REALITY 目标警告，建议换一个。'
+    fi
+    case "${TARGET_HTTP_HEADERS,,}" in
+        *$'\ncf-ray:'*|*$'\nserver: cloudflare'*|*$'\nx-cache:'*|*$'\nvia:'*|*$'\nx-akamai-'*)
+            warn '响应头显示可能使用 CDN 或缓存层；请自行核对解析 IP 和 ASN。' ;;
+    esac
+    if popular_target_name "$host"; then
+        warn '这是常见大型站点域名；建议比较更冷门的候选。'
+    else
+        say '热门程度无法可靠自动判断，请自行核对。'
+    fi
+    first="$(probe_target_latency "$host")" && second="$(probe_target_latency "$host")" \
+        && say "VPS 到目标的 TLS 握手耗时：${first} ms、${second} ms（平均 $(((first + second) / 2)) ms）。" \
+        || warn '耗时复测失败；必需条件已通过，建议稍后重测。'
+}
 nearby_target_ok() {
-    local host="$1" server_ip="$2" prefix addresses v6_addresses ip handshake headers final_url final_host
+    local host="$1" server_ip="$2" prefix addresses v6_addresses ip
     valid_host "$host" && ! warned_reality_name "$host" || return 1
     prefix="${server_ip%.*}."
     addresses="$(getent ahostsv4 "$host" 2>/dev/null | awk '$2 == "STREAM" {print $1}' | sort -u)" || return 1
@@ -287,20 +379,9 @@ nearby_target_ok() {
     done <<< "$addresses"
     v6_addresses="$(getent ahostsv6 "$host" 2>/dev/null | awk '$2 == "STREAM" {print $1}' || true)"
     [[ -z "$v6_addresses" ]] || return 1
-    handshake="$(timeout 8 openssl s_client -4 -connect "${host}:443" -servername "$host" \
-        -tls1_3 -groups X25519 -alpn h2 -verify_hostname "$host" -verify_return_error \
-        -CApath /etc/ssl/certs -brief </dev/null 2>&1)" || return 1
-    [[ "$handshake" == *'Protocol version: TLSv1.3'* \
-        && "$handshake" == *'ALPN protocol: h2'* \
-        && "$handshake" == *'Verification: OK'* ]] || return 1
-    headers="$(curl -4sSIL --noproxy '*' --connect-timeout 5 --max-time 8 --max-redirs 3 \
-        -w $'\nFINAL_URL:%{url_effective}\n' "https://$host/" 2>/dev/null)" || return 1
-    case "${headers,,}" in *$'\ncf-ray:'*|*$'\nserver: cloudflare'*) return 1 ;; esac
-    final_url="${headers##*FINAL_URL:}"
-    final_url="${final_url%%$'\n'*}"
-    [[ "$final_url" =~ ^https://([^/:]+) ]] || return 1
-    final_host="${BASH_REMATCH[1],,}"
-    [[ "$final_host" == "$host" ]]
+    reality_tls_ok "$host" || return 1
+    target_http_check "$host" || return 1
+    case "${TARGET_HTTP_HEADERS,,}" in *$'\ncf-ray:'*|*$'\nserver: cloudflare'*) return 1 ;; esac
 }
 load_nearby_candidates() {
     local file="${1:-}" line host
@@ -436,6 +517,16 @@ select_fastest_sni() {
 show_nearby_sni() (
     select_nearby_sni "${1:-}" || fail '候选域名没有通过同网段与 TLS 验证，请更换候选。'
     say '此操作只显示结果，不修改节点配置。需要修改时请运行 sni 新域名。'
+)
+show_sni_check() (
+    local host="${1:-}"
+    if [[ -z "$host" ]]; then
+        [[ -t 0 ]] || fail '非交互运行时请指定要检测的域名。'
+        read -r -p '请输入要检测的纯域名：' host || fail '已取消输入。'
+    fi
+    host="${host,,}"
+    check_sni_target "$host" || fail '域名未通过必需条件检查。'
+    say '检测只读，节点配置未修改。'
 )
 
 generate_reality_keys() {
@@ -747,7 +838,7 @@ install_node() {
         *)
             SNI="${SNI,,}"
             valid_host "$SNI" || fail '伪装域名格式不正确；只填域名，不要带 https://、端口或路径。'
-            if warned_reality_name "$SNI"; then warn '该域名会触发 Xray 的 REALITY 目标警告，建议换一个。'; fi
+            check_sni_target "$SNI" || fail '伪装域名未通过必需条件检查，请更换域名。'
             ;;
     esac
 
@@ -1111,7 +1202,6 @@ change_sni() {
         *)
             new="${new,,}"
             valid_host "$new" || fail '伪装域名格式不正确。'
-            if warned_reality_name "$new"; then warn '该域名会触发 Xray 的 REALITY 目标警告，建议换一个。'; fi
             ;;
     esac
     if [[ "$new" == "$SNI" ]]; then
@@ -1119,7 +1209,7 @@ change_sni() {
         fail '新域名与当前域名相同。'
     fi
     if (( ! nearby_sni )); then
-        target_tls_ok "$new" || fail "$new:443 未通过 TLS 1.3 与证书校验。"
+        check_sni_target "$new" || fail '新伪装域名未通过必需条件检查，原节点未修改。'
     fi
     if systemctl is-active --quiet xray; then
         was_active=1
@@ -1370,6 +1460,7 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   port [新端口]                修改端口
   sni [新域名|nearby:文件]     修改 SNI，或从同网段候选优选
   sni-nearby [文件]            导入并验证同网段候选，不修改节点
+  sni-check [域名]             检查单个伪装域名，不修改节点
   tfo [on|off]                 查看或切换 TCP Fast Open
   uuid                         重新生成 UUID
   rotate-keys                  轮换 REALITY 密钥和 Short ID
@@ -1425,6 +1516,7 @@ show_menu() {
     say ' 15. 查看运行日志'
     say ' 16. 导入并优选同网段域名（只查看）'
     say ' 17. 开关 TCP Fast Open'
+    say ' 18. 检测单个伪装域名（只查看）'
     say ' 00. 退出'
     say '=================================='
     menu_status
@@ -1439,7 +1531,7 @@ menu_action() {
         10) warn '操作后旧链接立即失效。'; rotate_keys ;;
         11) rename_node ;; 12) refresh_ip ;; 13) show_node ;;
         14) status_node ;; 15) log_node ;; 16) show_nearby_sni ;;
-        17) tfo_node ;; *) return 2 ;;
+        17) tfo_node ;; 18) show_sni_check ;; *) return 2 ;;
     esac
 }
 interactive_menu() {
@@ -1449,8 +1541,8 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-17，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-7]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-18，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-8]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
@@ -1473,6 +1565,7 @@ main() {
         port) shift; change_port "$@" ;;
         sni) shift; change_sni "$@" ;;
         sni-nearby) shift; [[ $# -le 1 ]] || fail "用法：$(cmd_name) sni-nearby [候选文件]"; show_nearby_sni "${1:-}" ;;
+        sni-check) shift; [[ $# -le 1 ]] || fail "用法：$(cmd_name) sni-check [域名]"; show_sni_check "${1:-}" ;;
         tfo) shift; tfo_node "$@" ;;
         __tfo-apply) shift; tfo_apply "$@" ;;
         uuid) change_uuid ;;
@@ -1485,7 +1578,7 @@ main() {
         log|logs) shift; log_node "$@" ;;
         update) update_xray ;;
         uninstall) uninstall_node ;;
-        [1-9]|1[0-7]) need_root; menu_action "$1" ;;
+        [1-9]|1[0-8]) need_root; menu_action "$1" ;;
         *) print_help; exit 2 ;;
     esac
 }
