@@ -5,10 +5,14 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.4.2'
+SCRIPT_VERSION='1.4.3'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
+CHECKER_API='https://api.github.com/repos/V2RaySSR/RealityChecker/releases/latest'
+CHECKER_BIN='/usr/local/bin/reality-checker'
+CHECKER_MARKER='/usr/local/bin/.vless-reality-checker-owned'
+CHECKER_TAG='# vless-reality-setup: RealityChecker'
 CONFIG_DIR='/usr/local/etc/xray'
 CONFIG='/usr/local/etc/xray/config.json'
 MARKER='/usr/local/etc/xray/.vless-reality-owned'
@@ -273,6 +277,161 @@ download_verified_release() {
         || fail '安装包 SHA-256 与 GitHub 官方发布信息不一致，已停止。'
 }
 
+checker_asset() {
+    case "$(dpkg --print-architecture 2>/dev/null)" in
+        amd64) printf 'reality-checker-linux-amd64.zip' ;;
+        arm64) printf 'reality-checker-linux-arm64.zip' ;;
+        *) fail 'RealityChecker 仅提供 amd64 和 arm64 安装包。' ;;
+    esac
+}
+checker_marker_is_ours() {
+    [[ -f "$CHECKER_MARKER" && ! -L "$CHECKER_MARKER" ]] \
+        && [[ "$(sed -n '1p' "$CHECKER_MARKER")" == "$CHECKER_TAG" ]] \
+        && [[ "$(sed -n '2p' "$CHECKER_MARKER")" =~ ^version=v[0-9]+[.][0-9]+[.][0-9]+$ ]] \
+        && [[ "$(sed -n '3p' "$CHECKER_MARKER")" =~ ^sha256=[0-9a-f]{64}$ ]]
+}
+checker_binary_is_ours() {
+    local expected actual
+    checker_marker_is_ours || return 1
+    [[ -f "$CHECKER_BIN" && ! -L "$CHECKER_BIN" ]] || return 1
+    expected="$(sed -n '3s/^sha256=//p' "$CHECKER_MARKER")"
+    actual="$(sha256sum -- "$CHECKER_BIN" | awk '{print $1}')" || return 1
+    [[ "$actual" == "$expected" ]]
+}
+checker_cleanup_preflight() {
+    checker_marker_is_ours || return 0
+    if [[ -e "$CHECKER_BIN" || -L "$CHECKER_BIN" ]]; then
+        checker_binary_is_ours || { warn 'RealityChecker 文件与安装记录不符；已保留，请先检查。' >&2; return 1; }
+    fi
+}
+remove_checker() {
+    checker_cleanup_preflight || return 1
+    checker_marker_is_ours || return 0
+    if [[ -e "$CHECKER_BIN" || -L "$CHECKER_BIN" ]]; then
+        rm -f -- "$CHECKER_BIN" || return 1
+    fi
+    rm -f -- "$CHECKER_MARKER" || return 1
+    [[ ! -e "$CHECKER_BIN" && ! -L "$CHECKER_BIN" && ! -e "$CHECKER_MARKER" ]] || return 1
+}
+install_checker() (
+    need_root
+    if checker_binary_is_ours; then
+        if [[ ! -x "$CHECKER_BIN" ]]; then
+            chmod 755 "$CHECKER_BIN" || fail '恢复 RealityChecker 执行权限失败。'
+        fi
+        ok "RealityChecker 已安装：$(sed -n '2s/^version=//p' "$CHECKER_MARKER")。"
+        return 0
+    fi
+    [[ ! -e "$CHECKER_BIN" && ! -L "$CHECKER_BIN" \
+        && ! -e "$CHECKER_MARKER" && ! -L "$CHECKER_MARKER" ]] \
+        || fail '发现已有 RealityChecker 程序或安装记录；为避免覆盖，已停止。'
+    ensure_dependencies
+    local asset stage_dir release_tag asset_json url digest archive binary_hash
+    asset="$(checker_asset)" || fail '无法选择 RealityChecker 安装包。'
+    stage_dir="$(mktemp -d "${CHECKER_BIN%/*}/.vless-reality-checker-stage.XXXXXX")" \
+        || fail '无法创建 RealityChecker 暂存目录。'
+    trap 'rm -rf -- "$stage_dir"' EXIT
+    printf 'vless-reality-setup\n' > "$stage_dir/.vless-reality-owned" \
+        || fail '无法标记 RealityChecker 暂存目录。'
+    curl -fLsS --retry 3 --connect-timeout 10 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' -o "$stage_dir/release.json" "$CHECKER_API" \
+        || fail '无法查询 RealityChecker 官方 GitHub Release。'
+    release_tag="$(jq -er '.tag_name | select(type == "string")' "$stage_dir/release.json")" \
+        || fail 'RealityChecker 发布信息缺少版本号。'
+    [[ "$release_tag" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || fail 'RealityChecker 版本号格式异常。'
+    [[ "$(jq -r '[.draft, .prerelease] | join(",")' "$stage_dir/release.json")" == 'false,false' ]] \
+        || fail 'RealityChecker 最新发布不是正式稳定版。'
+    asset_json="$(jq -c --arg name "$asset" \
+        '[(.assets // [])[] | select(.name == $name)] | if length == 1 then .[0] else null end' \
+        "$stage_dir/release.json")"
+    [[ "$asset_json" != null ]] || fail "RealityChecker 发布中没有 $asset。"
+    url="$(jq -er '.browser_download_url | select(type == "string")' <<< "$asset_json")" \
+        || fail 'RealityChecker 下载地址缺失。'
+    digest="$(jq -er '.digest | select(type == "string")' <<< "$asset_json")" \
+        || fail 'RealityChecker SHA-256 摘要缺失。'
+    [[ "$url" == "https://github.com/V2RaySSR/RealityChecker/releases/download/$release_tag/$asset" ]] \
+        || fail 'RealityChecker 下载地址异常。'
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'RealityChecker SHA-256 摘要格式异常。'
+    archive="$stage_dir/reality-checker.zip"
+    curl -fL --retry 3 --connect-timeout 10 --max-time 180 -o "$archive" "$url" \
+        || fail '下载 RealityChecker 失败。'
+    printf '%s  %s\n' "${digest#sha256:}" "$archive" | sha256sum --check --status \
+        || fail 'RealityChecker 压缩包 SHA-256 校验失败。'
+    unzip -q "$archive" reality-checker -d "$stage_dir" || fail '解压 RealityChecker 失败。'
+    [[ -f "$stage_dir/reality-checker" && ! -L "$stage_dir/reality-checker" \
+        && -s "$stage_dir/reality-checker" ]] || fail '压缩包中的程序文件异常。'
+    chmod 755 "$stage_dir/reality-checker" || fail '设置 RealityChecker 执行权限失败。'
+    binary_hash="$(sha256sum -- "$stage_dir/reality-checker" | awk '{print $1}')" \
+        || fail '无法记录 RealityChecker 程序摘要。'
+    printf '%s\nversion=%s\nsha256=%s\n' "$CHECKER_TAG" "$release_tag" "$binary_hash" \
+        > "$stage_dir/receipt" || fail '写入 RealityChecker 安装记录失败。'
+    chmod 600 "$stage_dir/receipt" || fail '设置 RealityChecker 安装记录权限失败。'
+    mv -- "$stage_dir/receipt" "$CHECKER_MARKER" || fail '写入 RealityChecker 安装记录失败。'
+    if ! mv -- "$stage_dir/reality-checker" "$CHECKER_BIN"; then
+        rm -f -- "$CHECKER_MARKER"
+        fail '安装 RealityChecker 程序失败。'
+    fi
+    checker_binary_is_ours || fail 'RealityChecker 安装后校验失败，请运行 checker uninstall 清理。'
+    ok "RealityChecker ${release_tag} 已安装：$CHECKER_BIN"
+)
+checker_status() {
+    if checker_binary_is_ours; then
+        if [[ -x "$CHECKER_BIN" ]]; then
+            say "RealityChecker：已安装 $(sed -n '2s/^version=//p' "$CHECKER_MARKER")（本脚本管理）"
+        else
+            warn 'RealityChecker：程序内容正常，但执行权限已丢失；运行 checker install 可恢复。'
+        fi
+    elif checker_marker_is_ours; then
+        warn 'RealityChecker：安装记录存在，但程序缺失或内容已改变。'
+    elif [[ -e "$CHECKER_MARKER" || -L "$CHECKER_MARKER" ]]; then
+        warn 'RealityChecker：发现无法确认归属的安装记录，已保留。'
+    elif [[ -e "$CHECKER_BIN" || -L "$CHECKER_BIN" ]]; then
+        warn 'RealityChecker：发现同名程序，但不属于本脚本。'
+    else
+        say 'RealityChecker：未安装。'
+    fi
+}
+checker_command() {
+    local action="${1:-status}" host="${2:-}"
+    need_root
+    case "$action" in
+        status) [[ $# -le 1 ]] || fail '用法：checker status'; checker_status ;;
+        install) [[ $# -le 1 ]] || fail '用法：checker install'; install_checker ;;
+        uninstall)
+            [[ $# -le 1 ]] || fail '用法：checker uninstall'
+            if ! checker_marker_is_ours; then
+                clean_checker_stage || fail 'RealityChecker 暂存文件未清理。'
+                say '没有本脚本管理的 RealityChecker；未删除其他程序。'
+                return 0
+            fi
+            remove_checker || fail 'RealityChecker 未清理；请检查程序与安装记录。'
+            clean_checker_stage || fail 'RealityChecker 暂存文件未清理。'
+            ok '本脚本安装的 RealityChecker 已清理。'
+            ;;
+        check)
+            [[ $# -eq 2 ]] || fail '用法：checker check 域名'
+            valid_host "$host" || fail '请输入纯域名。'
+            checker_binary_is_ours || fail '请先安装本脚本管理的 RealityChecker。'
+            [[ -x "$CHECKER_BIN" ]] || fail 'RealityChecker 没有执行权限；请运行 checker install 修复。'
+            "$CHECKER_BIN" check "$host"
+            ;;
+        *) fail '用法：checker [status|install|uninstall|check 域名]' ;;
+    esac
+}
+checker_menu() {
+    need_root
+    checker_status
+    local choice host
+    read -r -p 'RealityChecker [1 安装 / 2 检测域名 / 3 卸载 / 0 返回]：' choice || return 0
+    case "$choice" in
+        1) checker_command install ;;
+        2) read -r -p '请输入纯域名：' host || return 0; checker_command check "$host" ;;
+        3) checker_command uninstall ;;
+        0|'') return 0 ;;
+        *) warn '请输入 0、1、2 或 3。' ;;
+    esac
+}
+
 installed_version() {
     if [[ -x "$XRAY_BIN" ]]; then
         "$XRAY_BIN" version 2>/dev/null | awk 'NR == 1 {print $2}'
@@ -524,6 +683,41 @@ clean_config_residue() (
         rm -f -- "$entry" || return 1
     done
 )
+# 清理 RealityChecker 安装中断留下的、带有脚本标记的暂存目录。
+clean_checker_stage() (
+    local dir entry owner file unknown
+    shopt -s nullglob dotglob
+    for dir in "${CHECKER_BIN%/*}"/.vless-reality-checker-stage.??????; do
+        [[ -d "$dir" && ! -L "$dir" ]] || continue
+        owner="$(stat -c %u -- "$dir")" || return 1
+        [[ "$owner" == "$EUID" ]] || { warn "暂存目录不属于当前用户，已保留：$dir" >&2; continue; }
+        if [[ ! -f "$dir/.vless-reality-owned" || -L "$dir/.vless-reality-owned" \
+            || "$(< "$dir/.vless-reality-owned")" != vless-reality-setup ]]; then
+            warn "暂存目录没有本脚本的标记，已保留：$dir" >&2
+            continue
+        fi
+        unknown=0
+        for entry in "$dir"/*; do
+            case "${entry##*/}" in
+                .vless-reality-owned) ;;
+                release.json|reality-checker.zip|reality-checker|receipt)
+                    [[ -f "$entry" && ! -L "$entry" ]] || unknown=1 ;;
+                *) unknown=1 ;;
+            esac
+        done
+        if (( unknown )); then
+            warn "暂存目录含有其他文件，已保留：$dir" >&2
+            continue
+        fi
+        for file in release.json reality-checker.zip reality-checker receipt; do
+            entry="$dir/$file"
+            [[ -f "$entry" && ! -L "$entry" ]] || continue
+            rm -f -- "$entry" || return 1
+        done
+        rm -f -- "$dir/.vless-reality-owned" || return 1
+        rmdir -- "$dir" || return 1
+    done
+)
 # 清理被中断的链接写入或程序升级留下的、当前用户创建的临时文件。
 clean_runtime_residue() (
     local entry owner dir file
@@ -570,6 +764,7 @@ clean_runtime_residue() (
         rm -f -- "$dir/.vless-reality-owned" || return 1
         rmdir -- "$dir" 2>/dev/null || warn "临时目录含有其他文件，已保留：$dir" >&2
     done
+    clean_checker_stage
 )
 finish_install() {
     local result=$? cleanup_ok=1
@@ -632,7 +827,7 @@ install_node() {
     . /etc/os-release
     [[ "${ID:-}" == debian || "${ID:-}" == ubuntu ]] || fail '这个脚本仅支持 Debian 和 Ubuntu。'
     check_install_eligibility
-    local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0 tfo_choice="${4:-off}"
+    local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0 tfo_choice="${4:-off}" checker_choice=0
     default_name="Reality-$(hostname -s)"
 
     if [[ -z "$raw_port" ]]; then
@@ -676,6 +871,9 @@ install_node() {
         off) TFO_ENABLED=0 ;;
         *) fail 'TFO 参数必须为 on 或 off。' ;;
     esac
+    if (( interactive )) && confirm '是否安装 RealityChecker 检测工具？默认不安装 [y/N]：'; then
+        checker_choice=1
+    fi
 
     if (( interactive )); then
         say
@@ -685,6 +883,7 @@ install_node() {
         if (( auto_sni )); then say "  SNI： $SNI:443（自动优选）"; else say "  SNI： $SNI:443"; fi
         say "  名称：$NODE_NAME"
         if (( TFO_ENABLED )); then say '  TFO： 开启'; else say '  TFO： 关闭'; fi
+        if (( checker_choice )); then say '  RealityChecker： 安装'; else say '  RealityChecker： 不安装'; fi
         warn "  请确认云安全组已放行 TCP ${PORT}，无需开放 TCP 80"
         step '————————————————————————————————'
         confirm '开始安装？[y/N]：' || { say '已取消安装。'; return 0; }
@@ -774,6 +973,11 @@ EOF
     TEMP_DIR=''
     ok "安装完成：Xray ${RELEASE_VERSION} 正在监听 TCP ${PORT}。"
     warn "请确认云安全组已放行 TCP ${PORT}。导入链接包含 UUID，请勿公开分享。"
+    if (( checker_choice )); then
+        if ! install_checker; then
+            warn '节点已安装，但 RealityChecker 安装失败；稍后可从菜单第 18 项重试。' >&2
+        fi
+    fi
 }
 
 show_node() {
@@ -1201,11 +1405,14 @@ uninstall_node() {
         if [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]]; then
             shortcut_is_ours || fail '快捷命令不属于本脚本，未删除。'
         fi
-        if [[ ! -e "$MANAGER" && ! -e "$SHORTCUT" ]] && ! tfo_sysctl_is_ours; then
+        if [[ ! -e "$MANAGER" && ! -e "$SHORTCUT" ]] \
+            && ! tfo_sysctl_is_ours && ! checker_marker_is_ours; then
             fail '没有发现本脚本的残留文件。'
         fi
         confirm '节点记录已不存在，清理本脚本的残留管理入口和 TFO 设置？[y/N]：' \
             || { say '已取消清理。'; return 0; }
+        checker_cleanup_preflight || fail 'RealityChecker 程序已改变，未继续清理。'
+        remove_checker || fail '清理 RealityChecker 失败。'
         disable_kernel_tfo || fail '清理残留 TFO 设置失败。'
         clean_runtime_residue || fail '清理临时文件失败。'
         if shortcut_is_ours; then rm -f -- "$SHORTCUT" || fail '删除快捷命令失败。'; fi
@@ -1215,6 +1422,7 @@ uninstall_node() {
     fi
     [[ -f "$MARKER" && ! -L "$MARKER" ]] || fail '安装记录异常，已停止以保护现有服务。'
     confirm '确定卸载节点并清理本脚本创建的全部文件？[y/N]：' || { say '已取消卸载。'; return 0; }
+    checker_cleanup_preflight || fail 'RealityChecker 程序已改变，未继续卸载。'
     if [[ -e "$SERVICE" ]]; then
         [[ -f "$SERVICE" && ! -L "$SERVICE" ]] || fail '服务文件不是普通文件，已停止以保护现有服务。'
         grep -qFx 'ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json' "$SERVICE" \
@@ -1227,6 +1435,7 @@ uninstall_node() {
         fail '发现运行中的 xray 服务，但本脚本的服务文件已不存在；未继续删除。'
     fi
     systemctl is-active --quiet xray && fail 'Xray 仍在运行，未继续删除文件。'
+    remove_checker || fail '删除 RealityChecker 失败；保留节点安装记录以便重试。'
     disable_kernel_tfo || fail '恢复内核 TCP Fast Open 设置失败；保留节点文件以便重试。'
     rm -f -- "$SERVICE" || fail '删除 systemd 服务文件失败。'
     systemctl daemon-reload || fail '刷新 systemd 失败；保留安装记录以便重试。'
@@ -1244,6 +1453,7 @@ uninstall_node() {
     rm -f -- "$MANAGER" || fail '删除管理脚本失败。'
     [[ ! -e "$XRAY_BIN" && ! -e "$SERVICE" && ! -e "$CONFIG" \
         && ! -e "$LINK_FILE" ]] || fail '卸载后仍发现节点文件，请手动检查。'
+    checker_marker_is_ours && fail '卸载后仍发现本脚本的 RealityChecker。'
     tfo_sysctl_is_ours && fail '卸载后仍发现本脚本的 TFO 设置。'
     if getent passwd xray >/dev/null 2>&1 || getent group xray >/dev/null 2>&1 \
         || systemctl is-active --quiet xray; then
@@ -1268,6 +1478,7 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   port [新端口]                修改端口
   sni [新域名|auto]            修改或自动优选 REALITY 伪装域名
   sni-best                     查看当前测速延迟最低的域名，不修改节点
+  checker [status|install|uninstall|check 域名]  管理 RealityChecker
   tfo [on|off]                 查看或切换 TCP Fast Open
   uuid                         重新生成 UUID
   rotate-keys                  轮换 REALITY 密钥和 Short ID
@@ -1323,6 +1534,7 @@ show_menu() {
     say ' 15. 查看运行日志'
     say ' 16. 查看当前测速延迟最低的域名'
     say ' 17. 开关 TCP Fast Open'
+    say ' 18. 管理 RealityChecker（可选）'
     say ' 00. 退出'
     say '=================================='
     menu_status
@@ -1337,7 +1549,7 @@ menu_action() {
         10) warn '操作后旧链接立即失效。'; rotate_keys ;;
         11) rename_node ;; 12) refresh_ip ;; 13) show_node ;;
         14) status_node ;; 15) log_node ;; 16) show_fastest_sni ;;
-        17) tfo_node ;; *) return 2 ;;
+        17) tfo_node ;; 18) checker_menu ;; *) return 2 ;;
     esac
 }
 interactive_menu() {
@@ -1347,8 +1559,8 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-17，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-7]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-18，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-8]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
@@ -1371,6 +1583,7 @@ main() {
         port) shift; change_port "$@" ;;
         sni) shift; change_sni "$@" ;;
         sni-best) show_fastest_sni ;;
+        checker) shift; checker_command "$@" ;;
         tfo) shift; tfo_node "$@" ;;
         __tfo-apply) shift; tfo_apply "$@" ;;
         uuid) change_uuid ;;
@@ -1383,7 +1596,7 @@ main() {
         log|logs) shift; log_node "$@" ;;
         update) update_xray ;;
         uninstall) uninstall_node ;;
-        [1-9]|1[0-7]) need_root; menu_action "$1" ;;
+        [1-9]|1[0-8]) need_root; menu_action "$1" ;;
         *) print_help; exit 2 ;;
     esac
 }

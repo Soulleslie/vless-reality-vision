@@ -45,6 +45,8 @@ XRAY_BIN="$TEST_DIR/xray"
 LINK_FILE="$TEST_DIR/link.txt"
 MANAGER="$TEST_DIR/manager.sh"
 SHORTCUT="$TEST_DIR/shortcut"
+CHECKER_BIN="$TEST_DIR/reality-checker"
+CHECKER_MARKER="$TEST_DIR/.vless-reality-checker-owned"
 TFO_SYSCTL="$TEST_DIR/tfo.conf"
 KERNEL_STATE="$TEST_DIR/kernel"
 sysctl() {
@@ -69,26 +71,50 @@ make_fixture() {
     printf '2' > "$KERNEL_STATE"
     printf '%s\n# original=0\n# applied=2\nnet.ipv4.tcp_fastopen = 2\n' "$TFO_TAG" > "$TFO_SYSCTL"
 }
+make_checker_fixture() {
+    printf 'checker program\n' > "$CHECKER_BIN"
+    printf '%s\nversion=v2.2.3\nsha256=%s\n' "$CHECKER_TAG" \
+        "$(sha256sum "$CHECKER_BIN" | awk '{print $1}')" > "$CHECKER_MARKER"
+}
 
 make_fixture
+make_checker_fixture
 stop_fails=1
 if (uninstall_node >/dev/null 2>&1); then
     printf '卸载应在停止服务失败时中止\n' >&2
     exit 1
 fi
 [[ -f "$SERVICE" && -f "$CONFIG" && -f "$MARKER" ]]
+[[ -f "$CHECKER_BIN" && -f "$CHECKER_MARKER" ]]
 [[ -f "$TFO_SYSCTL" && "$(kernel_tfo_value)" == 2 ]]
 
 stop_fails=0
 uninstall_node >/dev/null
 [[ ! -e "$SERVICE" && ! -e "$CONFIG" && ! -e "$MARKER" ]]
 [[ ! -e "$XRAY_BIN" && ! -e "$LINK_FILE" && ! -e "$MANAGER" && ! -e "$SHORTCUT" ]]
+[[ ! -e "$CHECKER_BIN" && ! -e "$CHECKER_MARKER" ]]
 [[ ! -e "${LINK_FILE}.abcdef" && ! -e "$TEST_DIR/.xray-update.abcdef" ]]
 [[ ! -e "$ORPHAN_DIR" ]]
 [[ ! -e "$SNI_ORPHAN_DIR" ]]
 [[ ! -e "$TFO_SYSCTL" && "$(kernel_tfo_value)" == 0 ]]
 [[ ! -e "$CONFIG_DIR/.change-backup.abcdef" && -f "$CONFIG_DIR/foreign-file" ]]
 (( account_present == 0 && group_present == 0 ))
+
+rm -f -- "$CONFIG_DIR/foreign-file"
+account_present=1
+group_present=1
+make_fixture
+make_checker_fixture
+printf 'modified\n' >> "$CHECKER_BIN"
+if (uninstall_node >/dev/null 2>&1); then
+    printf '程序被修改时卸载应在停止节点前中止\n' >&2
+    exit 1
+fi
+[[ -f "$SERVICE" && -f "$CONFIG" && -f "$MARKER" \
+    && -f "$CHECKER_BIN" && -f "$CHECKER_MARKER" ]]
+sed -i '$d' "$CHECKER_BIN"
+uninstall_node >/dev/null
+[[ ! -e "$CHECKER_BIN" && ! -e "$CHECKER_MARKER" ]]
 
 rm -f -- "$CONFIG_DIR/foreign-file"
 account_present=1
@@ -123,6 +149,16 @@ uninstall_node >/dev/null
 printf '%s\n' "$SHORTCUT_TAG" > "$SHORTCUT"
 uninstall_node >/dev/null
 [[ ! -e "$SHORTCUT" ]]
+
+make_checker_fixture
+uninstall_node >/dev/null
+[[ ! -e "$CHECKER_BIN" && ! -e "$CHECKER_MARKER" ]]
+
+printf 'foreign checker\n' > "$CHECKER_BIN"
+printf 'VLESS + REALITY + Vision 节点管理脚本\n' > "$MANAGER"
+uninstall_node >/dev/null
+[[ -f "$CHECKER_BIN" && ! -e "$CHECKER_MARKER" ]]
+rm -f -- "$CHECKER_BIN"
 
 account_present=1
 group_present=1
