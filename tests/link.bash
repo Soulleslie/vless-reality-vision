@@ -15,6 +15,7 @@ load_metadata() {
     SERVER_IP=203.0.113.1
     PUBLIC_KEY=test-public-key
     SHORT_ID=0123456789abcdef
+    CLIENT_ENCRYPTION="${TEST_CLIENT_ENCRYPTION:-none}"
 }
 config_uuid() { printf '00000000-0000-4000-8000-000000000000'; }
 
@@ -28,4 +29,8 @@ fi
 unset -f mv
 show_node >/dev/null
 [[ "$(< "$LINK_FILE")" == vless://* ]]
+[[ "$(< "$LINK_FILE")" == *'encryption=none'* ]]
+TEST_CLIENT_ENCRYPTION='mlkem768x25519plus.native.0rtt.ABC_def-123'
+show_node >/dev/null
+[[ "$(< "$LINK_FILE")" == *'encryption=mlkem768x25519plus.native.0rtt.ABC_def-123'* ]]
 printf '客户端链接原子写入验证通过\n'

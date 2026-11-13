@@ -17,6 +17,7 @@
 - 中文菜单管理启动、停止、重启、日志和状态
 - 修改端口、SNI、UUID、REALITY 密钥和节点名称
 - 可选开启 TCP Fast Open，并在菜单或命令行切换
+- 可选开启 VLESS Encryption；生成成对参数并更新客户端导入链接
 - 可选安装并运行 [RealityChecker](https://github.com/V2RaySSR/RealityChecker) 检测伪装域名，卸载节点时清理本脚本安装的程序
 - 升级失败、配置修改失败和首次安装失败时回滚
 - 卸载时只清理本脚本拥有的文件
@@ -27,7 +28,7 @@
 2. 在云服务商安全组中放行准备使用的 TCP 端口。若使用系统防火墙，也需放行该端口。
 3. 选择端口时直接回车使用 TCP 443；若已占用，脚本会提示重新输入其他端口（例如 8443）。
 4. 安装时伪装域名直接回车，会立即测速并显示实测延迟最低的域名，然后再提示输入节点名称；也可以手动输入一个支持 TLS 1.3 的域名。自动优选从脚本内的 68 个候选域名并发初筛，跳过证书或 TLS 1.3 验证失败的站点，再复测全部通过初筛的域名，选两次握手平均耗时最低的站点。这个耗时是 **VPS 到伪装站点** 的耗时，不是客户端到 VPS 的延迟。若候选全部不可用，请手动指定域名。
-5. 选择是否开启 TCP Fast Open；直接回车默认关闭。安装后可通过菜单第 17 项切换。交互安装还会询问是否安装 RealityChecker，直接回车默认不安装。
+5. 选择是否开启 TCP Fast Open 和 VLESS Encryption；两者直接回车都默认关闭。安装后可分别通过菜单第 17、19 项切换。交互安装还会询问是否安装 RealityChecker，直接回车默认不安装。
 
 ## 一键安装
 
@@ -87,6 +88,8 @@ v1.4.4 补齐 RealityChecker 的单域名、空格分隔批量域名和 CSV 文�
 
 v1.4.5 修正 RealityChecker v2.2.3 将 RealiTLScanner CSV 的 `TLS` 列误当域名的问题：按 `CERT_DOMAIN` 列名提取域名，生成临时兼容文件后再检测。
 
+v1.5.0 增加 VLESS Encryption 开关：通过 `xray vlessenc` 生成配对参数，写入服务端配置和客户端链接；切换由 systemd 后台任务完成，失败时恢复原配置。
+
 ## 非交互安装
 
 参数顺序为端口、伪装域名、节点名称：
@@ -107,6 +110,12 @@ v1.4.5 修正 RealityChecker v2.2.3 将 RealiTLScanner CSV 的 `TLS` 列误当�
 /root/vless-reality-setup.sh install 443 auto Reality-SG on
 ```
 
+第五个参数可指定 VLESS Encryption，省略时默认关闭。以下示例关闭 TFO、开启 VLESS Encryption：
+
+```bash
+/root/vless-reality-setup.sh install 443 auto Reality-SG off on
+```
+
 ## 常用命令
 
 ```text
@@ -125,6 +134,9 @@ vless-reality checker uninstall    单独卸载 RealityChecker
 vless-reality tfo                  显示状态，交互式切换 TFO
 vless-reality tfo on               开启 TFO
 vless-reality tfo off              关闭 TFO
+vless-reality vlessenc             查看状态，交互式切换 VLESS Encryption
+vless-reality vlessenc on          开启 VLESS Encryption
+vless-reality vlessenc off         关闭 VLESS Encryption
 vless-reality uuid                 重新生成 UUID
 vless-reality rotate-keys          轮换 REALITY 密钥和 Short ID
 vless-reality rename Reality-US    修改节点名称
@@ -151,6 +163,12 @@ TFO 默认关闭。开启时，脚本设置 Xray 入站的 `sockopt.tcpFastOpen`
 TFO 只影响新建 TCP 连接。客户端若支持 TFO，也需要在客户端单独开启；`vless://` 导入链接不会替客户端设置 TFO。部分网络对 TFO 的兼容性较差，因此默认关闭。
 
 切换 TFO 会重启 Xray。如果 SSH 连接经过这个 VLESS 节点，重启可能切断当前 SSH 会话；建议通过 VPS 的直连 SSH 操作。切换由 systemd 后台任务完成，断线后任务仍会继续。重连后运行 `vless-reality status` 核对结果；失败详情可用 `journalctl -u vless-reality-tfo -n 30 --no-pager` 查看。
+
+## VLESS Encryption
+
+默认关闭，客户端 `encryption=none` 与服务端 `decryption=none` 对应；REALITY 仍会加密客户端到 VPS 的传输。开启时脚本调用 Xray 官方 `xray vlessenc`，选用较短的 X25519 认证参数对（混合密钥交换仍包含 ML-KEM），将服务端 `decryption` 写入 Xray 配置，并把配套的客户端 `encryption` 记录在节点安装记录和新 `vless://` 链接中。REALITY、Vision 和 TFO 设置不变。
+
+开启或关闭后旧客户端链接会失效，运行 `vless-reality show` 获取新链接并重新导入；客户端必须支持 VLESS Encryption。建议使用 VPS 直连 SSH 或服务商控制台操作；切换会重启 Xray，若 SSH 经过此节点，可能断线。后台任务会继续执行并验证或回滚。重连后用 `vless-reality status` 查看结果，失败日志见 `journalctl -u vless-reality-enc -n 30 --no-pager`。卸载节点时会清理这些参数和链接。
 
 卸载会先停止并禁用本脚本创建的 Xray 服务，然后恢复本脚本设置的 TFO 内核参数，删除 Xray 程序、由本脚本安装的 RealityChecker、配置、安装记录、节点链接、管理脚本、快捷命令、配置备份和可识别的中断临时文件，最后核验服务与专用账号是否仍存在。任一步失败会报错，并尽可能保留安装记录，便于修正问题后重试。
 

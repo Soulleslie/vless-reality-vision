@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 
 XRAY_TEST_BIN="${1:?请传入 Xray 二进制路径}"
+ENC_MODE="${2:-off}"
 TEST_DIR="$(mktemp -d)"
 server_pid=''
 client_pid=''
@@ -27,6 +28,14 @@ private="$(awk -F': *' '/^PrivateKey:/ {print $2; exit}' <<< "$key_output")"
 public="$(awk -F': *' '/^Password \(PublicKey\):/ {print $2; exit}' <<< "$key_output")"
 short_id='0123456789abcdef'
 [[ -n "$private" && -n "$public" ]]
+decryption=none
+encryption=none
+if [[ "$ENC_MODE" == on ]]; then
+    enc_output="$($XRAY_TEST_BIN vlessenc)"
+    decryption="$(awk -F '"' '/"decryption":/ {print $4; exit}' <<< "$enc_output")"
+    encryption="$(awk -F '"' '/"encryption":/ {print $4; exit}' <<< "$enc_output")"
+    [[ "$decryption" == mlkem768x25519plus.* && "$encryption" == mlkem768x25519plus.* ]]
+fi
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
     -subj '/CN=www.amazon.com' -keyout "$TEST_DIR/target.key" \
     -out "$TEST_DIR/target.crt" >/dev/null 2>&1
@@ -35,24 +44,24 @@ openssl s_server -quiet -accept "127.0.0.1:${target_port}" \
     -tls1_3 -alpn h2,http/1.1 > "$TEST_DIR/target.log" 2>&1 &
 target_pid=$!
 
-jq -n --arg id "$uuid" --arg private "$private" --arg sid "$short_id" \
+jq -n --arg id "$uuid" --arg private "$private" --arg sid "$short_id" --arg decryption "$decryption" \
     --arg target "127.0.0.1:${target_port}" --argjson port "$server_port" '{
       log: {loglevel: "debug"},
       inbounds: [{listen: "127.0.0.1", port: $port, protocol: "vless",
-        settings: {clients: [{id: $id, flow: "xtls-rprx-vision"}], decryption: "none"},
+        settings: {clients: [{id: $id, flow: "xtls-rprx-vision"}], decryption: $decryption},
         streamSettings: {network: "tcp", security: "reality", realitySettings: {
           target: $target, serverNames: ["www.amazon.com"],
           privateKey: $private, shortIds: [$sid]}}}],
       outbounds: [{protocol: "freedom"}]
     }' > "$TEST_DIR/server.json"
 
-jq -n --arg id "$uuid" --arg public "$public" --arg sid "$short_id" \
+jq -n --arg id "$uuid" --arg public "$public" --arg sid "$short_id" --arg encryption "$encryption" \
     --argjson server_port "$server_port" --argjson client_port "$client_port" '{
       log: {loglevel: "warning"},
       inbounds: [{listen: "127.0.0.1", port: $client_port, protocol: "socks",
         settings: {auth: "noauth", udp: false}}],
       outbounds: [{protocol: "vless", settings: {vnext: [{address: "127.0.0.1",
-        port: $server_port, users: [{id: $id, flow: "xtls-rprx-vision", encryption: "none"}]}]},
+        port: $server_port, users: [{id: $id, flow: "xtls-rprx-vision", encryption: $encryption}]}]},
         streamSettings: {network: "tcp", security: "reality", realitySettings: {
           serverName: "www.amazon.com", fingerprint: "chrome",
           publicKey: $public, shortId: $sid}}}]

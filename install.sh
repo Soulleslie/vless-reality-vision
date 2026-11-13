@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.4.5'
+SCRIPT_VERSION='1.5.0'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -38,6 +38,8 @@ INSTALL_STARTED=0
 INSTALL_COMMITTED=0
 MANAGER_COPIED=0
 TFO_ENABLED=0
+VLESS_DECRYPTION='none'
+CLIENT_ENCRYPTION='none'
 SNI_CANDIDATES=(
     www.amazon.com www.samsung.com www.nvidia.com
     digitalassets.tesla.com electronics.sony.com www.xbox.com amd.com
@@ -605,12 +607,21 @@ generate_reality_keys() {
     [[ "$private" =~ ^[A-Za-z0-9_-]{43}$ && "$public" =~ ^[A-Za-z0-9_-]{43}$ ]] || return 1
     printf '%s\n%s\n' "$private" "$public"
 }
+generate_vless_encryption_pair() {
+    local output server client
+    output="$($XRAY_BIN vlessenc)" || return 1
+    server="$(awk -F '"' '/"decryption":/ {print $4; exit}' <<< "$output")"
+    client="$(awk -F '"' '/"encryption":/ {print $4; exit}' <<< "$output")"
+    [[ "$server" =~ ^mlkem768x25519plus[.]native[.]600s[.][A-Za-z0-9_-]+$ \
+        && "$client" =~ ^mlkem768x25519plus[.]native[.]0rtt[.][A-Za-z0-9_-]+$ ]] || return 1
+    printf '%s\n%s\n' "$server" "$client"
+}
 
 write_marker() {
     local tmp
     tmp="$(mktemp "$CONFIG_DIR/.marker.XXXXXX")" || return 1
-    if printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
-        "$PORT" "$SNI" "$NODE_NAME" "$SERVER_IP" "$PUBLIC_KEY" "$SHORT_ID" > "$tmp" \
+    if printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$PORT" "$SNI" "$NODE_NAME" "$SERVER_IP" "$PUBLIC_KEY" "$SHORT_ID" "$CLIENT_ENCRYPTION" > "$tmp" \
         && chown root:xray "$tmp" && chmod 640 "$tmp" && mv -f -- "$tmp" "$MARKER"; then
         return 0
     fi
@@ -628,10 +639,13 @@ load_metadata() {
     SERVER_IP="${lines[3]:-}"
     PUBLIC_KEY="${lines[4]:-}"
     SHORT_ID="${lines[5]:-}"
+    CLIENT_ENCRYPTION="${lines[6]:-none}"
     valid_port "$PORT" || fail '安装记录中的端口无效。'
     valid_host "$SNI" || fail '安装记录中的 SNI 无效。'
     [[ -n "$NODE_NAME" && -n "$SERVER_IP" && -n "$PUBLIC_KEY" && -n "$SHORT_ID" ]] \
         || fail '安装记录不完整。'
+    [[ "$CLIENT_ENCRYPTION" == none || "$CLIENT_ENCRYPTION" =~ ^mlkem768x25519plus[.]native[.]0rtt[.][A-Za-z0-9_-]+$ ]] \
+        || fail '安装记录中的 VLESS Encryption 参数无效。'
 }
 
 config_uuid() {
@@ -863,7 +877,7 @@ write_config() {
     local uuid="$1" private_key="$2"
     jq -n \
         --arg uuid "$uuid" --arg privateKey "$private_key" --arg shortId "$SHORT_ID" \
-        --arg sni "$SNI" --argjson port "$PORT" --argjson tfo "$TFO_ENABLED" '
+        --arg sni "$SNI" --arg decryption "$VLESS_DECRYPTION" --argjson port "$PORT" --argjson tfo "$TFO_ENABLED" '
         {
           log: {loglevel: "warning"},
           inbounds: [{
@@ -872,7 +886,7 @@ write_config() {
             protocol: "vless",
             settings: {
               clients: [{id: $uuid, flow: "xtls-rprx-vision", email: "default"}],
-              decryption: "none"
+              decryption: $decryption
             },
             streamSettings: {
               network: "tcp",
@@ -897,13 +911,13 @@ write_config() {
 
 install_node() {
     need_root
-    [[ $# -le 4 ]] || fail "用法：$(cmd_name) install [端口] [伪装域名] [节点名称] [on|off]"
+    [[ $# -le 5 ]] || fail "用法：$(cmd_name) install [端口] [伪装域名] [节点名称] [TFO:on|off] [VLESS加密:on|off]"
     [[ -r /etc/os-release ]] || fail '无法识别系统。'
     # shellcheck source=/dev/null
     . /etc/os-release
     [[ "${ID:-}" == debian || "${ID:-}" == ubuntu ]] || fail '这个脚本仅支持 Debian 和 Ubuntu。'
     check_install_eligibility
-    local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0 tfo_choice="${4:-off}" checker_choice=0
+    local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0 tfo_choice="${4:-off}" enc_choice="${5:-off}" checker_choice=0
     default_name="Reality-$(hostname -s)"
 
     if [[ -z "$raw_port" ]]; then
@@ -947,6 +961,10 @@ install_node() {
         off) TFO_ENABLED=0 ;;
         *) fail 'TFO 参数必须为 on 或 off。' ;;
     esac
+    if (( interactive )) && confirm '是否开启 VLESS Encryption？默认关闭 [y/N]：'; then
+        enc_choice=on
+    fi
+    case "$enc_choice" in on|off) ;; *) fail 'VLESS Encryption 参数必须为 on 或 off。' ;; esac
     if (( interactive )) && confirm '是否安装 RealityChecker 检测工具？默认不安装 [y/N]：'; then
         checker_choice=1
     fi
@@ -959,6 +977,7 @@ install_node() {
         if (( auto_sni )); then say "  SNI： $SNI:443（自动优选）"; else say "  SNI： $SNI:443"; fi
         say "  名称：$NODE_NAME"
         if (( TFO_ENABLED )); then say '  TFO： 开启'; else say '  TFO： 关闭'; fi
+        say "  VLESS Encryption：$enc_choice"
         if (( checker_choice )); then say '  RealityChecker： 安装'; else say '  RealityChecker： 不安装'; fi
         warn "  请确认云安全组已放行 TCP ${PORT}，无需开放 TCP 80"
         step '————————————————————————————————'
@@ -989,6 +1008,13 @@ install_node() {
     unzip -q "$archive" xray -d "$TEMP_DIR"
     [[ -x "$TEMP_DIR/xray" || -f "$TEMP_DIR/xray" ]] || fail '安装包中没有找到 xray 程序。'
     install -m 755 "$TEMP_DIR/xray" "$XRAY_BIN"
+    if [[ "$enc_choice" == on ]]; then
+        local enc_pair=()
+        mapfile -t enc_pair < <(generate_vless_encryption_pair)
+        (( ${#enc_pair[@]} == 2 )) || fail '生成 VLESS Encryption 配对参数失败；安装将回滚。'
+        VLESS_DECRYPTION="${enc_pair[0]}"
+        CLIENT_ENCRYPTION="${enc_pair[1]}"
+    fi
 
     step '[4/5] 生成 UUID、REALITY 密钥和配置…'
     if ! getent group xray >/dev/null 2>&1; then groupadd --system xray; fi
@@ -1059,10 +1085,11 @@ EOF
 show_node() {
     need_root
     load_metadata
-    local uuid label link tmp
+    local uuid label link tmp enc_param
     uuid="$(config_uuid)" || fail '无法从配置读取 UUID。'
     label="$(jq -rn --arg v "$NODE_NAME" '$v | @uri')" || return 1
-    link="vless://${uuid}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${label}"
+    enc_param="$(jq -rn --arg v "$CLIENT_ENCRYPTION" '$v | @uri')" || return 1
+    link="vless://${uuid}@${SERVER_IP}:${PORT}?encryption=${enc_param}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${label}"
     tmp="$(mktemp "${LINK_FILE}.XXXXXX")" || return 1
     if ! printf '%s\n' "$link" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$LINK_FILE"; then
         rm -f -- "$tmp"
@@ -1079,7 +1106,7 @@ show_node() {
 status_node() {
     need_root
     load_metadata
-    local state current_ip version flow
+    local state current_ip version flow server_enc
     state="$(systemctl is-active xray 2>/dev/null || true)"
     version="$(installed_version)"
     say "服务状态：$state"
@@ -1091,6 +1118,14 @@ status_node() {
         ok 'Vision flow：xtls-rprx-vision'
     else
         warn "Vision flow：${flow:-未配置}"
+    fi
+    server_enc="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG" 2>/dev/null || true)"
+    if [[ "$server_enc" == none && "$CLIENT_ENCRYPTION" == none ]]; then
+        say 'VLESS Encryption：未开启'
+    elif [[ "$server_enc" == mlkem768x25519plus.* && "$CLIENT_ENCRYPTION" == mlkem768x25519plus.* ]]; then
+        ok 'VLESS Encryption：已开启（服务端与客户端参数均已记录）'
+    else
+        warn 'VLESS Encryption：服务端与客户端参数不一致，请检查配置和安装记录。'
     fi
     if config_ok; then ok '配置检查：通过'; else warn '配置检查：失败'; fi
     if [[ -n "$(ss -H -ltn "sport = :$PORT" 2>/dev/null)" ]]; then ok '端口监听：正常'; else warn '端口监听：未发现'; fi
@@ -1247,6 +1282,91 @@ tfo_node() {
         fi
     else
         fail "TFO 后台任务失败；请查看 journalctl -u $unit。"
+    fi
+}
+
+vlessenc_apply() {
+    need_root
+    [[ $# -eq 1 ]] || fail '用法：vlessenc [on|off]'
+    load_metadata
+    local action="$1" backup was_active=0 old_port="$PORT" server_enc pair=()
+    case "$action" in on|off) ;; *) fail '用法：vlessenc [on|off]' ;; esac
+    server_enc="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG")" \
+        || fail '无法读取服务端 VLESS Encryption 状态。'
+    if [[ "$action" == on && "$server_enc" != none && "$CLIENT_ENCRYPTION" != none ]]; then
+        ok 'VLESS Encryption 已开启。'; return 0
+    fi
+    if [[ "$action" == off && "$server_enc" == none && "$CLIENT_ENCRYPTION" == none ]]; then
+        ok 'VLESS Encryption 已关闭。'; return 0
+    fi
+    if [[ "$action" == on ]]; then
+        mapfile -t pair < <(generate_vless_encryption_pair)
+        (( ${#pair[@]} == 2 )) || fail 'Xray 无法生成 VLESS Encryption 配对参数。'
+        VLESS_DECRYPTION="${pair[0]}"
+        CLIENT_ENCRYPTION="${pair[1]}"
+    else
+        VLESS_DECRYPTION=none
+        CLIENT_ENCRYPTION=none
+    fi
+    backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")" || fail '无法创建配置备份。'
+    backup_state "$backup" || fail "备份节点配置失败，备份保留在 $backup。"
+    if systemctl is-active --quiet xray; then was_active=1; fi
+    if ! edit_config --arg decryption "$VLESS_DECRYPTION" \
+        '(.inbounds[] | select(.protocol == "vless") | .settings.decryption) = $decryption' \
+        || ! write_marker; then
+        restore_state "$backup" "$was_active" || fail "恢复旧配置失败，备份保留在 $backup。"
+        rm -rf -- "$backup"
+        fail '写入 VLESS Encryption 配置失败，已恢复。'
+    fi
+    if config_ok && { (( was_active == 0 )) || { systemctl restart xray && wait_service 10; }; } \
+        && (show_node >/dev/null); then
+        rm -rf -- "$backup"
+        if [[ "$action" == on ]]; then ok 'VLESS Encryption 已开启。'; else ok 'VLESS Encryption 已关闭。'; fi
+        return 0
+    fi
+    PORT="$old_port"
+    restore_state "$backup" "$was_active" || fail "VLESS Encryption 修改失败，回滚未完成；备份保留在 $backup。"
+    rm -rf -- "$backup"
+    fail 'VLESS Encryption 修改失败，已恢复原配置。'
+}
+vlessenc_node() {
+    need_root
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) vlessenc [on|off]"
+    load_metadata
+    local action="${1:-}" server_enc script_path unit='vless-reality-enc'
+    server_enc="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG")" \
+        || fail '无法读取服务端 VLESS Encryption 状态。'
+    if [[ -z "$action" ]]; then
+        if [[ "$server_enc" != none && "$CLIENT_ENCRYPTION" != none ]]; then
+            say 'VLESS Encryption：已开启'
+            [[ -t 0 ]] || return 0
+            confirm '是否关闭 VLESS Encryption？[y/N]：' || { say '未修改。'; return 0; }
+            action=off
+        else
+            say 'VLESS Encryption：未开启'
+            [[ -t 0 ]] || return 0
+            confirm '是否开启 VLESS Encryption？默认关闭 [y/N]：' || { say '未修改。'; return 0; }
+            action=on
+        fi
+    fi
+    case "$action" in on|off) ;; *) fail "用法：$(cmd_name) vlessenc [on|off]" ;; esac
+    need_command systemd-run
+    need_command readlink
+    script_path="$(readlink -f -- "$SCRIPT_PATH")" || fail '无法找到当前管理脚本。'
+    [[ -f "$script_path" && -r "$script_path" ]] || fail '当前管理脚本不是可读取的普通文件。'
+    warn '切换 VLESS Encryption 将重启 Xray，旧客户端链接会失效；建议使用 VPS 直连 SSH 或服务商控制台，后台任务会完成修改或回滚。'
+    say "后台任务：$unit；若连接中断，重连后运行 $(cmd_name) status 查看结果。"
+    systemd-run --quiet --wait --collect --unit="$unit" \
+        --property=SyslogIdentifier=vless-reality-enc \
+        /bin/bash "$script_path" __vlessenc-apply "$action" \
+        || fail "VLESS Encryption 后台任务失败；请查看 journalctl -u $unit。"
+    load_metadata
+    server_enc="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG")"
+    if [[ "$action" == on && "$server_enc" != none && "$CLIENT_ENCRYPTION" != none ]] \
+        || [[ "$action" == off && "$server_enc" == none && "$CLIENT_ENCRYPTION" == none ]]; then
+        show_node
+    else
+        fail "后台任务已结束，但加密状态未达到预期；请查看 journalctl -u $unit。"
     fi
 }
 
@@ -1548,7 +1668,7 @@ print_help() {
     cat <<EOF
 VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
 用法：${cmd} [命令]
-  install [端口] [SNI] [名称] [on|off]  安装节点（TFO 默认 off）
+  install [端口] [SNI] [名称] [TFO:on|off] [VLESS加密:on|off]  安装节点
   show                         显示 vless:// 导入链接
   status                       查看服务、配置、端口和伪装站点状态
   port [新端口]                修改端口
@@ -1556,6 +1676,7 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   sni-best                     查看当前测速延迟最低的域名，不修改节点
   checker [status|install|uninstall|check 域名|batch 域名...|csv 文件]  管理 RealityChecker
   tfo [on|off]                 查看或切换 TCP Fast Open
+  vlessenc [on|off]            查看或切换 VLESS Encryption
   uuid                         重新生成 UUID
   rotate-keys                  轮换 REALITY 密钥和 Short ID
   rename [新名称]              修改节点名称
@@ -1611,6 +1732,7 @@ show_menu() {
     say ' 16. 查看当前测速延迟最低的域名'
     say ' 17. 开关 TCP Fast Open'
     say ' 18. 管理 RealityChecker（可选）'
+    say ' 19. 开关 VLESS Encryption'
     say ' 00. 退出'
     say '=================================='
     menu_status
@@ -1625,7 +1747,7 @@ menu_action() {
         10) warn '操作后旧链接立即失效。'; rotate_keys ;;
         11) rename_node ;; 12) refresh_ip ;; 13) show_node ;;
         14) status_node ;; 15) log_node ;; 16) show_fastest_sni ;;
-        17) tfo_node ;; 18) checker_menu ;; *) return 2 ;;
+        17) tfo_node ;; 18) checker_menu ;; 19) vlessenc_node ;; *) return 2 ;;
     esac
 }
 interactive_menu() {
@@ -1635,8 +1757,8 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-18，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-8]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-19，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-9]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
@@ -1662,6 +1784,8 @@ main() {
         checker) shift; checker_command "$@" ;;
         tfo) shift; tfo_node "$@" ;;
         __tfo-apply) shift; tfo_apply "$@" ;;
+        vlessenc) shift; vlessenc_node "$@" ;;
+        __vlessenc-apply) shift; vlessenc_apply "$@" ;;
         uuid) change_uuid ;;
         rotate-keys) rotate_keys ;;
         rename) shift; rename_node "$@" ;;
@@ -1672,7 +1796,7 @@ main() {
         log|logs) shift; log_node "$@" ;;
         update) update_xray ;;
         uninstall) uninstall_node ;;
-        [1-9]|1[0-8]) need_root; menu_action "$1" ;;
+        [1-9]|1[0-9]) need_root; menu_action "$1" ;;
         *) print_help; exit 2 ;;
     esac
 }

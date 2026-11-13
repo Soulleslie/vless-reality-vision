@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-if [[ "${1:-}" == --child || "${1:-}" == --child-on || "${1:-}" == --child-checker ]]; then
+if [[ "${1:-}" == --child || "${1:-}" == --child-on || "${1:-}" == --child-checker || "${1:-}" == --child-enc ]]; then
     TEST_MODE="${1:-}"
     source <(sed '$d' "$ROOT/install.sh")
     need_root() { :; }
@@ -18,7 +18,9 @@ if [[ "${1:-}" == --child || "${1:-}" == --child-on || "${1:-}" == --child-check
         say "$1"
         [[ "$TEST_MODE" == --child-on && "$1" == '是否开启 TCP Fast Open？默认关闭 [y/N]：' ]] \
             || [[ "$TEST_MODE" == --child-checker \
-                && "$1" == '是否安装 RealityChecker 检测工具？默认不安装 [y/N]：' ]]
+                && "$1" == '是否安装 RealityChecker 检测工具？默认不安装 [y/N]：' ]] \
+            || [[ "$TEST_MODE" == --child-enc \
+                && "$1" == '是否开启 VLESS Encryption？默认关闭 [y/N]：' ]]
     }
     install_node
     exit 0
@@ -32,8 +34,10 @@ before_name="${output%%请输入节点名称*}"
 [[ "$before_name" == *'实测延迟最低的域名：www.samsung.com（约 31 ms）'* ]]
 [[ "$output" == *'SNI： www.samsung.com:443（自动优选）'* ]]
 [[ "$output" == *'是否开启 TCP Fast Open？默认关闭 [y/N]：'* ]]
+[[ "$output" == *'是否开启 VLESS Encryption？默认关闭 [y/N]：'* ]]
 [[ "$output" == *'是否安装 RealityChecker 检测工具？默认不安装 [y/N]：'* ]]
 [[ "$output" == *'TFO： 关闭'* ]]
+[[ "$output" == *'VLESS Encryption：off'* ]]
 [[ "$output" == *'RealityChecker： 不安装'* ]]
 printf -v child_command 'bash %q --child-on' "$ROOT/tests/install_sni_prompt.bash"
 output="$(printf '\n\n' | script -q -e -c "$child_command" /dev/null)"
@@ -41,4 +45,7 @@ output="$(printf '\n\n' | script -q -e -c "$child_command" /dev/null)"
 printf -v child_command 'bash %q --child-checker' "$ROOT/tests/install_sni_prompt.bash"
 output="$(printf '\n\n' | script -q -e -c "$child_command" /dev/null)"
 [[ "$output" == *'RealityChecker： 安装'* ]]
+printf -v child_command 'bash %q --child-enc' "$ROOT/tests/install_sni_prompt.bash"
+output="$(printf '\n\n' | script -q -e -c "$child_command" /dev/null)"
+[[ "$output" == *'VLESS Encryption：on'* ]]
 printf '安装时优选域名显示顺序验证通过\n'

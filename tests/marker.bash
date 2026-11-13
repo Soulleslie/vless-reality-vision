@@ -6,6 +6,7 @@ source <(sed '$d' "$ROOT/install.sh")
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_DIR"' EXIT
 CONFIG_DIR="$TEST_DIR/xray"
+CONFIG="$CONFIG_DIR/config.json"
 MARKER="$CONFIG_DIR/.vless-reality-owned"
 mkdir -p "$CONFIG_DIR"
 printf 'old-record\n' > "$MARKER"
@@ -26,4 +27,10 @@ chown() { return 0; }
 write_marker
 [[ "$(sed -n '1p' "$MARKER")" == 443 ]]
 [[ "$(sed -n '2p' "$MARKER")" == www.amazon.com ]]
+[[ "$(sed -n '7p' "$MARKER")" == none ]]
+printf '{}\n' > "$CONFIG_DIR/config.json"
+sed -i '7d' "$MARKER"
+CLIENT_ENCRYPTION=stale
+load_metadata
+[[ "$CLIENT_ENCRYPTION" == none ]]
 printf '安装记录原子写入验证通过\n'
