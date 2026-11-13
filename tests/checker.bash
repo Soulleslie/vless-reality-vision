@@ -35,14 +35,33 @@ curl() {
 }
 unzip() {
     local destination="${@: -1}"
-    printf '#!/usr/bin/env bash\nprintf "checked:%%s\\n" "$2"\n' > "$destination/reality-checker"
+    printf '#!/usr/bin/env bash\nprintf "arg:%%s\\n" "$@"\n' > "$destination/reality-checker"
 }
 
 checker_command install >/dev/null
 [[ -x "$CHECKER_BIN" && -f "$CHECKER_MARKER" ]]
 checker_binary_is_ours
 [[ "$(checker_command status)" == *'v2.2.3'* ]]
-[[ "$(checker_command check example.com)" == 'checked:example.com' ]]
+[[ "$(checker_command check example.com)" == $'arg:check\narg:example.com' ]]
+[[ "$(checker_command batch Apple.com tesla.com microsoft.com)" \
+    == $'arg:batch\narg:apple.com\narg:tesla.com\narg:microsoft.com' ]]
+printf 'domain\nexample.com\n' > "$TEST_DIR/domains with space.csv"
+[[ "$(checker_command csv "$TEST_DIR/domains with space.csv")" \
+    == $'arg:csv\n'"arg:$TEST_DIR/domains with space.csv" ]]
+if (checker_command batch example.com 'https://bad.example.com' >/dev/null 2>&1); then
+    printf '批量检测应拒绝 URL\n' >&2
+    exit 1
+fi
+if (checker_command csv "$TEST_DIR/missing.csv" >/dev/null 2>&1); then
+    printf 'CSV 检测应拒绝不存在的文件\n' >&2
+    exit 1
+fi
+menu_output="$(printf '3\nApple.com tesla.com\n' | checker_menu)"
+[[ "$menu_output" == *$'arg:batch\narg:apple.com\narg:tesla.com'* ]]
+menu_output="$(printf '2\nApple.com\n' | checker_menu)"
+[[ "$menu_output" == *$'arg:check\narg:apple.com'* ]]
+menu_output="$(printf '4\n%s\n' "$TEST_DIR/domains with space.csv" | checker_menu)"
+[[ "$menu_output" == *$'arg:csv\n'"arg:$TEST_DIR/domains with space.csv"* ]]
 chmod 600 "$CHECKER_BIN"
 [[ "$(checker_command status)" == *'执行权限已丢失'* ]]
 checker_command install >/dev/null

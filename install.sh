@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.4.3'
+SCRIPT_VERSION='1.4.4'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -391,8 +391,13 @@ checker_status() {
         say 'RealityChecker：未安装。'
     fi
 }
+checker_require_ready() {
+    checker_binary_is_ours || fail '请先安装本脚本管理的 RealityChecker。'
+    [[ -x "$CHECKER_BIN" ]] || fail 'RealityChecker 没有执行权限；请运行 checker install 修复。'
+}
 checker_command() {
-    local action="${1:-status}" host="${2:-}"
+    local action="${1:-status}" host="${2:-}" candidate file
+    local -a domains=()
     need_root
     case "$action" in
         status) [[ $# -le 1 ]] || fail '用法：checker status'; checker_status ;;
@@ -410,25 +415,51 @@ checker_command() {
             ;;
         check)
             [[ $# -eq 2 ]] || fail '用法：checker check 域名'
+            host="${host,,}"
             valid_host "$host" || fail '请输入纯域名。'
-            checker_binary_is_ours || fail '请先安装本脚本管理的 RealityChecker。'
-            [[ -x "$CHECKER_BIN" ]] || fail 'RealityChecker 没有执行权限；请运行 checker install 修复。'
+            checker_require_ready
             "$CHECKER_BIN" check "$host"
             ;;
-        *) fail '用法：checker [status|install|uninstall|check 域名]' ;;
+        batch)
+            [[ $# -ge 2 ]] || fail '用法：checker batch 域名1 域名2 ...'
+            shift
+            for candidate in "$@"; do
+                candidate="${candidate,,}"
+                valid_host "$candidate" || fail "批量检测中含有无效域名：$candidate"
+                domains+=("$candidate")
+            done
+            checker_require_ready
+            "$CHECKER_BIN" batch "${domains[@]}"
+            ;;
+        csv)
+            [[ $# -eq 2 ]] || fail '用法：checker csv 文件路径'
+            file="$host"
+            [[ -f "$file" && -r "$file" ]] || fail "CSV 文件不可读取：$file"
+            [[ "$file" != -* ]] || file="./$file"
+            checker_require_ready
+            "$CHECKER_BIN" csv "$file"
+            ;;
+        *) fail '用法：checker [status|install|uninstall|check 域名|batch 域名...|csv 文件]' ;;
     esac
 }
 checker_menu() {
     need_root
     checker_status
-    local choice host
-    read -r -p 'RealityChecker [1 安装 / 2 检测域名 / 3 卸载 / 0 返回]：' choice || return 0
+    local choice host file
+    local -a domains=()
+    read -r -p 'RealityChecker [1 安装 / 2 单域名 / 3 批量 / 4 CSV / 5 卸载 / 0 返回]：' choice || return 0
     case "$choice" in
         1) checker_command install ;;
         2) read -r -p '请输入纯域名：' host || return 0; checker_command check "$host" ;;
-        3) checker_command uninstall ;;
+        3)
+            read -r -p '请输入多个域名（空格分隔）：' host || return 0
+            read -r -a domains <<< "$host"
+            checker_command batch "${domains[@]}"
+            ;;
+        4) read -r -p '请输入 CSV 文件路径：' file || return 0; checker_command csv "$file" ;;
+        5) checker_command uninstall ;;
         0|'') return 0 ;;
-        *) warn '请输入 0、1、2 或 3。' ;;
+        *) warn '请输入 0–5。' ;;
     esac
 }
 
@@ -1478,7 +1509,7 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   port [新端口]                修改端口
   sni [新域名|auto]            修改或自动优选 REALITY 伪装域名
   sni-best                     查看当前测速延迟最低的域名，不修改节点
-  checker [status|install|uninstall|check 域名]  管理 RealityChecker
+  checker [status|install|uninstall|check 域名|batch 域名...|csv 文件]  管理 RealityChecker
   tfo [on|off]                 查看或切换 TCP Fast Open
   uuid                         重新生成 UUID
   rotate-keys                  轮换 REALITY 密钥和 Short ID

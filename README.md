@@ -83,6 +83,8 @@ v1.4.2 通过 systemd 后台任务切换 TFO；即使 SSH 因 Xray 重启而断�
 
 v1.4.3 增加可选 RealityChecker 管理入口；按架构下载官方发布包、校验 SHA-256、安装程序并记录归属，卸载节点时一并清理。
 
+v1.4.4 补齐 RealityChecker 的单域名、空格分隔批量域名和 CSV 文件检测，并在菜单第 18 项提供三个入口。
+
 ## 非交互安装
 
 参数顺序为端口、伪装域名、节点名称：
@@ -114,6 +116,8 @@ vless-reality sni auto             重新测量并优选伪装域名
 vless-reality sni-best             显示当前测速延迟最低的域名，不修改节点
 vless-reality checker install      安装 RealityChecker
 vless-reality checker check 域名   用 RealityChecker 检测域名
+vless-reality checker batch apple.com tesla.com microsoft.com  批量检测域名
+vless-reality checker csv file.csv 从 CSV 文件检测域名
 vless-reality checker status       查看 RealityChecker 状态
 vless-reality checker uninstall    单独卸载 RealityChecker
 vless-reality tfo                  显示状态，交互式切换 TFO
@@ -134,7 +138,9 @@ vless-reality uninstall            卸载并清理
 
 交互安装节点时可以选择一并安装 RealityChecker，默认不安装；非交互安装节点后可单独运行 `checker install`。菜单第 18 项可安装、检测或单独卸载；命令行也可运行 `vless-reality checker install`，安装节点前可使用 `/root/vless-reality-setup.sh checker install`。安装时，脚本根据 VPS 的 amd64 或 arm64 架构读取官方最新稳定版的 GitHub Release，校验发布信息给出的 SHA-256 后解压并设置执行权限。程序安装在 `/usr/local/bin/reality-checker`，归属记录写入 `/usr/local/bin/.vless-reality-checker-owned`；不会把压缩包留在当前目录。若工具下载失败，已成功安装的节点仍会保留，可稍后重试。
 
-运行 `vless-reality checker check example.com` 可调用检测工具。卸载节点时会连同本脚本管理的 RealityChecker 和可识别的暂存目录一起清理；单独运行 `vless-reality checker uninstall` 也可以清理。脚本不会覆盖或删除未带本脚本归属记录的同名程序。如果程序内容在安装后被改动，卸载会停止并提示检查，以免误删其他程序。以前手动执行 `wget`、`unzip` 留在当前目录中的文件不属于脚本管理范围。
+工具的三种检测方式均可从菜单第 18 项进入，也可使用 `vless-reality checker check example.com`、`vless-reality checker batch apple.com tesla.com microsoft.com` 和 `vless-reality checker csv file.csv`。批量域名以空格分隔；CSV 路径可以是当前目录下的文件名或绝对路径。脚本只读取用户提供的 CSV 文件，卸载时不会删除它。
+
+卸载节点时会连同本脚本管理的 RealityChecker 和可识别的暂存目录一起清理；单独运行 `vless-reality checker uninstall` 也可以清理。脚本不会覆盖或删除未带本脚本归属记录的同名程序。如果程序内容在安装后被改动，卸载会停止并提示检查，以免误删其他程序。以前手动执行 `wget`、`unzip` 留在当前目录中的文件不属于脚本管理范围。
 
 ## TCP Fast Open
 
