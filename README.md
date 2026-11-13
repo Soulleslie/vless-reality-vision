@@ -85,6 +85,8 @@ v1.4.3 增加可选 RealityChecker 管理入口；按架构下载官方发布包
 
 v1.4.4 补齐 RealityChecker 的单域名、空格分隔批量域名和 CSV 文件检测，并在菜单第 18 项提供三个入口。
 
+v1.4.5 修正 RealityChecker v2.2.3 将 RealiTLScanner CSV 的 `TLS` 列误当域名的问题：按 `CERT_DOMAIN` 列名提取域名，生成临时兼容文件后再检测。
+
 ## 非交互安装
 
 参数顺序为端口、伪装域名、节点名称：
@@ -138,7 +140,7 @@ vless-reality uninstall            卸载并清理
 
 交互安装节点时可以选择一并安装 RealityChecker，默认不安装；非交互安装节点后可单独运行 `checker install`。菜单第 18 项可安装、检测或单独卸载；命令行也可运行 `vless-reality checker install`，安装节点前可使用 `/root/vless-reality-setup.sh checker install`。安装时，脚本根据 VPS 的 amd64 或 arm64 架构读取官方最新稳定版的 GitHub Release，校验发布信息给出的 SHA-256 后解压并设置执行权限。程序安装在 `/usr/local/bin/reality-checker`，归属记录写入 `/usr/local/bin/.vless-reality-checker-owned`；不会把压缩包留在当前目录。若工具下载失败，已成功安装的节点仍会保留，可稍后重试。
 
-工具的三种检测方式均可从菜单第 18 项进入，也可使用 `vless-reality checker check example.com`、`vless-reality checker batch apple.com tesla.com microsoft.com` 和 `vless-reality checker csv file.csv`。批量域名以空格分隔；CSV 路径可以是当前目录下的文件名或绝对路径。脚本只读取用户提供的 CSV 文件，卸载时不会删除它。
+工具的三种检测方式均可从菜单第 18 项进入，也可使用 `vless-reality checker check example.com`、`vless-reality checker batch apple.com tesla.com microsoft.com` 和 `vless-reality checker csv file.csv`。批量域名以空格分隔；CSV 路径可以是当前目录下的文件名或绝对路径。CSV 必须有 `CERT_DOMAIN` 列（也支持单列 `DOMAIN`）；脚本会跳过无效或重复域名，生成三列的临时文件供 RealityChecker 读取，检测结束即删除临时文件。上游 RealityChecker v2.2.3 直接读取 CSV 时固定使用第 3 列；对包含 `IP,ORIGIN,TLS,...,CERT_DOMAIN` 的 RealiTLScanner 文件，直接执行 `reality-checker csv file.csv` 会把 `TLS 1.3` 错当域名。请使用本脚本的 `checker csv` 入口。CSV 转换使用 Python 3，若 VPS 缺少它，首次使用时会安装。用户提供的原 CSV 不会被修改，卸载时也不会删除。
 
 卸载节点时会连同本脚本管理的 RealityChecker 和可识别的暂存目录一起清理；单独运行 `vless-reality checker uninstall` 也可以清理。脚本不会覆盖或删除未带本脚本归属记录的同名程序。如果程序内容在安装后被改动，卸载会停止并提示检查，以免误删其他程序。以前手动执行 `wget`、`unzip` 留在当前目录中的文件不属于脚本管理范围。
 

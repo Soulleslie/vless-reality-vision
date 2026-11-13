@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.4.4'
+SCRIPT_VERSION='1.4.5'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -395,6 +395,51 @@ checker_require_ready() {
     checker_binary_is_ours || fail '请先安装本脚本管理的 RealityChecker。'
     [[ -x "$CHECKER_BIN" ]] || fail 'RealityChecker 没有执行权限；请运行 checker install 修复。'
 }
+checker_csv() (
+    local input="$1" stage_dir count
+    checker_require_ready
+    if ! command -v python3 >/dev/null 2>&1; then
+        need_command apt-get
+        say '安装 CSV 解析所需的 Python 3…'
+        apt-get update && apt-get install -y python3 || fail '安装 Python 3 失败。'
+    fi
+    stage_dir="$(mktemp -d /tmp/vless-reality-checker-csv.XXXXXX)" || fail '无法创建 CSV 暂存目录。'
+    trap 'rm -rf -- "$stage_dir"' EXIT
+    printf 'vless-reality-setup\n' > "$stage_dir/.vless-reality-owned" || fail '无法标记 CSV 暂存目录。'
+    count="$(python3 - "$input" "$stage_dir/normalized.csv" <<'PY'
+import csv
+import re
+import sys
+
+source, destination = sys.argv[1:]
+host_pattern = re.compile(r'(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$')
+try:
+    with open(source, newline='', encoding='utf-8-sig') as original:
+        reader = csv.DictReader(original)
+        fields = {name.strip().upper(): name for name in (reader.fieldnames or [])}
+        field = fields.get('CERT_DOMAIN') or fields.get('DOMAIN')
+        if field is None:
+            raise ValueError('缺少 CERT_DOMAIN 或 DOMAIN 列')
+        seen = set()
+        with open(destination, 'w', newline='', encoding='utf-8') as normalized:
+            writer = csv.writer(normalized, lineterminator='\n')
+            writer.writerow(('IP', 'ORIGIN', 'CERT_DOMAIN'))
+            for row in reader:
+                host = (row.get(field) or '').strip().strip('"').lower()
+                if host_pattern.fullmatch(host) and host not in seen:
+                    writer.writerow(('', '', host))
+                    seen.add(host)
+        if not seen:
+            raise ValueError('域名列中没有有效域名')
+        print(len(seen))
+except (OSError, UnicodeError, csv.Error, ValueError) as exc:
+    print(f'CSV 解析失败：{exc}', file=sys.stderr)
+    sys.exit(1)
+PY
+)" || fail 'CSV 无法转换为 RealityChecker 可读取的域名列。'
+    say "从 CSV 域名列提取到 $count 个有效域名；正在检测…"
+    "$CHECKER_BIN" csv "$stage_dir/normalized.csv"
+)
 checker_command() {
     local action="${1:-status}" host="${2:-}" candidate file
     local -a domains=()
@@ -436,8 +481,7 @@ checker_command() {
             file="$host"
             [[ -f "$file" && -r "$file" ]] || fail "CSV 文件不可读取：$file"
             [[ "$file" != -* ]] || file="./$file"
-            checker_require_ready
-            "$CHECKER_BIN" csv "$file"
+            checker_csv "$file"
             ;;
         *) fail '用法：checker [status|install|uninstall|check 域名|batch 域名...|csv 文件]' ;;
     esac
@@ -718,7 +762,8 @@ clean_config_residue() (
 clean_checker_stage() (
     local dir entry owner file unknown
     shopt -s nullglob dotglob
-    for dir in "${CHECKER_BIN%/*}"/.vless-reality-checker-stage.??????; do
+    for dir in "${CHECKER_BIN%/*}"/.vless-reality-checker-stage.?????? \
+        /tmp/vless-reality-checker-csv.??????; do
         [[ -d "$dir" && ! -L "$dir" ]] || continue
         owner="$(stat -c %u -- "$dir")" || return 1
         [[ "$owner" == "$EUID" ]] || { warn "暂存目录不属于当前用户，已保留：$dir" >&2; continue; }
@@ -731,7 +776,7 @@ clean_checker_stage() (
         for entry in "$dir"/*; do
             case "${entry##*/}" in
                 .vless-reality-owned) ;;
-                release.json|reality-checker.zip|reality-checker|receipt)
+                release.json|reality-checker.zip|reality-checker|receipt|normalized.csv)
                     [[ -f "$entry" && ! -L "$entry" ]] || unknown=1 ;;
                 *) unknown=1 ;;
             esac
@@ -740,7 +785,7 @@ clean_checker_stage() (
             warn "暂存目录含有其他文件，已保留：$dir" >&2
             continue
         fi
-        for file in release.json reality-checker.zip reality-checker receipt; do
+        for file in release.json reality-checker.zip reality-checker receipt normalized.csv; do
             entry="$dir/$file"
             [[ -f "$entry" && ! -L "$entry" ]] || continue
             rm -f -- "$entry" || return 1
