@@ -24,14 +24,37 @@ systemctl() { return 1; }
 config_ok() { :; }
 show_node() { :; }
 generate_vless_encryption_pair() {
-    printf '%s\n%s\n' 'mlkem768x25519plus.native.600s.ABCdef0123_-' \
-        'mlkem768x25519plus.native.0rtt.XYZabc4567_-'
+    local mode="${1:-native}"
+    valid_vlessenc_mode "$mode" || return 1
+    printf '%s\n%s\n' "mlkem768x25519plus.$mode.600s.ABCdef0123_-" \
+        "mlkem768x25519plus.$mode.0rtt.XYZabc4567_-"
 }
 write_marker
 [[ "$(sed -n '7p' "$MARKER")" == none ]]
 vlessenc_apply on >/dev/null
 [[ "$(jq -r '.inbounds[0].settings.decryption' "$CONFIG")" == mlkem768x25519plus.native.600s.* ]]
 [[ "$(sed -n '7p' "$MARKER")" == mlkem768x25519plus.native.0rtt.* ]]
+vlessenc_apply on xorpub >/dev/null
+[[ "$(jq -r '.inbounds[0].settings.decryption' "$CONFIG")" == mlkem768x25519plus.xorpub.600s.* ]]
+[[ "$(sed -n '7p' "$MARKER")" == mlkem768x25519plus.xorpub.0rtt.* ]]
+vlessenc_apply on random >/dev/null
+[[ "$(jq -r '.inbounds[0].settings.decryption' "$CONFIG")" == mlkem768x25519plus.random.600s.* ]]
+[[ "$(sed -n '7p' "$MARKER")" == mlkem768x25519plus.random.0rtt.* ]]
+vlessenc_apply on >/dev/null
+[[ "$(jq -r '.inbounds[0].settings.decryption' "$CONFIG")" == mlkem768x25519plus.random.600s.* ]]
+if (vlessenc_apply on invalid >/dev/null 2>&1); then
+    printf '无效模式不应被接受\n' >&2
+    exit 1
+fi
+vlessenc_apply on xorpub >/dev/null
+config_ok() { return 1; }
+if (vlessenc_apply on random >/dev/null 2>&1); then
+    printf '模式切换失败时应回滚\n' >&2
+    exit 1
+fi
+[[ "$(jq -r '.inbounds[0].settings.decryption' "$CONFIG")" == mlkem768x25519plus.xorpub.600s.* ]]
+[[ "$(sed -n '7p' "$MARKER")" == mlkem768x25519plus.xorpub.0rtt.* ]]
+config_ok() { :; }
 vlessenc_apply off >/dev/null
 [[ "$(jq -r '.inbounds[0].settings.decryption' "$CONFIG")" == none ]]
 [[ "$(sed -n '7p' "$MARKER")" == none ]]

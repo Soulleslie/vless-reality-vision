@@ -28,7 +28,7 @@
 2. 在云服务商安全组中放行准备使用的 TCP 端口。若使用系统防火墙，也需放行该端口。
 3. 选择端口时直接回车使用 TCP 443；若已占用，脚本会提示重新输入其他端口（例如 8443）。
 4. 安装时伪装域名直接回车，会立即测速并显示实测延迟最低的域名，然后再提示输入节点名称；也可以手动输入一个支持 TLS 1.3 的域名。自动优选从脚本内的 68 个候选域名并发初筛，跳过证书或 TLS 1.3 验证失败的站点，再复测全部通过初筛的域名，选两次握手平均耗时最低的站点。这个耗时是 **VPS 到伪装站点** 的耗时，不是客户端到 VPS 的延迟。若候选全部不可用，请手动指定域名。
-5. 选择是否开启 TCP Fast Open 和 VLESS Encryption；两者直接回车都默认关闭。安装后可分别通过菜单第 17、19 项切换。交互安装还会询问是否安装 RealityChecker，直接回车默认不安装。
+5. 选择是否开启 TCP Fast Open 和 VLESS Encryption；两者直接回车都默认关闭。开启 VLESS Encryption 后可选择 `native`、`xorpub`、`random`，直接回车默认 `native`。安装后可分别通过菜单第 17、19 项切换。交互安装还会询问是否安装 RealityChecker，直接回车默认不安装。
 
 ## 一键安装
 
@@ -90,6 +90,8 @@ v1.4.5 修正 RealityChecker v2.2.3 将 RealiTLScanner CSV 的 `TLS` 列误当�
 
 v1.5.0 增加 VLESS Encryption 开关：通过 `xray vlessenc` 生成配对参数，写入服务端配置和客户端链接；切换由 systemd 后台任务完成，失败时恢复原配置。
 
+v1.6.0 增加 VLESS Encryption 的 `native`、`xorpub`、`random` 三种模式；安装时选择，安装后可从菜单或命令行修改。默认 `native`。
+
 ## 非交互安装
 
 参数顺序为端口、伪装域名、节点名称：
@@ -110,10 +112,10 @@ v1.5.0 增加 VLESS Encryption 开关：通过 `xray vlessenc` 生成配对参�
 /root/vless-reality-setup.sh install 443 auto Reality-SG on
 ```
 
-第五个参数可指定 VLESS Encryption，省略时默认关闭。以下示例关闭 TFO、开启 VLESS Encryption：
+第五个参数可指定 VLESS Encryption，省略时默认关闭；第六个参数指定模式，省略时默认 `native`。以下示例关闭 TFO、开启 `xorpub` 模式的 VLESS Encryption：
 
 ```bash
-/root/vless-reality-setup.sh install 443 auto Reality-SG off on
+/root/vless-reality-setup.sh install 443 auto Reality-SG off on xorpub
 ```
 
 ## 常用命令
@@ -136,6 +138,7 @@ vless-reality tfo on               开启 TFO
 vless-reality tfo off              关闭 TFO
 vless-reality vlessenc             查看状态，交互式切换 VLESS Encryption
 vless-reality vlessenc on          开启 VLESS Encryption
+vless-reality vlessenc on xorpub   切换至 xorpub 模式（random 同理）
 vless-reality vlessenc off         关闭 VLESS Encryption
 vless-reality uuid                 重新生成 UUID
 vless-reality rotate-keys          轮换 REALITY 密钥和 Short ID
@@ -167,6 +170,16 @@ TFO 只影响新建 TCP 连接。客户端若支持 TFO，也需要在客户端�
 ## VLESS Encryption
 
 默认关闭，客户端 `encryption=none` 与服务端 `decryption=none` 对应；REALITY 仍会加密客户端到 VPS 的传输。开启时脚本调用 Xray 官方 `xray vlessenc`，选用较短的 X25519 认证参数对（混合密钥交换仍包含 ML-KEM），将服务端 `decryption` 写入 Xray 配置，并把配套的客户端 `encryption` 记录在节点安装记录和新 `vless://` 链接中。REALITY、Vision 和 TFO 设置不变。
+
+三种模式只改变 VLESS Encryption 握手数据的外观，必须在客户端和服务端保持一致：
+
+| 模式 | 区别 |
+| --- | --- |
+| `native`（默认） | 使用原始格式；适合当前外层已有 REALITY 的节点。 |
+| `xorpub` | 在原始格式上隐藏公钥部分。 |
+| `random` | 隐藏记录头，流量外观看起来更像随机数据。 |
+
+安装后运行菜单第 19 项可输入新模式，也可执行 `vless-reality vlessenc on random` 等命令切换。仅运行 `vless-reality vlessenc on` 时，已开启的节点保持原模式，未开启的节点使用 `native`。
 
 开启或关闭后旧客户端链接会失效，运行 `vless-reality show` 获取新链接并重新导入；客户端必须支持 VLESS Encryption。建议使用 VPS 直连 SSH 或服务商控制台操作；切换会重启 Xray，若 SSH 经过此节点，可能断线。后台任务会继续执行并验证或回滚。重连后用 `vless-reality status` 查看结果，失败日志见 `journalctl -u vless-reality-enc -n 30 --no-pager`。卸载节点时会清理这些参数和链接。
 

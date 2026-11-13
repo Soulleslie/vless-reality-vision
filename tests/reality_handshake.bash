@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# 用法：bash tests/reality_handshake.bash /path/to/xray
+# 用法：bash tests/reality_handshake.bash /path/to/xray [native|xorpub|random]
 set -Eeuo pipefail
 
 XRAY_TEST_BIN="${1:?请传入 Xray 二进制路径}"
 ENC_MODE="${2:-off}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=/dev/null
+source <(sed '$d' "$ROOT/install.sh")
+XRAY_BIN="$XRAY_TEST_BIN"
 TEST_DIR="$(mktemp -d)"
 server_pid=''
 client_pid=''
@@ -30,11 +34,13 @@ short_id='0123456789abcdef'
 [[ -n "$private" && -n "$public" ]]
 decryption=none
 encryption=none
-if [[ "$ENC_MODE" == on ]]; then
-    enc_output="$($XRAY_TEST_BIN vlessenc)"
-    decryption="$(awk -F '"' '/"decryption":/ {print $4; exit}' <<< "$enc_output")"
-    encryption="$(awk -F '"' '/"encryption":/ {print $4; exit}' <<< "$enc_output")"
-    [[ "$decryption" == mlkem768x25519plus.* && "$encryption" == mlkem768x25519plus.* ]]
+if [[ "$ENC_MODE" == on || "$ENC_MODE" == native || "$ENC_MODE" == xorpub || "$ENC_MODE" == random ]]; then
+    mode="$ENC_MODE"
+    [[ "$mode" != on ]] || mode=native
+    mapfile -t pair < <(generate_vless_encryption_pair "$mode")
+    [[ ${#pair[@]} -eq 2 ]]
+    decryption="${pair[0]}"
+    encryption="${pair[1]}"
 fi
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
     -subj '/CN=www.amazon.com' -keyout "$TEST_DIR/target.key" \

@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.5.0'
+SCRIPT_VERSION='1.6.0'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -607,13 +607,37 @@ generate_reality_keys() {
     [[ "$private" =~ ^[A-Za-z0-9_-]{43}$ && "$public" =~ ^[A-Za-z0-9_-]{43}$ ]] || return 1
     printf '%s\n%s\n' "$private" "$public"
 }
+valid_vlessenc_mode() {
+    case "$1" in native|xorpub|random) return 0 ;; *) return 1 ;; esac
+}
+vlessenc_pair_mode() {
+    local mode
+    for mode in native xorpub random; do
+        if [[ "$1" =~ ^mlkem768x25519plus[.]$mode[.]600s[.][A-Za-z0-9_-]+$ \
+            && "$2" =~ ^mlkem768x25519plus[.]$mode[.]0rtt[.][A-Za-z0-9_-]+$ ]]; then
+            printf '%s\n' "$mode"
+            return 0
+        fi
+    done
+    return 1
+}
+show_vlessenc_modes() {
+    say '  native：原始格式（默认）；适合当前 REALITY 节点。'
+    say '  xorpub：在原始格式上隐藏公钥部分。'
+    say '  random：隐藏记录头，流量外观看起来更像随机数据。'
+    say '  三种模式的客户端与服务端必须一致；切换后需重新导入链接。'
+}
 generate_vless_encryption_pair() {
-    local output server client
+    local mode="${1:-native}" output server client
+    valid_vlessenc_mode "$mode" || return 1
     output="$($XRAY_BIN vlessenc)" || return 1
     server="$(awk -F '"' '/"decryption":/ {print $4; exit}' <<< "$output")"
     client="$(awk -F '"' '/"encryption":/ {print $4; exit}' <<< "$output")"
     [[ "$server" =~ ^mlkem768x25519plus[.]native[.]600s[.][A-Za-z0-9_-]+$ \
         && "$client" =~ ^mlkem768x25519plus[.]native[.]0rtt[.][A-Za-z0-9_-]+$ ]] || return 1
+    # xray vlessenc 默认生成 native；三种模式共用密钥格式，必须同时修改配对的两端。
+    server="${server/.native./.$mode.}"
+    client="${client/.native./.$mode.}"
     printf '%s\n%s\n' "$server" "$client"
 }
 
@@ -644,7 +668,7 @@ load_metadata() {
     valid_host "$SNI" || fail '安装记录中的 SNI 无效。'
     [[ -n "$NODE_NAME" && -n "$SERVER_IP" && -n "$PUBLIC_KEY" && -n "$SHORT_ID" ]] \
         || fail '安装记录不完整。'
-    [[ "$CLIENT_ENCRYPTION" == none || "$CLIENT_ENCRYPTION" =~ ^mlkem768x25519plus[.]native[.]0rtt[.][A-Za-z0-9_-]+$ ]] \
+    [[ "$CLIENT_ENCRYPTION" == none || "$CLIENT_ENCRYPTION" =~ ^mlkem768x25519plus[.](native|xorpub|random)[.]0rtt[.][A-Za-z0-9_-]+$ ]] \
         || fail '安装记录中的 VLESS Encryption 参数无效。'
 }
 
@@ -911,13 +935,13 @@ write_config() {
 
 install_node() {
     need_root
-    [[ $# -le 5 ]] || fail "用法：$(cmd_name) install [端口] [伪装域名] [节点名称] [TFO:on|off] [VLESS加密:on|off]"
+    [[ $# -le 6 ]] || fail "用法：$(cmd_name) install [端口] [伪装域名] [节点名称] [TFO:on|off] [VLESS加密:on|off] [模式:native|xorpub|random]"
     [[ -r /etc/os-release ]] || fail '无法识别系统。'
     # shellcheck source=/dev/null
     . /etc/os-release
     [[ "${ID:-}" == debian || "${ID:-}" == ubuntu ]] || fail '这个脚本仅支持 Debian 和 Ubuntu。'
     check_install_eligibility
-    local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0 tfo_choice="${4:-off}" enc_choice="${5:-off}" checker_choice=0
+    local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0 tfo_choice="${4:-off}" enc_choice="${5:-off}" enc_mode="${6:-native}" checker_choice=0
     default_name="Reality-$(hostname -s)"
 
     if [[ -z "$raw_port" ]]; then
@@ -965,6 +989,16 @@ install_node() {
         enc_choice=on
     fi
     case "$enc_choice" in on|off) ;; *) fail 'VLESS Encryption 参数必须为 on 或 off。' ;; esac
+    if [[ "$enc_choice" == on ]]; then
+        if (( interactive )); then
+            show_vlessenc_modes
+            read -r -p '选择 VLESS Encryption 模式（直接回车使用 native）：' answer || fail '已取消输入。'
+            enc_mode="${answer:-native}"
+        fi
+        valid_vlessenc_mode "$enc_mode" || fail '模式只能是 native、xorpub 或 random。'
+    elif [[ $# -ge 6 ]]; then
+        fail '指定 VLESS Encryption 模式时，必须同时开启 VLESS Encryption。'
+    fi
     if (( interactive )) && confirm '是否安装 RealityChecker 检测工具？默认不安装 [y/N]：'; then
         checker_choice=1
     fi
@@ -977,7 +1011,7 @@ install_node() {
         if (( auto_sni )); then say "  SNI： $SNI:443（自动优选）"; else say "  SNI： $SNI:443"; fi
         say "  名称：$NODE_NAME"
         if (( TFO_ENABLED )); then say '  TFO： 开启'; else say '  TFO： 关闭'; fi
-        say "  VLESS Encryption：$enc_choice"
+        if [[ "$enc_choice" == on ]]; then say "  VLESS Encryption：开启（$enc_mode）"; else say '  VLESS Encryption：关闭'; fi
         if (( checker_choice )); then say '  RealityChecker： 安装'; else say '  RealityChecker： 不安装'; fi
         warn "  请确认云安全组已放行 TCP ${PORT}，无需开放 TCP 80"
         step '————————————————————————————————'
@@ -1010,7 +1044,7 @@ install_node() {
     install -m 755 "$TEMP_DIR/xray" "$XRAY_BIN"
     if [[ "$enc_choice" == on ]]; then
         local enc_pair=()
-        mapfile -t enc_pair < <(generate_vless_encryption_pair)
+        mapfile -t enc_pair < <(generate_vless_encryption_pair "$enc_mode")
         (( ${#enc_pair[@]} == 2 )) || fail '生成 VLESS Encryption 配对参数失败；安装将回滚。'
         VLESS_DECRYPTION="${enc_pair[0]}"
         CLIENT_ENCRYPTION="${enc_pair[1]}"
@@ -1106,7 +1140,7 @@ show_node() {
 status_node() {
     need_root
     load_metadata
-    local state current_ip version flow server_enc
+    local state current_ip version flow server_enc enc_mode
     state="$(systemctl is-active xray 2>/dev/null || true)"
     version="$(installed_version)"
     say "服务状态：$state"
@@ -1122,8 +1156,8 @@ status_node() {
     server_enc="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG" 2>/dev/null || true)"
     if [[ "$server_enc" == none && "$CLIENT_ENCRYPTION" == none ]]; then
         say 'VLESS Encryption：未开启'
-    elif [[ "$server_enc" == mlkem768x25519plus.* && "$CLIENT_ENCRYPTION" == mlkem768x25519plus.* ]]; then
-        ok 'VLESS Encryption：已开启（服务端与客户端参数均已记录）'
+    elif enc_mode="$(vlessenc_pair_mode "$server_enc" "$CLIENT_ENCRYPTION")"; then
+        ok "VLESS Encryption：已开启（$enc_mode，服务端与客户端参数均已记录）"
     else
         warn 'VLESS Encryption：服务端与客户端参数不一致，请检查配置和安装记录。'
     fi
@@ -1287,20 +1321,26 @@ tfo_node() {
 
 vlessenc_apply() {
     need_root
-    [[ $# -eq 1 ]] || fail '用法：vlessenc [on|off]'
+    [[ $# -ge 1 && $# -le 2 ]] || fail '用法：vlessenc on [native|xorpub|random] 或 vlessenc off'
     load_metadata
-    local action="$1" backup was_active=0 old_port="$PORT" server_enc pair=()
-    case "$action" in on|off) ;; *) fail '用法：vlessenc [on|off]' ;; esac
+    local action="$1" mode="${2:-}" current_mode='' backup was_active=0 old_port="$PORT" server_enc pair=()
+    case "$action" in on|off) ;; *) fail '用法：vlessenc on [native|xorpub|random] 或 vlessenc off' ;; esac
+    [[ "$action" == on || -z "$mode" ]] || fail '关闭加密时无需指定模式。'
     server_enc="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG")" \
         || fail '无法读取服务端 VLESS Encryption 状态。'
-    if [[ "$action" == on && "$server_enc" != none && "$CLIENT_ENCRYPTION" != none ]]; then
-        ok 'VLESS Encryption 已开启。'; return 0
+    current_mode="$(vlessenc_pair_mode "$server_enc" "$CLIENT_ENCRYPTION" || true)"
+    if [[ "$action" == on ]]; then
+        mode="${mode:-${current_mode:-native}}"
+        valid_vlessenc_mode "$mode" || fail '模式只能是 native、xorpub 或 random。'
+    fi
+    if [[ "$action" == on && "$current_mode" == "$mode" ]]; then
+        ok "VLESS Encryption 已开启（$mode）。"; return 0
     fi
     if [[ "$action" == off && "$server_enc" == none && "$CLIENT_ENCRYPTION" == none ]]; then
         ok 'VLESS Encryption 已关闭。'; return 0
     fi
     if [[ "$action" == on ]]; then
-        mapfile -t pair < <(generate_vless_encryption_pair)
+        mapfile -t pair < <(generate_vless_encryption_pair "$mode")
         (( ${#pair[@]} == 2 )) || fail 'Xray 无法生成 VLESS Encryption 配对参数。'
         VLESS_DECRYPTION="${pair[0]}"
         CLIENT_ENCRYPTION="${pair[1]}"
@@ -1321,7 +1361,7 @@ vlessenc_apply() {
     if config_ok && { (( was_active == 0 )) || { systemctl restart xray && wait_service 10; }; } \
         && (show_node >/dev/null); then
         rm -rf -- "$backup"
-        if [[ "$action" == on ]]; then ok 'VLESS Encryption 已开启。'; else ok 'VLESS Encryption 已关闭。'; fi
+        if [[ "$action" == on ]]; then ok "VLESS Encryption 已开启（$mode）。"; else ok 'VLESS Encryption 已关闭。'; fi
         return 0
     fi
     PORT="$old_port"
@@ -1331,25 +1371,40 @@ vlessenc_apply() {
 }
 vlessenc_node() {
     need_root
-    [[ $# -le 1 ]] || fail "用法：$(cmd_name) vlessenc [on|off]"
+    [[ $# -le 2 ]] || fail "用法：$(cmd_name) vlessenc on [native|xorpub|random] 或 vlessenc off"
     load_metadata
-    local action="${1:-}" server_enc script_path unit='vless-reality-enc'
+    local action="${1:-}" mode="${2:-}" current_mode='' answer server_enc script_path unit='vless-reality-enc'
     server_enc="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG")" \
         || fail '无法读取服务端 VLESS Encryption 状态。'
+    current_mode="$(vlessenc_pair_mode "$server_enc" "$CLIENT_ENCRYPTION" || true)"
     if [[ -z "$action" ]]; then
-        if [[ "$server_enc" != none && "$CLIENT_ENCRYPTION" != none ]]; then
-            say 'VLESS Encryption：已开启'
+        if [[ -n "$current_mode" ]]; then
+            say "VLESS Encryption：已开启（$current_mode）"
             [[ -t 0 ]] || return 0
-            confirm '是否关闭 VLESS Encryption？[y/N]：' || { say '未修改。'; return 0; }
-            action=off
+            show_vlessenc_modes
+            read -r -p '输入新模式切换；输入 off 关闭；直接回车不修改：' answer || fail '已取消输入。'
+            [[ -n "$answer" ]] || { say '未修改。'; return 0; }
+            if [[ "$answer" == off ]]; then action=off; else action=on; mode="$answer"; fi
         else
             say 'VLESS Encryption：未开启'
             [[ -t 0 ]] || return 0
             confirm '是否开启 VLESS Encryption？默认关闭 [y/N]：' || { say '未修改。'; return 0; }
             action=on
+            show_vlessenc_modes
+            read -r -p '选择模式（直接回车使用 native）：' answer || fail '已取消输入。'
+            mode="${answer:-native}"
         fi
     fi
-    case "$action" in on|off) ;; *) fail "用法：$(cmd_name) vlessenc [on|off]" ;; esac
+    case "$action" in on|off) ;; *) fail "用法：$(cmd_name) vlessenc on [native|xorpub|random] 或 vlessenc off" ;; esac
+    if [[ "$action" == on ]]; then
+        mode="${mode:-${current_mode:-native}}"
+        valid_vlessenc_mode "$mode" || fail '模式只能是 native、xorpub 或 random。'
+        if [[ "$mode" == "$current_mode" ]]; then ok "VLESS Encryption 已开启（$mode）。"; return 0; fi
+    elif [[ -n "$mode" ]]; then
+        fail '关闭加密时无需指定模式。'
+    elif [[ "$server_enc" == none && "$CLIENT_ENCRYPTION" == none ]]; then
+        ok 'VLESS Encryption 已关闭。'; return 0
+    fi
     need_command systemd-run
     need_command readlink
     script_path="$(readlink -f -- "$SCRIPT_PATH")" || fail '无法找到当前管理脚本。'
@@ -1358,11 +1413,11 @@ vlessenc_node() {
     say "后台任务：$unit；若连接中断，重连后运行 $(cmd_name) status 查看结果。"
     systemd-run --quiet --wait --collect --unit="$unit" \
         --property=SyslogIdentifier=vless-reality-enc \
-        /bin/bash "$script_path" __vlessenc-apply "$action" \
+        /bin/bash "$script_path" __vlessenc-apply "$action" "$mode" \
         || fail "VLESS Encryption 后台任务失败；请查看 journalctl -u $unit。"
     load_metadata
     server_enc="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG")"
-    if [[ "$action" == on && "$server_enc" != none && "$CLIENT_ENCRYPTION" != none ]] \
+    if [[ "$action" == on && "$(vlessenc_pair_mode "$server_enc" "$CLIENT_ENCRYPTION" || true)" == "$mode" ]] \
         || [[ "$action" == off && "$server_enc" == none && "$CLIENT_ENCRYPTION" == none ]]; then
         show_node
     else
@@ -1668,7 +1723,7 @@ print_help() {
     cat <<EOF
 VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
 用法：${cmd} [命令]
-  install [端口] [SNI] [名称] [TFO:on|off] [VLESS加密:on|off]  安装节点
+  install [端口] [SNI] [名称] [TFO:on|off] [VLESS加密:on|off] [模式]  安装节点
   show                         显示 vless:// 导入链接
   status                       查看服务、配置、端口和伪装站点状态
   port [新端口]                修改端口
@@ -1676,7 +1731,7 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   sni-best                     查看当前测速延迟最低的域名，不修改节点
   checker [status|install|uninstall|check 域名|batch 域名...|csv 文件]  管理 RealityChecker
   tfo [on|off]                 查看或切换 TCP Fast Open
-  vlessenc [on|off]            查看或切换 VLESS Encryption
+  vlessenc [on [native|xorpub|random]|off]  查看或切换 VLESS Encryption 模式
   uuid                         重新生成 UUID
   rotate-keys                  轮换 REALITY 密钥和 Short ID
   rename [新名称]              修改节点名称
@@ -1732,7 +1787,7 @@ show_menu() {
     say ' 16. 查看当前测速延迟最低的域名'
     say ' 17. 开关 TCP Fast Open'
     say ' 18. 管理 RealityChecker（可选）'
-    say ' 19. 开关 VLESS Encryption'
+    say ' 19. 开关 VLESS Encryption / 修改模式'
     say ' 00. 退出'
     say '=================================='
     menu_status

@@ -37,7 +37,7 @@ before_name="${output%%请输入节点名称*}"
 [[ "$output" == *'是否开启 VLESS Encryption？默认关闭 [y/N]：'* ]]
 [[ "$output" == *'是否安装 RealityChecker 检测工具？默认不安装 [y/N]：'* ]]
 [[ "$output" == *'TFO： 关闭'* ]]
-[[ "$output" == *'VLESS Encryption：off'* ]]
+[[ "$output" == *'VLESS Encryption：关闭'* ]]
 [[ "$output" == *'RealityChecker： 不安装'* ]]
 printf -v child_command 'bash %q --child-on' "$ROOT/tests/install_sni_prompt.bash"
 output="$(printf '\n\n' | script -q -e -c "$child_command" /dev/null)"
@@ -46,6 +46,7 @@ printf -v child_command 'bash %q --child-checker' "$ROOT/tests/install_sni_promp
 output="$(printf '\n\n' | script -q -e -c "$child_command" /dev/null)"
 [[ "$output" == *'RealityChecker： 安装'* ]]
 printf -v child_command 'bash %q --child-enc' "$ROOT/tests/install_sni_prompt.bash"
-output="$(printf '\n\n' | script -q -e -c "$child_command" /dev/null)"
-[[ "$output" == *'VLESS Encryption：on'* ]]
+output="$(printf '\n\n\n' | script -q -e -c "$child_command" /dev/null)"
+[[ "$output" == *'选择 VLESS Encryption 模式（直接回车使用 native）：'* ]]
+[[ "$output" == *'VLESS Encryption：开启（native）'* ]]
 printf '安装时优选域名显示顺序验证通过\n'
