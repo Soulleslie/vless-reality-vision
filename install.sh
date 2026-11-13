@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.6.0'
+SCRIPT_VERSION='1.4.2'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -34,7 +34,31 @@ INSTALL_STARTED=0
 INSTALL_COMMITTED=0
 MANAGER_COPIED=0
 TFO_ENABLED=0
-SNI_CANDIDATES=()
+SNI_CANDIDATES=(
+    www.amazon.com www.samsung.com www.nvidia.com
+    digitalassets.tesla.com electronics.sony.com www.xbox.com amd.com
+    assets-xbxweb.xbox.com s7mbrstream.scene7.com d.impactradius-event.com
+    www.oracle.com acctcdn.msftauth.net cdn-dynmedia-1.microsoft.com
+    j.6sc.co lpcdn.lpsnmedia.net ds-aksb-a.akamaihd.net
+    gray-config-prod.api.arc-cdn.net img-prod-cms-rt-microsoft-com.akamaized.net
+    vscjava.gallerycdn.vsassets.io th.bing.com d2c.aws.amazon.com
+    gsp-ssl.ls.apple.com rum.hlx.page www.wowt.com www.amd.com
+    sisu.xboxlive.com cdn.userway.org assets.adobedtm.com www.tesla.com
+    catalog.gamepass.com cdnssl.clicktale.net aws.com res-1.cdn.office.net
+    www.aws.com ts3.tc.mm.bing.net beacon.gtv-pub.com
+    d3agakyjgjv5i8.cloudfront.net drivers.amd.com fpinit.itunes.apple.com
+    api.company-target.com tag-logger.demandbase.com cua-chat-ui.tesla.com
+    store-images.s-microsoft.com gray-wowt-prod.gtv-cdn.com www.sony.com
+    cdn77.api.userway.org downloadmirror.intel.com c.6sc.co
+    downloaddispatch.itunes.apple.com devblogs.microsoft.com
+    static.cloud.coveo.com a.b.cdn.console.awsstatic.com cdn.bizible.com
+    apps.mzstatic.com gray.video-player.arcpublishing.com www.xilinx.com
+    prod.us-east-1.ui.gcr-chat.marketing.aws.dev snap.licdn.com
+    gray-config-prod.api.cdn.arcpublishing.com c.s-microsoft.com
+    aadcdn.msftauth.net www.bing.com cdn.bizibly.com s.go-mpulse.net
+    publisher.liveperson.net mscom.demdex.net prod.log.shortbread.aws.dev
+    visualstudio.microsoft.com
+)
 
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
     GREEN=$'\033[32m' RED=$'\033[31m' YELLOW=$'\033[33m' BOLD=$'\033[1m' RESET=$'\033[0m'
@@ -265,194 +289,10 @@ target_tls_ok() {
 probe_target_latency() {
     local host="$1" start end
     start="$(date +%s%3N)" || return 1
-    reality_tls_ok "$host" 5 || return 1
+    target_tls_ok "$host" 5 || return 1
     end="$(date +%s%3N)" || return 1
     [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$end" -ge "$start" ]] || return 1
     printf '%s' "$((end - start))"
-}
-warned_reality_name() {
-    case "$1" in
-        *apple*|*icloud*|*microsoft*|*.cn|*.ru|*.ir) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-reality_tls_ok() {
-    local host="$1" timeout_seconds="${2:-10}" output
-    output="$(timeout "$timeout_seconds" openssl s_client -4 -connect "${host}:443" -servername "$host" \
-        -tls1_3 -groups X25519 -alpn h2 -verify_hostname "$host" -verify_return_error \
-        -CApath /etc/ssl/certs -brief </dev/null 2>&1)" || return 1
-    [[ "$output" == *'Protocol version: TLSv1.3'* \
-        && "$output" == *'ALPN protocol: h2'* \
-        && "$output" == *'Verification: OK'* ]]
-}
-target_http_check() {
-    local host="$1" url="https://$1/" response status location line authority attempt
-    TARGET_HTTP_HEADERS=''
-    TARGET_REDIRECT_HOST=''
-    for ((attempt = 0; attempt < 4; attempt++)); do
-        # Follow only HTTPS redirects to the original hostname; never fetch another host.
-        response="$(curl -4sSI --noproxy '*' --connect-timeout 5 --max-time 8 \
-            -w $'\nFINAL_STATUS:%{http_code}\n' "$url" 2>/dev/null)" || return 1
-        TARGET_HTTP_HEADERS+=$'\n'"$response"
-        status="${response##*FINAL_STATUS:}"
-        status="${status%%$'\n'*}"
-        [[ "$status" =~ ^[0-9]{3}$ ]] || return 1
-        [[ "$status" == 3?? ]] || return 0
-        location=''
-        while IFS= read -r line; do
-            if [[ "${line,,}" == location:* ]]; then
-                location="${line#*:}"
-                location="${location#"${location%%[![:space:]]*}"}"
-                location="${location%$'\r'}"
-                break
-            fi
-        done <<< "$response"
-        [[ -n "$location" ]] || return 1
-        case "$location" in
-            https://*) url="$location" ;;
-            //*) url="https:$location" ;;
-            /*) url="https://$host$location" ;;
-            \?*) url="${url%%\?*}$location" ;;
-            *://*) return 1 ;;
-            *) url="${url%/*}/$location" ;;
-        esac
-        [[ "$url" =~ ^https://([^/?#]+) ]] || return 1
-        authority="${BASH_REMATCH[1],,}"
-        if [[ "$authority" != "$host" && "$authority" != "$host:443" ]]; then
-            TARGET_REDIRECT_HOST="${authority%:443}"
-            return 2
-        fi
-    done
-    return 1
-}
-popular_target_name() {
-    case "$1" in
-        google.com|*.google.com|youtube.com|*.youtube.com|amazon.com|*.amazon.com|\
-        microsoft.com|*.microsoft.com|apple.com|*.apple.com|facebook.com|*.facebook.com|\
-        netflix.com|*.netflix.com|cloudflare.com|*.cloudflare.com) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-check_sni_target() {
-    local host="$1" http_rc first second
-    valid_host "$host" || { warn '域名格式不正确；只填纯域名。' >&2; return 1; }
-    need_root
-    ensure_dependencies
-    say "正在从 VPS 检查 $host:443 的 TLS 1.3、X25519、H2、证书与跳转…"
-    reality_tls_ok "$host" || { warn 'TLS 1.3、X25519、H2 或证书域名校验未通过。' >&2; return 1; }
-    if target_http_check "$host"; then
-        :
-    else
-        http_rc=$?
-        if (( http_rc == 2 )); then
-            warn "该域名会跳转到 $TARGET_REDIRECT_HOST；请改用该目标域名重新检查，直至不再跨域跳转。" >&2
-        else
-            warn '网站响应或 HTTPS 跳转检查失败。' >&2
-        fi
-        return 1
-    fi
-    ok "必需条件通过：TLS 1.3、X25519、H2、证书匹配，未跳转到其他域名。"
-    if warned_reality_name "$host"; then
-        warn '该域名可能触发 Xray 的 REALITY 目标警告，建议换一个。'
-    fi
-    case "${TARGET_HTTP_HEADERS,,}" in
-        *$'\ncf-ray:'*|*$'\nserver: cloudflare'*|*$'\nx-cache:'*|*$'\nvia:'*|*$'\nx-akamai-'*)
-            warn '响应头显示可能使用 CDN 或缓存层；请自行核对解析 IP 和 ASN。' ;;
-    esac
-    if popular_target_name "$host"; then
-        warn '这是常见大型站点域名；建议比较更冷门的候选。'
-    else
-        say '热门程度无法可靠自动判断，请自行核对。'
-    fi
-    first="$(probe_target_latency "$host")" && second="$(probe_target_latency "$host")" \
-        && say "VPS 到目标的 TLS 握手耗时：${first} ms、${second} ms（平均 $(((first + second) / 2)) ms）。" \
-        || warn '耗时复测失败；必需条件已通过，建议稍后重测。'
-}
-nearby_target_ok() {
-    local host="$1" server_ip="$2" prefix addresses v6_addresses ip
-    valid_host "$host" && ! warned_reality_name "$host" || return 1
-    prefix="${server_ip%.*}."
-    addresses="$(getent ahostsv4 "$host" 2>/dev/null | awk '$2 == "STREAM" {print $1}' | sort -u)" || return 1
-    [[ -n "$addresses" ]] || return 1
-    while IFS= read -r ip; do
-        [[ "$ip" == "$prefix"* && "$ip" != "$server_ip" ]] || return 1
-    done <<< "$addresses"
-    v6_addresses="$(getent ahostsv6 "$host" 2>/dev/null | awk '$2 == "STREAM" {print $1}' || true)"
-    [[ -z "$v6_addresses" ]] || return 1
-    reality_tls_ok "$host" || return 1
-    target_http_check "$host" || return 1
-    case "${TARGET_HTTP_HEADERS,,}" in *$'\ncf-ray:'*|*$'\nserver: cloudflare'*) return 1 ;; esac
-}
-load_nearby_candidates() {
-    local file="${1:-}" line host
-    local -A seen=()
-    NEARBY_CANDIDATES=()
-    if [[ -n "$file" ]]; then
-        [[ -f "$file" && -r "$file" ]] || fail "候选域名文件不可读取：$file"
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            host="${line%$'\r'}"
-            [[ -n "$host" && "$host" != \#* ]] || continue
-            host="${host,,}"
-            valid_host "$host" || fail "候选域名格式错误：$host（文件须每行一个纯域名）。"
-            [[ -v seen[$host] ]] && continue
-            seen[$host]=1
-            NEARBY_CANDIDATES+=("$host")
-            (( ${#NEARBY_CANDIDATES[@]} <= 32 )) || fail '一次最多导入 32 个域名。'
-        done < "$file"
-    else
-        [[ -t 0 ]] || fail '非交互运行时请指定域名列表文件。'
-        say '请从 bgp.tools 的 Forward DNS 复制候选域名；每行输入一个，空行结束（最多 32 个）。'
-        while true; do
-            read -r -p '候选域名（空行结束）：' line || fail '已取消输入。'
-            [[ -n "$line" ]] || break
-            host="${line,,}"
-            valid_host "$host" || { warn '只输入域名，不要带 IP、端口或网址。'; continue; }
-            [[ -v seen[$host] ]] && continue
-            seen[$host]=1
-            NEARBY_CANDIDATES+=("$host")
-            (( ${#NEARBY_CANDIDATES[@]} <= 32 )) || fail '一次最多导入 32 个域名。'
-        done
-    fi
-    (( ${#NEARBY_CANDIDATES[@]} > 0 )) || fail '没有收到候选域名。'
-}
-select_nearby_sni() {
-    local file="${1:-}" probe_dir index pid rc=0
-    local -a pids=() qualified=() original=("${SNI_CANDIDATES[@]}")
-    need_root
-    ensure_dependencies
-    SERVER_IP="$(public_ipv4)" || fail '无法查询 VPS 公网 IPv4，不能核对同网段。'
-    load_nearby_candidates "$file"
-    say "正在核对 ${#NEARBY_CANDIDATES[@]} 个域名是否解析到 ${SERVER_IP%.*}.0/24，并验证 TLS、H2、证书和跳转…"
-    probe_dir="$(mktemp -d /tmp/vless-reality-nearby.XXXXXX)" || return 1
-    if ! printf '%s\n' vless-reality-setup > "$probe_dir/.vless-reality-owned"; then
-        rm -rf -- "$probe_dir"
-        return 1
-    fi
-    for ((index = 0; index < ${#NEARBY_CANDIDATES[@]}; index++)); do
-        (if nearby_target_ok "${NEARBY_CANDIDATES[index]}" "$SERVER_IP"; then
-            printf 'ok' > "$probe_dir/pass.$index"
-        fi) &
-        pids+=("$!")
-        if (( ${#pids[@]} >= 8 || index == ${#NEARBY_CANDIDATES[@]} - 1 )); then
-            for pid in "${pids[@]}"; do wait "$pid" || true; done
-            pids=()
-            say "  已验证 $((index + 1))/${#NEARBY_CANDIDATES[@]} 个域名"
-        fi
-    done
-    for ((index = 0; index < ${#NEARBY_CANDIDATES[@]}; index++)); do
-        if [[ -f "$probe_dir/pass.$index" ]]; then
-            qualified+=("${NEARBY_CANDIDATES[index]}")
-        else
-            warn "  ${NEARBY_CANDIDATES[index]}：未通过同网段、TLS/H2、证书或网站检查，跳过。"
-        fi
-    done
-    rm -rf -- "$probe_dir"
-    (( ${#qualified[@]} > 0 )) || { warn '没有通过验证的同网段域名。'; return 1; }
-    say "通过严格筛选：${qualified[*]}"
-    SNI_CANDIDATES=("${qualified[@]}")
-    select_fastest_sni || rc=$?
-    SNI_CANDIDATES=("${original[@]}")
-    return "$rc"
 }
 select_fastest_sni() {
     local host first second score index pid line probe_dir count=0
@@ -514,19 +354,13 @@ select_fastest_sni() {
     ok "实测延迟最低的域名：$SNI（约 ${finalists[0]%% *} ms）"
 }
 
-show_nearby_sni() (
-    select_nearby_sni "${1:-}" || fail '候选域名没有通过同网段与 TLS 验证，请更换候选。'
-    say '此操作只显示结果，不修改节点配置。需要修改时请运行 sni 新域名。'
-)
-show_sni_check() (
-    local host="${1:-}"
-    if [[ -z "$host" ]]; then
-        [[ -t 0 ]] || fail '非交互运行时请指定要检测的域名。'
-        read -r -p '请输入要检测的纯域名：' host || fail '已取消输入。'
-    fi
-    host="${host,,}"
-    check_sni_target "$host" || fail '域名未通过必需条件检查。'
-    say '检测只读，节点配置未修改。'
+show_fastest_sni() (
+    local command_name
+    for command_name in openssl timeout date sort sed mktemp; do
+        need_command "$command_name"
+    done
+    select_fastest_sni || fail '候选域名均不可用，请检查 VPS 网络或手动指定伪装域名。'
+    say '此操作只显示测速结果，不修改节点配置。'
 )
 
 generate_reality_keys() {
@@ -710,8 +544,7 @@ clean_runtime_residue() (
         [[ "$owner" == "$EUID" ]] || continue
         rm -f -- "$entry" || return 1
     done
-    for dir in /tmp/vless-reality-install.?????? /tmp/vless-reality-update.?????? \
-        /tmp/vless-reality-sni.?????? /tmp/vless-reality-nearby.??????; do
+    for dir in /tmp/vless-reality-install.?????? /tmp/vless-reality-update.?????? /tmp/vless-reality-sni.??????; do
         [[ -d "$dir" && ! -L "$dir" ]] || continue
         owner="$(stat -c %u -- "$dir")" || return 1
         if [[ "$owner" != "$EUID" ]]; then
@@ -730,12 +563,6 @@ clean_runtime_residue() (
         done
         if [[ "$dir" == /tmp/vless-reality-sni.?????? ]]; then
             for entry in "$dir"/result.* "$dir"/result2.*; do
-                [[ -f "$entry" && ! -L "$entry" ]] || continue
-                rm -f -- "$entry" || return 1
-            done
-        fi
-        if [[ "$dir" == /tmp/vless-reality-nearby.?????? ]]; then
-            for entry in "$dir"/pass.*; do
                 [[ -f "$entry" && ! -L "$entry" ]] || continue
                 rm -f -- "$entry" || return 1
             done
@@ -805,7 +632,7 @@ install_node() {
     . /etc/os-release
     [[ "${ID:-}" == debian || "${ID:-}" == ubuntu ]] || fail '这个脚本仅支持 Debian 和 Ubuntu。'
     check_install_eligibility
-    local interactive=0 raw_port="${1:-}" answer default_name nearby_sni=0 tfo_choice="${4:-off}"
+    local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0 tfo_choice="${4:-off}"
     default_name="Reality-$(hostname -s)"
 
     if [[ -z "$raw_port" ]]; then
@@ -820,27 +647,19 @@ install_node() {
 
     SNI="${2:-}"
     if [[ -z "$SNI" ]]; then
-        [[ -t 0 ]] || fail '非交互运行时，请指定伪装域名或 nearby:候选文件。'
+        [[ -t 0 ]] || fail '非交互运行时，请指定伪装域名或 auto。'
         interactive=1
-        read -r -p 'REALITY 伪装域名（回车导入同网段候选，或输入自定义域名）：' SNI || fail '已取消输入。'
-        SNI="${SNI:-nearby}"
+        read -r -p 'REALITY 伪装域名（直接回车默认选实测延迟最低的域名，或输入自定义域名）：' SNI || fail '已取消输入。'
+        SNI="${SNI:-auto}"
     fi
-    case "${SNI,,}" in
-        nearby)
-            nearby_sni=1
-            select_nearby_sni || fail '同网段候选均不可用，请手动指定伪装域名。'
-            ;;
-        nearby:*)
-            nearby_sni=1
-            select_nearby_sni "${SNI#*:}" || fail '同网段候选均不可用，请手动指定伪装域名。'
-            ;;
-        auto) fail '内置域名自动优选已移除；请使用 nearby:候选文件或手动填写域名。' ;;
-        *)
-            SNI="${SNI,,}"
-            valid_host "$SNI" || fail '伪装域名格式不正确；只填域名，不要带 https://、端口或路径。'
-            check_sni_target "$SNI" || fail '伪装域名未通过必需条件检查，请更换域名。'
-            ;;
-    esac
+    SNI="${SNI,,}"
+    if [[ "$SNI" == auto ]]; then
+        auto_sni=1
+        ensure_dependencies
+        select_fastest_sni || fail '候选域名均不可用，请手动指定可从 VPS 访问的伪装域名。'
+    else
+        valid_host "$SNI" || fail '伪装域名格式不正确；只填域名，不要带 https://、端口或路径。'
+    fi
 
     NODE_NAME="${3:-$default_name}"
     if (( interactive )); then
@@ -863,7 +682,7 @@ install_node() {
         step '—————————— 确认安装信息 ——————————'
         say "  协议：VLESS + REALITY + Vision"
         say "  端口：TCP $PORT"
-        if (( nearby_sni )); then say "  SNI： $SNI:443（同网段优选）"; else say "  SNI： $SNI:443"; fi
+        if (( auto_sni )); then say "  SNI： $SNI:443（自动优选）"; else say "  SNI： $SNI:443"; fi
         say "  名称：$NODE_NAME"
         if (( TFO_ENABLED )); then say '  TFO： 开启'; else say '  TFO： 关闭'; fi
         warn "  请确认云安全组已放行 TCP ${PORT}，无需开放 TCP 80"
@@ -1181,40 +1000,29 @@ change_sni() {
     need_root
     [[ $# -le 1 ]] || fail "用法：$(cmd_name) sni [新域名]"
     load_metadata
-    local new="${1:-}" old_port="$PORT" old_sni="$SNI" backup was_active=0 nearby_sni=0
+    local new="${1:-}" old_port="$PORT" old_sni="$SNI" backup was_active=0 auto_sni=0
     if [[ -z "$new" ]]; then
         [[ -t 0 ]] || fail '非交互运行时请指定新伪装域名。'
-        read -r -p "当前 SNI $SNI，请输入新域名（回车导入同网段候选）：" new || fail '已取消输入。'
-        new="${new:-nearby}"
+        read -r -p "当前 SNI $SNI，请输入新域名（回车自动优选）：" new || fail '已取消输入。'
+        new="${new:-auto}"
     fi
-    case "${new,,}" in
-        nearby|nearby:*)
-            nearby_sni=1
-            if [[ "${new,,}" == nearby ]]; then
-                select_nearby_sni || fail '同网段候选均不可用，请手动指定伪装域名。'
-            else
-                select_nearby_sni "${new#*:}" || fail '同网段候选均不可用，请手动指定伪装域名。'
-            fi
-            new="$SNI"
-            SNI="$old_sni"
-            ;;
-        auto) fail '内置域名自动优选已移除；请使用 nearby:候选文件或手动填写域名。' ;;
-        *)
-            new="${new,,}"
-            valid_host "$new" || fail '伪装域名格式不正确。'
-            ;;
-    esac
+    new="${new,,}"
+    if [[ "$new" == auto ]]; then
+        auto_sni=1
+        select_fastest_sni || fail '候选域名均不可用，请手动指定伪装域名。'
+        new="$SNI"
+        SNI="$old_sni"
+    else
+        valid_host "$new" || fail '伪装域名格式不正确。'
+    fi
     if [[ "$new" == "$SNI" ]]; then
-        if (( nearby_sni )); then ok "当前域名 $SNI 已是本次测试的最优选项，无需修改。"; return 0; fi
+        if (( auto_sni )); then ok "当前域名 $SNI 已是本次测试的最优选项，无需修改。"; return 0; fi
         fail '新域名与当前域名相同。'
     fi
-    if (( ! nearby_sni )); then
-        check_sni_target "$new" || fail '新伪装域名未通过必需条件检查，原节点未修改。'
+    if (( ! auto_sni )); then
+        target_tls_ok "$new" || fail "$new:443 未通过 TLS 1.3 与证书校验。"
     fi
-    if systemctl is-active --quiet xray; then
-        was_active=1
-        warn '修改 SNI 会重启 Xray；如果 SSH 经过此节点，连接可能中断。'
-    fi
+    if systemctl is-active --quiet xray; then was_active=1; fi
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
     backup_state "$backup"
     SNI="$new"
@@ -1454,13 +1262,12 @@ print_help() {
     cat <<EOF
 VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
 用法：${cmd} [命令]
-  install [端口] [SNI|nearby:文件] [名称] [on|off]  安装节点
+  install [端口] [SNI] [名称] [on|off]  安装节点（TFO 默认 off）
   show                         显示 vless:// 导入链接
   status                       查看服务、配置、端口和伪装站点状态
   port [新端口]                修改端口
-  sni [新域名|nearby:文件]     修改 SNI，或从同网段候选优选
-  sni-nearby [文件]            导入并验证同网段候选，不修改节点
-  sni-check [域名]             检查单个伪装域名，不修改节点
+  sni [新域名|auto]            修改或自动优选 REALITY 伪装域名
+  sni-best                     查看当前测速延迟最低的域名，不修改节点
   tfo [on|off]                 查看或切换 TCP Fast Open
   uuid                         重新生成 UUID
   rotate-keys                  轮换 REALITY 密钥和 Short ID
@@ -1505,7 +1312,7 @@ show_menu() {
     say '  6. 重启服务'
     say '----------------------------------'
     say '  7. 修改端口'
-    say '  8. 修改伪装域名（可导入同网段候选）'
+    say '  8. 修改伪装域名（支持自动优选）'
     say '  9. 重新生成 UUID'
     say ' 10. 轮换 REALITY 密钥'
     say ' 11. 修改节点名称'
@@ -1514,9 +1321,8 @@ show_menu() {
     say ' 13. 查看导入链接'
     say ' 14. 查看运行状态'
     say ' 15. 查看运行日志'
-    say ' 16. 导入并优选同网段域名（只查看）'
+    say ' 16. 查看当前测速延迟最低的域名'
     say ' 17. 开关 TCP Fast Open'
-    say ' 18. 检测单个伪装域名（只查看）'
     say ' 00. 退出'
     say '=================================='
     menu_status
@@ -1530,8 +1336,8 @@ menu_action() {
         9) warn '操作后旧链接立即失效。'; change_uuid ;;
         10) warn '操作后旧链接立即失效。'; rotate_keys ;;
         11) rename_node ;; 12) refresh_ip ;; 13) show_node ;;
-        14) status_node ;; 15) log_node ;; 16) show_nearby_sni ;;
-        17) tfo_node ;; 18) show_sni_check ;; *) return 2 ;;
+        14) status_node ;; 15) log_node ;; 16) show_fastest_sni ;;
+        17) tfo_node ;; *) return 2 ;;
     esac
 }
 interactive_menu() {
@@ -1541,8 +1347,8 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-18，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-8]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-17，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-7]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
@@ -1564,8 +1370,7 @@ main() {
         status) status_node ;;
         port) shift; change_port "$@" ;;
         sni) shift; change_sni "$@" ;;
-        sni-nearby) shift; [[ $# -le 1 ]] || fail "用法：$(cmd_name) sni-nearby [候选文件]"; show_nearby_sni "${1:-}" ;;
-        sni-check) shift; [[ $# -le 1 ]] || fail "用法：$(cmd_name) sni-check [域名]"; show_sni_check "${1:-}" ;;
+        sni-best) show_fastest_sni ;;
         tfo) shift; tfo_node "$@" ;;
         __tfo-apply) shift; tfo_apply "$@" ;;
         uuid) change_uuid ;;
@@ -1578,7 +1383,7 @@ main() {
         log|logs) shift; log_node "$@" ;;
         update) update_xray ;;
         uninstall) uninstall_node ;;
-        [1-9]|1[0-8]) need_root; menu_action "$1" ;;
+        [1-9]|1[0-7]) need_root; menu_action "$1" ;;
         *) print_help; exit 2 ;;
     esac
 }
