@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.6.0'
+SCRIPT_VERSION='1.6.1'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -1119,11 +1119,13 @@ EOF
 show_node() {
     need_root
     load_metadata
-    local uuid label link tmp enc_param
+    local uuid label link tmp enc_param tfo_param=''
     uuid="$(config_uuid)" || fail '无法从配置读取 UUID。'
     label="$(jq -rn --arg v "$NODE_NAME" '$v | @uri')" || return 1
     enc_param="$(jq -rn --arg v "$CLIENT_ENCRYPTION" '$v | @uri')" || return 1
-    link="vless://${uuid}@${SERVER_IP}:${PORT}?encryption=${enc_param}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${label}"
+    # tfo 是部分客户端识别的扩展参数；服务端开关仍以 Xray 配置为准。
+    if config_tfo_enabled; then tfo_param='&tfo=1'; fi
+    link="vless://${uuid}@${SERVER_IP}:${PORT}?encryption=${enc_param}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none${tfo_param}#${label}"
     tmp="$(mktemp "${LINK_FILE}.XXXXXX")" || return 1
     if ! printf '%s\n' "$link" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$LINK_FILE"; then
         rm -f -- "$tmp"
@@ -1259,14 +1261,15 @@ tfo_apply() {
         if (( changed )); then disable_kernel_tfo || changed=0; fi
     fi
     if (( changed )) && config_ok \
-        && { (( was_active == 0 )) || { systemctl restart xray && wait_service 10; }; }; then
+        && { (( was_active == 0 )) || { systemctl restart xray && wait_service 10; }; } \
+        && (show_node >/dev/null); then
         rm -rf -- "$backup"
         if [[ "$action" == on ]]; then
             ok "TCP Fast Open 已开启（内核值 $(kernel_tfo_value)）。"
         else
             ok 'TCP Fast Open 已关闭；本脚本修改的内核设置已恢复。'
         fi
-        say '客户端若支持 TFO，还需要在客户端单独开启。'
+        say '新导入链接已附带 tfo=1（开启时）；请检查客户端是否识别该参数。'
         return 0
     fi
     restore_tfo_snapshot "$backup" "$old_kernel" "$old_foreign" || rollback_ok=0
@@ -1314,6 +1317,7 @@ tfo_node() {
         else
             fail "后台任务已结束，但 TFO 状态未达到预期；请查看 journalctl -u $unit。"
         fi
+        show_node
     else
         fail "TFO 后台任务失败；请查看 journalctl -u $unit。"
     fi

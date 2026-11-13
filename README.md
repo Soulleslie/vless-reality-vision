@@ -92,6 +92,8 @@ v1.5.0 增加 VLESS Encryption 开关：通过 `xray vlessenc` 生成配对参�
 
 v1.6.0 增加 VLESS Encryption 的 `native`、`xorpub`、`random` 三种模式；安装时选择，安装后可从菜单或命令行修改。默认 `native`。
 
+v1.6.1 开启服务端 TFO 时，在新生成的导入链接中附带客户端可选参数 `tfo=1`；切换 TFO 后刷新链接。
+
 ## 非交互安装
 
 参数顺序为端口、伪装域名、节点名称：
@@ -163,7 +165,7 @@ vless-reality uninstall            卸载并清理
 
 TFO 默认关闭。开启时，脚本设置 Xray 入站的 `sockopt.tcpFastOpen`，并开启内核参数 `net.ipv4.tcp_fastopen` 的服务端位。内核设置写入 `/etc/sysctl.d/99-vless-reality-tfo.conf`，重启后仍生效。关闭或卸载时，只清理带有本脚本标记的设置文件，并尽可能恢复修改前的内核值；若内核值后来被其他程序改动，脚本会保留当前值并提示。
 
-TFO 只影响新建 TCP 连接。客户端若支持 TFO，也需要在客户端单独开启；`vless://` 导入链接不会替客户端设置 TFO。部分网络对 TFO 的兼容性较差，因此默认关闭。
+TFO 只影响新建 TCP 连接。服务端开启 TFO 时，新生成的 `vless://` 链接会附带 `tfo=1`，关闭时不附带。该参数是部分客户端识别的扩展参数，不在通用 VLESS 分享链接字段中；导入后请检查客户端是否真的开启 TFO，不识别的客户端需手动开启。部分网络对 TFO 的兼容性较差，因此默认关闭。
 
 切换 TFO 会重启 Xray。如果 SSH 连接经过这个 VLESS 节点，重启可能切断当前 SSH 会话；建议通过 VPS 的直连 SSH 操作。切换由 systemd 后台任务完成，断线后任务仍会继续。重连后运行 `vless-reality status` 核对结果；失败详情可用 `journalctl -u vless-reality-tfo -n 30 --no-pager` 查看。
 

@@ -6,6 +6,8 @@ source <(sed '$d' "$ROOT/install.sh")
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_DIR"' EXIT
 LINK_FILE="$TEST_DIR/link.txt"
+CONFIG="$TEST_DIR/config.json"
+printf '%s\n' '{"inbounds":[{"protocol":"vless","streamSettings":{"sockopt":{"tcpFastOpen":false}}}]}' > "$CONFIG"
 printf 'old-link\n' > "$LINK_FILE"
 need_root() { return 0; }
 load_metadata() {
@@ -30,7 +32,15 @@ unset -f mv
 show_node >/dev/null
 [[ "$(< "$LINK_FILE")" == vless://* ]]
 [[ "$(< "$LINK_FILE")" == *'encryption=none'* ]]
+[[ "$(< "$LINK_FILE")" != *'&tfo=1'* ]]
 TEST_CLIENT_ENCRYPTION='mlkem768x25519plus.native.0rtt.ABC_def-123'
+jq '(.inbounds[0].streamSettings.sockopt.tcpFastOpen) = true' "$CONFIG" > "$TEST_DIR/new-config.json"
+mv "$TEST_DIR/new-config.json" "$CONFIG"
 show_node >/dev/null
 [[ "$(< "$LINK_FILE")" == *'encryption=mlkem768x25519plus.native.0rtt.ABC_def-123'* ]]
+[[ "$(< "$LINK_FILE")" == *'&tfo=1#'* ]]
+jq '(.inbounds[0].streamSettings.sockopt.tcpFastOpen) = false' "$CONFIG" > "$TEST_DIR/new-config.json"
+mv "$TEST_DIR/new-config.json" "$CONFIG"
+show_node >/dev/null
+[[ "$(< "$LINK_FILE")" != *'&tfo=1'* ]]
 printf '客户端链接原子写入验证通过\n'

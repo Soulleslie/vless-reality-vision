@@ -19,6 +19,7 @@ printf '0' > "$KERNEL_STATE"
 need_root() { :; }
 need_command() { :; }
 load_metadata() { :; }
+show_node() { :; }
 # shellcheck disable=SC2329 # 由 tfo_node 间接调用。
 config_ok() { return 0; }
 systemctl() { return 1; }

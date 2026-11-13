@@ -22,6 +22,7 @@ if [[ "${1:-}" == --child ]]; then
     need_command() { :; }
     ensure_shortcut() { :; }
     load_metadata() { NODE_NAME=test; SERVER_IP=127.0.0.1; PORT=443; SNI=www.amazon.com; }
+    show_node() { :; }
     installed_version() { printf 'test'; }
     config_ok() { return 0; }
     wait_service() { return 0; }
