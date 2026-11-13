@@ -10,7 +10,7 @@ if [[ "${1:-}" == --child || "${1:-}" == --child-on ]]; then
     choose_port() { PORT=443; }
     port_free() { :; }
     ensure_dependencies() { :; }
-    select_fastest_sni() {
+    select_nearby_sni() {
         SNI=www.samsung.com
         say '实测延迟最低的域名：www.samsung.com（约 31 ms）'
     }
@@ -28,7 +28,7 @@ output="$(printf '\n\n' | script -q -e -c "$child_command" /dev/null)"
 [[ "$output" == *'实测延迟最低的域名：www.samsung.com（约 31 ms）'* ]]
 before_name="${output%%请输入节点名称*}"
 [[ "$before_name" == *'实测延迟最低的域名：www.samsung.com（约 31 ms）'* ]]
-[[ "$output" == *'SNI： www.samsung.com:443（自动优选）'* ]]
+[[ "$output" == *'SNI： www.samsung.com:443（同网段优选）'* ]]
 [[ "$output" == *'是否开启 TCP Fast Open？默认关闭 [y/N]：'* ]]
 [[ "$output" == *'TFO： 关闭'* ]]
 printf -v child_command 'bash %q --child-on' "$ROOT/tests/install_sni_prompt.bash"
