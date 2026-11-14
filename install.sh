@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.2.0'
+SCRIPT_VERSION='2.2.1'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -51,6 +51,7 @@ SELF_RENEW_TIMER='/etc/systemd/system/vless-reality-cert.timer'
 SELF_METHOD=''
 SELF_EMAIL=''
 SELF_CREDENTIALS=''
+SELF_INPUT_DOMAIN=''
 SELF_STARTED=0
 SELF_OPERATION_LOCKED=0
 SELF_POLICY='/usr/sbin/policy-rc.d'
@@ -902,6 +903,8 @@ install_node() {
     step '[2/5] 验证 REALITY 伪装站点…'
     if [[ "$NODE_MODE" == self ]]; then
         self_preflight
+        # 在安装 Nginx/Certbot、读取 DNS Token、创建项目文件及安装回滚事务之前拦截错误域名。
+        self_dns_precheck "$SNI" || fail '自有域名预检未通过；未开始部署，请修正域名或 DNS 后重试。'
     else
         target_tls_ok "$SNI" || fail "$SNI:443 未通过 TLS 1.3 与证书校验，请更换可从本机访问的伪装域名。"
         ok "伪装站点可用：$SNI:443（TLS 1.3）"
@@ -1789,21 +1792,66 @@ ensure_dns_tool() {
     need_command dig
 }
 self_dns_query() { dig "@$1" "$2" "$3" +time=4 +tries=1 +noall +answer +comments; }
+self_dns_checked_query() {
+    local resolver="$1" domain="$2" type="$3" output status=UNKNOWN reason
+    if ! output="$(self_dns_query "$resolver" "$domain" "$type" 2>&1)"; then
+        warn "失败：$resolver 查询 $domain 的 $type 记录未完成；请检查 VPS 的 DNS 网络连通性或稍后重试。" >&2
+        return 1
+    fi
+    if [[ "$output" =~ status:[[:space:]]*([A-Z]+) ]]; then status="${BASH_REMATCH[1]}"; fi
+    case "$status" in
+        NOERROR) printf '%s\n' "$output"; return 0 ;;
+        NXDOMAIN) reason='域名或子域名不存在，请检查拼写及 DNS 记录是否已创建/生效' ;;
+        SERVFAIL) reason='解析失败，请检查权威 NS、DNSSEC 或 DNS 服务状态' ;;
+        REFUSED) reason='解析器拒绝查询，请检查 DNS 服务与网络访问限制' ;;
+        *) reason='未获得正常 DNS 响应，请检查 DNS 配置或稍后重试' ;;
+    esac
+    warn "失败：$resolver 查询 $domain 的 $type 记录返回 $status；$reason。" >&2
+    return 1
+}
 self_dns_check() {
     local domain="$1" ip resolver output records aaaa cname
     valid_host "$domain" || { warn '失败：域名格式无效。' >&2; return 1; }
     ip="$(public_ipv4)" || { warn '失败：无法确认本机公网 IPv4。' >&2; return 1; }
     for resolver in 1.1.1.1 8.8.8.8; do
-        output="$(self_dns_query "$resolver" "$domain" A)" || return 1
-        [[ "$output" == *'status: NOERROR'* ]] || { warn "失败：$resolver 返回 DNS 错误。" >&2; return 1; }
+        output="$(self_dns_checked_query "$resolver" "$domain" A)" || return 1
         cname="$(awk '$4 == "CNAME" {print $5}' <<< "$output")"
         [[ -z "$cname" ]] || { warn '失败：连接域名不接受 CNAME，请使用直接指向 VPS 的 A 记录。' >&2; return 1; }
         records="$(awk '$4 == "A" {print $5}' <<< "$output" | sort -u)"
-        [[ "$records" == "$ip" ]] || { warn '失败：A 记录不是唯一的当前 VPS IPv4；请关闭 CDN/Cloudflare 橙云并等待 DNS 生效。' >&2; return 1; }
-        output="$(self_dns_query "$resolver" "$domain" AAAA)" || return 1
-        [[ "$output" == *'status: NOERROR'* ]] || return 1
+        [[ "$records" == "$ip" ]] || { warn "失败：$resolver 查询 $domain 的 A 记录为 ${records//$'\n'/, }（空白表示无记录），期望唯一 IPv4 $ip；请核对域名、关闭 CDN/Cloudflare 橙云并等待 DNS 生效。" >&2; return 1; }
+        output="$(self_dns_checked_query "$resolver" "$domain" AAAA)" || return 1
         aaaa="$(awk '$4 == "AAAA" {print $5}' <<< "$output")"
         [[ -z "$aaaa" ]] || { warn '失败：此模式只配置 IPv4 入口，请先移除 AAAA 记录，避免 IPv6 连接绕过本机配置。' >&2; return 1; }
+    done
+}
+self_dns_precheck() {
+    valid_host "$1" || { warn '失败：只填完整域名，不要带 https://、端口、路径或空格。' >&2; return 1; }
+    ensure_dns_tool || return 1
+    self_dns_check "$1"
+}
+# 仅交互安装/更换自有域名使用；CLI 显式参数保持无人值守语义，仍须通过部署前预检。
+self_prompt_domain() {
+    local domain confirmation tools_ready=0
+    SELF_INPUT_DOMAIN=''
+    while true; do
+        IFS= read -r -p '自有域名（A 直连 VPS，无 AAAA / CNAME / CDN；输入 0 返回）：' domain || return 1
+        case "$domain" in 0|00|q|Q) return 1 ;; esac
+        domain="${domain,,}"
+        if ! valid_host "$domain"; then warn '域名格式不正确：只填完整域名，不要带 https://、端口、路径或空格。'; continue; fi
+        if (( ! tools_ready )); then
+            ensure_dependencies || fail '域名预检所需的基础工具不可用，未开始部署。'
+            ensure_dns_tool || fail '域名预检所需的 DNS 工具不可用，未开始部署。'
+            tools_ready=1
+        fi
+        say "正在检查自有域名：$domain"
+        if ! self_dns_check "$domain"; then warn '域名预检未通过，请修正后重新输入；尚未开始部署。'; continue; fi
+        ok 'DNS 预检通过：两个解析器均确认 A 直连当前 VPS，无 AAAA / CNAME。'
+        say "准备使用的完整域名：$domain"
+        IFS= read -r -p '请再次输入完整域名确认（输入 0 返回）：' confirmation || return 1
+        case "$confirmation" in 0|00|q|Q) return 1 ;; esac
+        if [[ "${confirmation,,}" != "$domain" ]]; then warn '两次域名不一致，请重新输入并核对。'; continue; fi
+        SELF_INPUT_DOMAIN="$domain"
+        return 0
     done
 }
 self_cloudflare_zone() {
@@ -2200,7 +2248,8 @@ self_prepare() {
         self_track "$SELF_DIR/cloudflare.ini"
     fi
     self_extra_dependencies || fail '自有域名依赖安装失败。'
-    self_dns_check "$SNI" || fail 'DNS 检查未通过。'
+    # 前置预检之后再复核，避免依赖安装期间 DNS 改变仍继续签发。
+    self_dns_check "$SNI" || fail '部署期间 DNS 复核未通过，正在回滚；请核对域名解析。'
     curl --version | grep -q HTTP2 || fail '系统 curl 必须支持 HTTP/2。'
     # 只处理本次新安装软件包创建的默认入口，预存站点不动。
     if [[ "$had_nginx" == false && -L /etc/nginx/sites-enabled/default ]]; then
@@ -2234,7 +2283,8 @@ install_self() (
     local domain="${1:-}" method="${2:-}" email="${3:-}" name="${4:-Reality-Self}" tfo="${5:-off}" enc="${6:-off}" mode="${7:-native}" answer args=()
     if [[ -z "$domain" ]]; then
         [[ -t 0 ]] || fail '请指定自有域名。'
-        read -r -p '自有域名（A 直连 VPS，无 AAAA / CNAME / CDN）：' domain || fail '已取消。'
+        self_prompt_domain || { say '已取消安装。'; return 0; }
+        domain="$SELF_INPUT_DOMAIN"
         read -r -p '证书验证 [cloudflare DNS-01 / http HTTP-01]（回车 cloudflare）：' method || fail '已取消。'
         method="${method:-cloudflare}"
         read -r -p 'LE 通知邮箱：' email || fail '已取消。'
@@ -2319,7 +2369,7 @@ self_cleanup() (
         if systemctl is-active --quiet "$unit"; then systemctl stop "$unit" || return 1; fi
         if systemctl is-failed --quiet "$unit"; then systemctl reset-failed "$unit" || return 1; fi
     done
-    if systemctl is-enabled --quiet vless-reality-cert.timer; then systemctl disable vless-reality-cert.timer || return 1; fi
+    if systemctl is-enabled --quiet vless-reality-cert.timer 2>/dev/null; then systemctl disable vless-reality-cert.timer || return 1; fi
     if [[ -f "$SELF_SITE" ]]; then
         cp -a "$SELF_SITE" "$SELF_DIR/work/site-before-cleanup"
         rm -- "$SELF_SITE" || return 1
@@ -2588,11 +2638,13 @@ change_self_domain() {
     local domain="${1:-}" script_path
     if [[ -z "$domain" ]]; then
         [[ -t 0 ]] || fail '请指定新自有域名；不支持 auto。'
-        read -r -p '新自有域名（将同步证书、网站与 Xray）：' domain || fail '已取消。'
+        self_prompt_domain || { say '已取消修改。'; return 0; }
+        domain="$SELF_INPUT_DOMAIN"
     fi
     domain="${domain,,}"
     valid_host "$domain" || fail '新自有域名格式无效；自有域名模式不允许 auto。'
     [[ "$domain" != "$SNI" ]] || { ok '域名未改变。'; return 0; }
+    self_dns_precheck "$domain" || fail '新域名预检未通过；原节点保持不变。'
     script_path="$(readlink -f "$SCRIPT_PATH")" || fail '找不到当前脚本。'
     warn '即将申请新证书并重启 Xray；请使用 VPS 直连 SSH。成功后须重新导入链接。'
     systemd-run --quiet --wait --collect --unit=vless-reality-self-change \

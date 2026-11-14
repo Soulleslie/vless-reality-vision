@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "${1:-}" != --child ]]; then
-    for stage in success dns provider credentials cert renewal renew-record timer nginx xray target nat-pending nat-auth public-http; do
+    for stage in success dns dns-late provider credentials cert renewal renew-record timer nginx xray target nat-pending nat-auth public-http; do
         bash "${BASH_SOURCE[0]}" --child "$stage" cloudflare
     done
     bash "${BASH_SOURCE[0]}" --child success http
@@ -27,9 +27,11 @@ printf 'dns_cloudflare_api_token = abcdefghijklmnopqrstuvwxyz12345\n' > "$TEST_D
 chmod 600 "$TEST_DIR/credentials.ini"
 [[ "$STAGE" != credentials ]] || chmod 644 "$TEST_DIR/credentials.ini"
 export VLESS_CF_CREDENTIALS="$TEST_DIR/credentials.ini"
-need_root() { :; }; need_command() { :; }; ensure_dependencies() { :; }; self_extra_dependencies() { :; }; ensure_dns_tool() { :; }
+need_root() { :; }; need_command() { :; }; ensure_dependencies() { :; }; self_extra_dependencies() { touch "$TEST_DIR/deploy-dependencies"; }; ensure_dns_tool() { :; }
 security_dns_snapshot() { printf '{"domain":"%s","A":"203.0.113.1","AAAA":"","CNAME":"","NS":"ns1.example.com.","CAA":""}\n' "$1"; }
-self_dns_check() { [[ "$STAGE" != dns ]]; }; self_cloudflare_zone() { [[ "$STAGE" != provider ]]; }; self_tls_check() { :; }; self_reject_check() { :; }; self_authority_check() { [[ "$STAGE" != security-rule && "$STAGE" != security-rollback ]]; }; self_loaded_cert_matches() { :; }
+DNS_CHECK_COUNT=0
+self_dns_check() { (( DNS_CHECK_COUNT += 1 )); [[ "$STAGE" != dns ]] && { [[ "$STAGE" != dns-late ]] || (( DNS_CHECK_COUNT == 1 )); }; }
+self_cloudflare_zone() { [[ "$STAGE" != provider ]]; }; self_tls_check() { :; }; self_reject_check() { :; }; self_authority_check() { [[ "$STAGE" != security-rule && "$STAGE" != security-rollback ]]; }; self_loaded_cert_matches() { :; }
 public_ipv4() { printf '203.0.113.1'; }; chown() { :; }; getent() { return 2; }; groupadd() { :; }; useradd() { :; }
 stat() { if [[ "$*" == '-c %u '* ]]; then printf 0; else command stat "$@"; fi; }
 install() {
@@ -69,7 +71,12 @@ systemctl() {
     case "$cmd" in
         cat) return 1 ;;
         is-active) [[ -f "$TEST_DIR/units/active-$unit" ]] ;;
-        is-enabled) [[ -f "$TEST_DIR/units/enabled-$unit" ]] ;;
+        is-enabled)
+            if [[ "$unit" == vless-reality-cert.timer && ! -f "$SELF_RENEW_TIMER" ]]; then
+                printf 'Failed to get unit file state for vless-reality-cert.timer: No such file or directory\n' >&2
+                return 1
+            fi
+            [[ -f "$TEST_DIR/units/enabled-$unit" ]] ;;
         is-failed) [[ -f "$TEST_DIR/units/failed-$unit" ]] ;;
         reset-failed) rm -f "$TEST_DIR/units/failed-$unit" ;;
         daemon-reload|reload) return 0 ;;
@@ -134,6 +141,11 @@ if (( result == 0 )) || [[ "$STAGE" == nat-pending && "$result" == 3 ]]; then
 else
     [[ "$STAGE" != success ]] || { cat "$TEST_DIR/install.log"; exit 1; }
     [[ ! -e "$SELF_DIR" && ! -e "$SELF_WEB" && ! -e "$SELF_SITE" && ! -e "$SELF_RENEW_TIMER" && ! -e "$XRAY_BIN" && ! -e "$CONFIG_DIR" ]] || { echo "故障 $STAGE 回滚有残留"; ls -la "$TEST_DIR"; exit 1; }
+    [[ "$(< "$TEST_DIR/install.log")" != *'Failed to get unit file state for vless-reality-cert.timer'* ]]
+    if [[ "$STAGE" == dns ]]; then
+        [[ ! -e "$TEST_DIR/deploy-dependencies" && ! -e "$MANAGER" && ! -e "$SHORTCUT" ]]
+        [[ "$(< "$TEST_DIR/install.log")" == *'未开始部署'* && "$(< "$TEST_DIR/install.log")" != *'正在撤销'* ]]
+    fi
     exit 0
 fi
 load_metadata
