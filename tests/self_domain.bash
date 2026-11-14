@@ -29,7 +29,7 @@ for DNS_CASE in wrong cname missing ipv6; do
     if self_dns_check node.example.com >/dev/null 2>&1; then echo "DNS 应拒绝 $DNS_CASE"; exit 1; fi
 done
 DNS_CASE=valid
-PORT=443; SNI=node.example.com; SERVER_IP=203.0.113.1; NODE_NAME=Test; PUBLIC_KEY=pub; SHORT_ID=0123456789abcdef
+PORT=443; SNI=node.example.com; SERVER_IP=203.0.113.1; NODE_NAME=Test; PUBLIC_KEY=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB; SHORT_ID=0123456789abcdef
 NODE_MODE=self; VLESS_DECRYPTION=none
 write_config 00000000-0000-4000-8000-000000000000 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 write_marker

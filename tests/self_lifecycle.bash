@@ -28,7 +28,8 @@ chmod 600 "$TEST_DIR/credentials.ini"
 [[ "$STAGE" != credentials ]] || chmod 644 "$TEST_DIR/credentials.ini"
 export VLESS_CF_CREDENTIALS="$TEST_DIR/credentials.ini"
 need_root() { :; }; need_command() { :; }; ensure_dependencies() { :; }; self_extra_dependencies() { :; }
-self_dns_check() { [[ "$STAGE" != dns ]]; }; self_cloudflare_zone() { [[ "$STAGE" != provider ]]; }; self_tls_check() { :; }; self_reject_check() { :; }; self_loaded_cert_matches() { :; }
+security_dns_snapshot() { printf '{"domain":"%s","A":"203.0.113.1","AAAA":"","CNAME":"","NS":"ns1.example.com.","CAA":""}\n' "$1"; }
+self_dns_check() { [[ "$STAGE" != dns ]]; }; self_cloudflare_zone() { [[ "$STAGE" != provider ]]; }; self_tls_check() { :; }; self_reject_check() { :; }; self_authority_check() { [[ "$STAGE" != security-rule && "$STAGE" != security-rollback ]]; }; self_loaded_cert_matches() { :; }
 public_ipv4() { printf '203.0.113.1'; }; chown() { :; }; getent() { return 2; }; groupadd() { :; }; useradd() { :; }
 stat() { if [[ "$*" == '-c %u '* ]]; then printf 0; else command stat "$@"; fi; }
 install() {
@@ -69,6 +70,8 @@ systemctl() {
         cat) return 1 ;;
         is-active) [[ -f "$TEST_DIR/units/active-$unit" ]] ;;
         is-enabled) [[ -f "$TEST_DIR/units/enabled-$unit" ]] ;;
+        is-failed) [[ -f "$TEST_DIR/units/failed-$unit" ]] ;;
+        reset-failed) rm -f "$TEST_DIR/units/failed-$unit" ;;
         daemon-reload|reload) return 0 ;;
         start|restart|enable)
             [[ "$STAGE" != nginx || "$unit" != nginx ]] || return 1
@@ -105,6 +108,10 @@ self_certbot() {
         [[ "$STAGE" != renewal && "$STAGE" != domain-renewal ]] || return 1
     fi
 }
+cp() {
+    if [[ "$STAGE" == security-rollback && "${2:-}" == *security-backup.*/site.conf ]]; then return 1; fi
+    command cp "$@"
+}
 self_client_probe() { :; }
 self_nginx_shared() { return 1; }
 # 目标配置错误必须让安装最终检查失败。
@@ -134,7 +141,16 @@ STAGE=domain-renewal
 if (self_domain_apply other.example.com >/dev/null 2>&1); then echo '域名续期失败应回滚'; exit 1; fi
 [[ "$(sha256sum "$CONFIG")" == "$old_config" && "$(sha256sum "$SELF_SITE")" == "$old_site" ]]
 [[ "$(self_state domain)" == node.example.com ]]
+STAGE=security-rule
+site_before="$(sha256sum "$SELF_SITE" "$SELF_DIR/files.sha256")"
+if (security_apply >/dev/null 2>&1); then echo '安全规则检测失败应回滚'; exit 1; fi
+[[ "$(sha256sum "$SELF_SITE" "$SELF_DIR/files.sha256")" == "$site_before" ]]
+STAGE=security-rollback
+if (security_apply >/dev/null 2>&1); then echo '回滚失败必须报错'; exit 1; fi
+rollback_dir="$(find "$SELF_DIR/work" -type d -name 'security-backup.*' | head -1)"
+[[ -n "$rollback_dir" && -f "$rollback_dir/site.conf" && -f "$rollback_dir/files.sha256" ]]
 STAGE=success
+cp -a "$rollback_dir/site.conf" "$SELF_SITE"; cp -a "$rollback_dir/files.sha256" "$SELF_DIR/files.sha256"; rm -rf "$rollback_dir"
 self_domain_apply other.example.com > "$TEST_DIR/domain.log" 2>&1 || { cat "$TEST_DIR/domain.log"; exit 1; }
 load_metadata
 [[ "$SNI" == other.example.com && "$(< "$LINK_FILE")" == *'@other.example.com:443?'* ]]
@@ -142,6 +158,8 @@ load_metadata
 mv "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" "$SELF_DIR/work/hook-backup"
 if self_renew_ready >/dev/null 2>&1; then echo '缺失 hook 不应通过检查'; exit 1; fi
 mv "$SELF_DIR/work/hook-backup" "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx"
+# 安全检查记录应随项目目录一起清理。
+printf '{"external":"unverified"}\n' > "$SELF_DIR/security-last.json"
 # 中断的包安装保护文件也应随卸载清理。
 printf '#!/bin/sh\n# vless-reality-self package guard\nexit 101\n' > "$SELF_POLICY"
 self_track "$SELF_POLICY"
@@ -153,5 +171,7 @@ printf 'foreign\n' > "$SELF_WEB/user.txt"
 if self_cleanup_preflight >/dev/null 2>&1; then echo '不能删除用户网站数据'; exit 1; fi
 rm "$SELF_WEB/user.txt"
 confirm() { return 0; }
+touch "$TEST_DIR/units/failed-vless-reality-cert.service"
 (uninstall_node) > "$TEST_DIR/uninstall.log" 2>&1 || { cat "$TEST_DIR/uninstall.log"; exit 1; }
 [[ ! -e "$SELF_DIR" && ! -e "$SELF_WEB" && ! -e "$SELF_SITE" && ! -e "$SELF_RENEW_SERVICE" && ! -e "$SELF_RENEW_TIMER" && ! -e "$CONFIG_DIR" && ! -e "$MANAGER" && ! -e "$LINK_FILE" && ! -e "$SELF_POLICY" && ! -e "${SELF_RENEW_SERVICE%.service}-alert.service" ]]
+[[ ! -e "$TEST_DIR/units/failed-vless-reality-cert.service" ]]

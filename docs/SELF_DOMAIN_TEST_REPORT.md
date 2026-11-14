@@ -2,6 +2,8 @@
 
 日期：2026-11-14。基础版本：`main@2d706c2`（v1.6.2），开发分支：`feat/self-domain-reality`。未在生产 VPS 部署，未合并 main。
 
+后续 v2.1.0 已把部署与安全任务合并至 `feat/self-domain-security`；新增功能和当前完整验收见 [安全审查与测试报告](SELF_DOMAIN_SECURITY_REPORT.md)。
+
 ## 修改文件
 
 - `install.sh`：单文件内嵌自有域名模式、DNS 与端口预检、Nginx 静态站、Certbot 申请/续期、检测、同步域名变更、操作锁、归属校验和卸载回滚。保留原命令与菜单编号；新增菜单 20–24。

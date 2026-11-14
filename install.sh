@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.0.0'
+SCRIPT_VERSION='2.1.0'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -491,10 +491,27 @@ config_uuid() {
     jq -er '[.inbounds[] | select(.protocol == "vless") | .settings.clients[] | select(.flow == "xtls-rprx-vision") | .id][0]' "$CONFIG"
 }
 
+# 不把 UUID、REALITY 私钥或 VLESS 解密密钥放进外部进程的命令行。
+# 临时文件与配置位于同一受保护目录；被 SIGKILL 中断时由卸载清理。
+private_values_file() (
+    local file
+    file="$(mktemp "$CONFIG_DIR/.private.XXXXXX")" || return 1
+    if ! printf '%s\n' "$@" > "$file"; then rm -f -- "$file"; return 1; fi
+    printf '%s' "$file"
+)
+edit_config_private() (
+    local filter="$1" file
+    shift
+    file="$(private_values_file "$@")" || return 1
+    trap 'rm -f -- "$file"' EXIT
+    edit_config --rawfile credentials "$file" "$filter"
+)
+
 edit_config() {
     local tmp
     tmp="$(mktemp "$CONFIG_DIR/.config.json.XXXXXX")" || return 1
-    if jq "$@" "$CONFIG" > "$tmp" && chown root:xray "$tmp" && chmod 640 "$tmp" \
+    if jq "$@" "$CONFIG" > "$tmp" \
+        && { [[ "$NODE_MODE" != self ]] || self_config_policy "$tmp" "$SNI"; } && chown root:xray "$tmp" && chmod 640 "$tmp" \
         && mv -f -- "$tmp" "$CONFIG"; then
         return 0
     fi
@@ -503,6 +520,12 @@ edit_config() {
 }
 
 config_ok() {
+    if [[ "$NODE_MODE" == self ]]; then
+        self_config_policy "$CONFIG" "$SNI" || return 1
+        if jq -e '.. | objects | select(has("limitFallbackUpload") or has("limitFallbackDownload"))' "$CONFIG" >/dev/null; then
+            fallback_capability "$CONFIG" "$XRAY_BIN" || return 1
+        fi
+    fi
     "$XRAY_BIN" run -test -config "$CONFIG" >/dev/null 2>&1
 }
 service_ok() {
@@ -570,6 +593,7 @@ purge_node_files() {
         systemctl stop xray >/dev/null 2>&1 || return 1
     fi
     systemctl is-active --quiet xray && return 1
+    if systemctl is-failed --quiet xray; then systemctl reset-failed xray || return 1; fi
     if systemctl is-enabled --quiet xray; then
         systemctl disable xray >/dev/null 2>&1 || return 1
     fi
@@ -602,8 +626,9 @@ clean_config_residue() (
             rmdir -- "$backup" || return 1
         fi
     done
-    for entry in "$CONFIG_DIR"/.config.json.??????; do
+    for entry in "$CONFIG_DIR"/.config.json.?????? "$CONFIG_DIR"/.private.??????; do
         [[ -f "$entry" && ! -L "$entry" ]] || continue
+        [[ "$(stat -c %u -- "$entry")" == "$EUID" ]] || { warn "临时配置不属于当前用户，已保留：$entry" >&2; continue; }
         rm -f -- "$entry" || return 1
     done
     for entry in "$CONFIG_DIR"/.marker.??????; do
@@ -680,7 +705,7 @@ clean_runtime_residue() (
             continue
         fi
         if [[ "$dir" == /tmp/vless-reality-client.?????? ]]; then stop_client_residue "$dir" || return 1; fi
-        for file in release.json xray.zip xray xray.old client.json client.log test.log client.pid; do
+        for file in release.json xray.zip xray xray.old client.json client.log test.log client.pid credentials; do
             entry="$dir/$file"
             [[ -f "$entry" && ! -L "$entry" ]] || continue
             rm -f -- "$entry" || return 1
@@ -718,11 +743,12 @@ finish_install() {
 }
 
 write_config() {
-    local uuid="$1" private_key="$2" target="${SNI}:443"
+    local uuid="$1" private_key="$2" target="${SNI}:443" credentials
     [[ "$NODE_MODE" != self ]] || target=127.0.0.1:8443
-    jq -n \
-        --arg uuid "$uuid" --arg privateKey "$private_key" --arg shortId "$SHORT_ID" \
-        --arg target "$target" --arg sni "$SNI" --arg decryption "$VLESS_DECRYPTION" --argjson port "$PORT" --argjson tfo "$TFO_ENABLED" '
+    credentials="$(private_values_file "$uuid" "$private_key" "$SHORT_ID" "$VLESS_DECRYPTION")" || return 1
+    if ! jq -n --rawfile credentials "$credentials" \
+        --arg target "$target" --arg sni "$SNI" --argjson port "$PORT" --argjson tfo "$TFO_ENABLED" '
+        ($credentials | split("\n")) as $secret |
         {
           log: {loglevel: "warning"},
           inbounds: [{
@@ -730,8 +756,8 @@ write_config() {
             port: $port,
             protocol: "vless",
             settings: {
-              clients: [{id: $uuid, flow: "xtls-rprx-vision", email: "default"}],
-              decryption: $decryption
+              clients: [{id: $secret[0], flow: "xtls-rprx-vision", email: "default"}],
+              decryption: $secret[3]
             },
             streamSettings: {
               network: "tcp",
@@ -742,14 +768,15 @@ write_config() {
                 target: $target,
                 xver: 0,
                 serverNames: [$sni],
-                privateKey: $privateKey,
-                shortIds: [$shortId]
+                privateKey: $secret[1],
+                shortIds: [$secret[2]]
               }
             },
             sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
           }],
           outbounds: [{protocol: "freedom", tag: "direct"}, {protocol: "blackhole", tag: "blocked"}]
-        }' > "$CONFIG"
+        }' > "$CONFIG"; then rm -f -- "$credentials"; return 1; fi
+    rm -f -- "$credentials" || return 1
     chown root:xray "$CONFIG"
     chmod 640 "$CONFIG"
 }
@@ -941,6 +968,10 @@ show_node() {
     load_metadata
     local uuid label link tmp address="$SERVER_IP" enc_param tfo_param=''
     uuid="$(config_uuid)" || fail '无法从配置读取 UUID。'
+    if [[ "$NODE_MODE" == self ]]; then
+        [[ "$PUBLIC_KEY" =~ ^[A-Za-z0-9_-]{43}$ && "$SHORT_ID" =~ ^[0-9a-f]{16}$ ]] || fail '自有域名安装记录中的公钥或 Short ID 无效。'
+        [[ "$PUBLIC_KEY" != "$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$CONFIG")" ]] || fail '公钥记录错误：拒绝把 REALITY 私钥写入链接。'
+    fi
     label="$(jq -rn --arg v "$NODE_NAME" '$v | @uri')" || return 1
     enc_param="$(jq -rn --arg v "$CLIENT_ENCRYPTION" '$v | @uri')" || return 1
     # tfo 是部分客户端识别的扩展参数；服务端开关仍以 Xray 配置为准。
@@ -1185,8 +1216,8 @@ vlessenc_apply() {
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")" || fail '无法创建配置备份。'
     backup_state "$backup" || fail "备份节点配置失败，备份保留在 $backup。"
     if systemctl is-active --quiet xray; then was_active=1; fi
-    if ! edit_config --arg decryption "$VLESS_DECRYPTION" \
-        '(.inbounds[] | select(.protocol == "vless") | .settings.decryption) = $decryption' \
+    if ! edit_config_private \
+        '($credentials | split("\n")) as $secret | (.inbounds[] | select(.protocol == "vless") | .settings.decryption) = $secret[0]' "$VLESS_DECRYPTION" \
         || ! write_marker; then
         restore_state "$backup" "$was_active" || fail "恢复旧配置失败，备份保留在 $backup。"
         rm -rf -- "$backup"
@@ -1338,8 +1369,8 @@ change_uuid() {
     if systemctl is-active --quiet xray; then was_active=1; fi
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
     backup_state "$backup"
-    edit_config --arg id "$new" \
-        '(.inbounds[] | select(.protocol == "vless") | .settings.clients[] | select(.flow == "xtls-rprx-vision") | .id) = $id' \
+    edit_config_private \
+        '($credentials | split("\n")) as $secret | (.inbounds[] | select(.protocol == "vless") | .settings.clients[] | select(.flow == "xtls-rprx-vision") | .id) = $secret[0]' "$new" \
         || { restore_state "$backup" "$was_active" || fail "恢复失败，备份保留在 $backup。"; fail '写入配置失败。'; }
     commit_change "$backup" "$old_port" 'UUID 已重新生成，旧链接立即失效。' "$was_active"
 }
@@ -1357,9 +1388,9 @@ rotate_keys() {
     if systemctl is-active --quiet xray; then was_active=1; fi
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
     backup_state "$backup"
-    if ! edit_config --arg private "$private" --arg sid "$SHORT_ID" \
-        '(.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.privateKey) = $private |
-         (.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.shortIds) = [$sid]' \
+    if ! edit_config_private \
+        '($credentials | split("\n")) as $secret | (.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.privateKey) = $secret[0] |
+         (.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.shortIds) = [$secret[1]]' "$private" "$SHORT_ID" \
         || ! write_marker; then
         restore_state "$backup" "$was_active" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
         rm -rf -- "$backup"
@@ -1430,6 +1461,12 @@ update_xray() {
     unzip -q "$archive" xray -d "$TEMP_DIR"
     candidate="$TEMP_DIR/xray"
     chmod 755 "$candidate"
+    if [[ "$NODE_MODE" == self ]]; then
+        self_config_policy "$CONFIG" "$SNI" || fail '自有域名配置违反安全约束，未执行升级。'
+        if jq -e '.. | objects | select(has("limitFallbackUpload") or has("limitFallbackDownload"))' "$CONFIG" >/dev/null; then
+            fallback_capability "$CONFIG" "$candidate" || fail '新版核心无法确认支持当前回落限速，未升级。'
+        fi
+    fi
     "$candidate" run -test -config "$CONFIG" >/dev/null || fail '新版 Xray 不接受当前配置，已停止升级。'
     backup="$TEMP_DIR/xray.old"
     cp -a -- "$XRAY_BIN" "$backup"
@@ -1536,6 +1573,7 @@ uninstall_node() {
         fail '发现运行中的 xray 服务，但本脚本的服务文件已不存在；未继续删除。'
     fi
     systemctl is-active --quiet xray && fail 'Xray 仍在运行，未继续删除文件。'
+    if systemctl is-failed --quiet xray; then systemctl reset-failed xray || fail '清理 Xray 失败状态未完成；保留文件以便重试。'; fi
     self_cleanup || fail '自有域名资源未清理；保留节点安装记录以便重试。'
     remove_checker || fail '删除 RealityChecker 失败；保留节点安装记录以便重试。'
     disable_kernel_tfo || fail '恢复内核 TCP Fast Open 设置失败；保留节点文件以便重试。'
@@ -1634,6 +1672,8 @@ self_extra_dependencies() {
     command -v dig >/dev/null || packages+=(dnsutils)
     command -v nginx >/dev/null || packages+=(nginx)
     command -v certbot >/dev/null || packages+=(certbot)
+    # 兼容现有 Certbot 来自 snap/独立虚拟环境的系统，确保系统 Python 可安全校验密钥配对。
+    python3 -c 'from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey' >/dev/null 2>&1 || packages+=(python3-cryptography)
     if [[ "$SELF_METHOD" == cloudflare ]] && ! dpkg-query -W -f='${Status}' python3-certbot-dns-cloudflare 2>/dev/null | grep -q 'install ok installed'; then
         packages+=(python3-certbot-dns-cloudflare)
     fi
@@ -1673,7 +1713,7 @@ self_preflight() {
     fi
 }
 self_nginx_write() {
-    local domain="$1" tls="${2:-yes}" http_domain="${3:-$1}" version h2listen='http2' h2directive='' tmp
+    local domain="$1" tls="${2:-yes}" http_domain="${3:-$1}" escaped="${1//./\\.}" version h2listen='http2' h2directive='' tmp
     version="$(nginx -v 2>&1 | sed -n 's|.*nginx/\([0-9.]*\).*|\1|p')"
     dpkg --compare-versions "$version" ge 1.19.4 || return 1
     if dpkg --compare-versions "$version" ge 1.25.1; then h2listen=''; h2directive='http2 on;'; fi
@@ -1697,6 +1737,9 @@ EOF
         fi
         if [[ "$tls" == yes ]]; then
             cat <<EOF
+# xver=0: all fallback peers are loopback. Never trust a client X-Forwarded-For.
+map \$ssl_server_name \$vless_self_sni_ok { default 0; ~*^${escaped}\$ 1; }
+map \$http_host \$vless_self_host_ok { default 0; ~*^${escaped}(:443|:8443)?\$ 1; }
 server {
     listen 127.0.0.1:8443 ssl $h2listen default_server;
     $h2directive
@@ -1704,6 +1747,7 @@ server {
     ssl_protocols TLSv1.3;
     ssl_ecdh_curve X25519:prime256v1;
     ssl_reject_handshake on;
+    return 421;
 }
 server {
     listen 127.0.0.1:8443 ssl $h2listen;
@@ -1720,11 +1764,15 @@ server {
     client_header_timeout 10s;
     client_body_timeout 10s;
     keepalive_timeout 15s;
+    send_timeout 15s;
+    keepalive_requests 1000;
     access_log off;
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy no-referrer always;
     add_header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'" always;
-    if (\$ssl_server_name != "$domain") { return 444; }
+    if (\$vless_self_sni_ok = 0) { return 421; }
+    if (\$vless_self_host_ok = 0) { return 421; }
+    if (\$host != "$domain") { return 421; }
     location / { limit_except GET HEAD { deny all; } try_files \$uri \$uri/ =404; }
     location ~ /\. { deny all; }
 }
@@ -1800,7 +1848,7 @@ self_issue_cert() {
 self_tls_check() {
     local domain="$1" address="$2" output
     output="$(timeout 15 openssl s_client -connect "$address" -servername "$domain" -tls1_3 -groups X25519 \
-        -alpn h2 -verify_hostname "$domain" -verify_return_error -CApath /etc/ssl/certs </dev/null 2>&1)" || return 1
+        -alpn h2 -verify_hostname "$domain" -verify_return_error -CApath /etc/ssl/certs </dev/null 2>&1 | tr -d '\000')" || return 1
     [[ "$output" == *'Verify return code: 0 (ok)'* && "$output" == *'TLSv1.3'* \
         && "$output" == *'X25519'* && "$output" == *'ALPN protocol: h2'* ]]
 }
@@ -1885,7 +1933,7 @@ self_cert_alert() {
     self_exists || return 1
     local domain hook=/etc/vless-reality-cert-alert
     domain="$(self_state domain)" || return 1
-    logger -p daemon.err -t vless-reality-cert -- "证书到期预警或续期失败：$domain；请检查 journalctl -u vless-reality-cert。"
+    logger -p daemon.err -t vless-reality-cert -- "证书/DNS 监测异常或证书到期预警：$domain；请检查 journalctl -u vless-reality-cert。"
     if [[ -x "$hook" && -f "$hook" && ! -L "$hook" && "$(stat -c %u "$hook")" == 0 \
         && "$(stat -c %a "$hook")" =~ ^[57]00$ ]]; then "$hook" "$domain"; fi
 }
@@ -1895,6 +1943,16 @@ self_cert_renew() (
     exec 8> "$SELF_DIR/operation.lock"; flock -x 8 || return 1
     local domain rc=0
     domain="$(self_state domain)" || return 1
+    if ! self_dns_check "$domain" > "$SELF_DIR/logs/dns-check.log" 2>&1; then
+        logger -p daemon.err -t vless-reality-cert -- "DNS 与当前 VPS 不符或无法验证：$domain；未修改 DNS，需管理员检查。"
+        rc=1
+    fi
+    local dns_result=0
+    security_dns_changed "$domain" > "$SELF_DIR/logs/dns-baseline-check.log" 2>&1 || dns_result=$?
+    if (( dns_result==2 )); then
+        logger -p daemon.err -t vless-reality-cert -- "DNS 记录与已确认基线不同：$domain；未改 DNS、未封禁连接。"
+        rc=1
+    elif (( dns_result!=0 )); then logger -p daemon.warning -t vless-reality-cert -- "DNS 基线未验证：$domain；请运行 security-check 核对。"; fi
     self_certbot renew --non-interactive --quiet --cert-name "$domain" > "$SELF_DIR/logs/renew.log" 2>&1 || rc=1
     if ! self_wait_tls "$domain"; then rc=1; fi
     if ! openssl x509 -in "$SELF_DIR/acme/live/$domain/cert.pem" -checkend 1209600 -noout; then
@@ -1906,7 +1964,7 @@ self_cert_renew() (
     tmp="$(mktemp "$SELF_DIR/.renew.XXXXXX")" || return 1
     jq -n --arg domain "$domain" --arg result "$result" --arg time "$(date -u +%FT%TZ)" \
         '{domain:$domain,result:$result,time:$time}' > "$tmp" && mv "$tmp" "$SELF_DIR/renew-status.json" || return 1
-    if (( rc )); then logger -p daemon.err -t vless-reality-cert -- "证书续期失败：$domain；请以 root 检查项目私有日志。"; fi
+    if (( rc )); then logger -p daemon.err -t vless-reality-cert -- "证书续期或 DNS 安全监测失败：$domain；请以 root 检查项目私有日志。"; fi
     return "$rc"
 )
 self_renew_test() {
@@ -2013,6 +2071,7 @@ self_prepare() {
     self_renew_test "$SNI" || fail '证书续期 dry-run 或 reload hook 失败。'
     self_timer_write || fail '自动续期任务配置失败。'
     if ! { systemctl is-enabled --quiet vless-reality-cert.timer && systemctl is-active --quiet vless-reality-cert.timer; }; then fail '续期 timer 未实际生效。'; fi
+    security_dns_baseline "$SNI" || warn '警告：无法保存一致的 DNS 安全基线；安装后请运行 security-check 核对。'
     ok '证书自动续期配置成功（dry-run 与 reload hook 已验证）。'
 }
 install_self() (
@@ -2067,7 +2126,7 @@ self_cleanup_preflight() {
     for entry in "$SELF_DIR"/* "$SELF_DIR"/.[!.]*; do
         [[ -e "$entry" || -L "$entry" ]] || continue
         case "${entry##*/}" in
-            .owned|.receipt.??????|.renew.??????|files.sha256|cli.ini|state.json|cloudflare.ini|default-target|renew-test.json|renew-status.json|operation.lock|acme|logs|work) ;;
+            .owned|.receipt.??????|.renew.??????|files.sha256|cli.ini|state.json|cloudflare.ini|default-target|renew-test.json|renew-status.json|security-last.json|security-dns.json|operation.lock|acme|logs|work) ;;
             *) warn "自有域名目录含有未知文件，已保留：$entry" >&2; return 1 ;;
         esac
     done
@@ -2107,6 +2166,7 @@ self_cleanup() (
     # 先停专用续期任务，绝不操作共享的 certbot.timer。
     for unit in vless-reality-cert.timer vless-reality-cert.service vless-reality-cert-alert.service; do
         if systemctl is-active --quiet "$unit"; then systemctl stop "$unit" || return 1; fi
+        if systemctl is-failed --quiet "$unit"; then systemctl reset-failed "$unit" || return 1; fi
     done
     if systemctl is-enabled --quiet vless-reality-cert.timer; then systemctl disable vless-reality-cert.timer || return 1; fi
     if [[ -f "$SELF_SITE" ]]; then
@@ -2160,58 +2220,94 @@ stop_client_residue() {
     return 1
 }
 self_client_probe() (
-    local domain="$1" address="$2" server_port="${3:-443}" test_dir pid='' socks_port uuid
-    test_dir="$(mktemp -d /tmp/vless-reality-client.XXXXXX)" || return 1
+    local domain="$1" address="$2" server_port="${3:-443}" kind="${4:-valid}" test_dir pid='' socks_port uuid sid="$SHORT_ID" pub="$PUBLIC_KEY" tries=5 seconds=20 ready=0
+    test_dir="$(mktemp -d /tmp/vless-reality-client.XXXXXX)" || return 2
     trap 'rc=$?; trap - EXIT
         if [[ -n "$pid" ]]; then
             if stop_client_residue "$test_dir"; then wait "$pid" 2>/dev/null || true;
-            else warn "检查客户端未能安全停止；保留归属目录供卸载重试：$test_dir" >&2; exit 1; fi
+            else warn "检查客户端未能安全停止；保留归属目录供卸载重试：$test_dir" >&2; exit 2; fi
         fi
         rm -rf -- "$test_dir"; exit "$rc"' EXIT
     printf 'vless-reality-setup\n' > "$test_dir/.vless-reality-owned"
-    socks_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" || return 1
-    uuid="$(config_uuid)" || return 1
-    jq -n --arg id "$uuid" --arg host "$address" --argjson port "$server_port" --argjson socks "$socks_port" \
-        --arg sni "$domain" --arg pub "$PUBLIC_KEY" --arg sid "$SHORT_ID" --arg enc "$CLIENT_ENCRYPTION" '{
+    socks_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" || return 2
+    uuid="$(config_uuid)" || return 2
+    case "$kind" in
+        valid) ;;
+        bad-uuid)
+            local wrong
+            wrong="$("$XRAY_BIN" uuid)" || return 2
+            [[ "$wrong" != "$uuid" && "$wrong" =~ ^[0-9a-f-]{36}$ ]] || return 2
+            uuid="$wrong"; tries=1; seconds=4 ;;
+        bad-reality) sid=0000000000000000; tries=1; seconds=4 ;;
+        bad-public-key)
+            local pair=()
+            mapfile -t pair < <(generate_reality_keys)
+            [[ ${#pair[@]} == 2 && "${pair[1]}" != "$PUBLIC_KEY" ]] || return 2
+            pub="${pair[1]}"; tries=1; seconds=4 ;;
+        *) return 2 ;;
+    esac
+    printf '%s\n' "$uuid" "$sid" "$CLIENT_ENCRYPTION" > "$test_dir/credentials" || return 2
+    jq -n --rawfile credentials "$test_dir/credentials" --arg host "$address" --argjson port "$server_port" --argjson socks "$socks_port" \
+        --arg sni "$domain" --arg pub "$pub" '($credentials | split("\n")) as $secret | {
         log:{loglevel:"warning"}, inbounds:[{listen:"127.0.0.1",port:$socks,protocol:"socks",settings:{auth:"noauth"}}],
-        outbounds:[{protocol:"vless",settings:{vnext:[{address:$host,port:$port,users:[{id:$id,flow:"xtls-rprx-vision",encryption:$enc}]}]},
-          streamSettings:{network:"tcp",security:"reality",realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$sid}}}]
-        }' > "$test_dir/client.json" || return 1
-    "$XRAY_BIN" run -test -config "$test_dir/client.json" > "$test_dir/test.log" 2>&1 || return 1
+        outbounds:[{protocol:"vless",settings:{vnext:[{address:$host,port:$port,users:[{id:$secret[0],flow:"xtls-rprx-vision",encryption:$secret[2]}]}]},
+          streamSettings:{network:"tcp",security:"reality",realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$secret[1]}}}]
+        }' > "$test_dir/client.json" || return 2
+    rm -f -- "$test_dir/credentials" || return 2
+    "$XRAY_BIN" run -test -config "$test_dir/client.json" > "$test_dir/test.log" 2>&1 || return 2
     "$XRAY_BIN" run -config "$test_dir/client.json" > "$test_dir/client.log" 2>&1 &
     pid=$!
     printf '%s %s\n' "$pid" "$(awk '{print $22}' "/proc/$pid/stat")" > "$test_dir/client.pid"
     local attempt
-    for attempt in 1 2 3 4 5; do
-        if curl --noproxy '' --proxy "socks5h://127.0.0.1:$socks_port" -fsS --connect-timeout 5 --max-time 20 \
+    for attempt in {1..20}; do
+        kill -0 "$pid" 2>/dev/null || return 2
+        if ss -H -ltnp "sport = :$socks_port" | grep -F "pid=$pid," >/dev/null; then ready=1; break; fi
+        sleep 0.1
+    done
+    (( ready )) || return 2
+    for (( attempt=1; attempt<=tries; attempt++ )); do
+        if curl --noproxy '' --proxy "socks5h://127.0.0.1:$socks_port" -fsS --connect-timeout 3 --max-time "$seconds" \
             'https://www.debian.org/' -o /dev/null 2>/dev/null; then
             kill -0 "$pid" 2>/dev/null && return 0
-            return 1
+            return 2
         fi
-        kill -0 "$pid" 2>/dev/null || return 1
-        sleep 1
+        kill -0 "$pid" 2>/dev/null || return 2
+        (( attempt >= tries )) || sleep 1
     done
+    # 只有准备成功且客户端仍运行时，才把请求失败分类为没有获得代理访问。
     return 1
 )
 self_reject_check() {
-    local domain="$1" output
-    output="$(timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername invalid.example -tls1_3 </dev/null 2>&1 || true)"
+    local domain="$1" address="${2:-127.0.0.1:8443}" output
+    output="$(timeout 10 openssl s_client -connect "$address" -servername invalid.example -tls1_3 </dev/null 2>&1 || true)"
     [[ "$output" == *'no peer certificate available'* ]] || return 1
-    output="$(timeout 10 openssl s_client -connect 127.0.0.1:8443 -noservername -tls1_3 </dev/null 2>&1 || true)"
+    output="$(timeout 10 openssl s_client -connect "$address" -noservername -tls1_3 </dev/null 2>&1 || true)"
     [[ "$output" == *'no peer certificate available'* && "$domain" != invalid.example ]]
 }
 self_report() {
     local label="$1"; shift
     if "$@"; then ok "通过：$label"; else warn "失败：$label"; SELF_CHECK_FAILURES=$((SELF_CHECK_FAILURES + 1)); fi
 }
-self_config_check() {
-    jq -e --arg sni "$SNI" '
-      [.inbounds[] | select(.protocol=="vless" and .listen=="0.0.0.0" and .port==443) |
-        select(.streamSettings.network=="tcp" and .streamSettings.security=="reality") |
-        select(.streamSettings.realitySettings.target=="127.0.0.1:8443") |
-        select(.streamSettings.realitySettings.serverNames==[$sni]) |
-        select(any(.settings.clients[]; .flow=="xtls-rprx-vision"))] | length==1' "$CONFIG" >/dev/null && config_ok
+self_config_policy() {
+    local file="$1" domain="$2"
+    valid_host "$domain" || return 1
+    jq -e --arg sni "$domain" '
+      def uuid: type=="string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$") and .!="00000000-0000-0000-0000-000000000000";
+      def limit: type=="object" and all([.afterBytes,.bytesPerSec,.burstBytesPerSec][]; type=="number" and .>=0 and .<=1073741824 and floor==.);
+      (.inbounds|length)==1 and all(.inbounds[];
+        .protocol=="vless" and .listen=="0.0.0.0" and .port==443 and
+        .streamSettings.network=="tcp" and .streamSettings.security=="reality" and
+        (.settings.clients|length)>0 and all(.settings.clients[]; (.id|uuid) and .flow=="xtls-rprx-vision") and
+        ([.settings.clients[].id|ascii_downcase]|length)==([.settings.clients[].id|ascii_downcase]|unique|length) and
+        (.streamSettings.realitySettings as $r |
+          $r.target=="127.0.0.1:8443" and $r.xver==0 and $r.show==false and $r.serverNames==[$sni] and
+          ($r.privateKey|type=="string" and test("^[A-Za-z0-9_-]{43}$")) and
+          ($r.shortIds|length)==1 and all($r.shortIds[]; type=="string" and test("^[0-9a-f]{16}$") and .!="0000000000000000") and
+          (($r.masterKeyLog // "")=="") and
+          (if $r|has("limitFallbackUpload") then $r.limitFallbackUpload|limit else true end) and
+          (if $r|has("limitFallbackDownload") then $r.limitFallbackDownload|limit else true end)))' "$file" >/dev/null 2>&1
 }
+self_config_check() { self_config_policy "$CONFIG" "$SNI" && config_ok; }
 self_renew_ready() {
     if systemctl is-failed --quiet vless-reality-cert.service; then return 1; fi
     if [[ -f "$SELF_DIR/renew-status.json" ]] && jq -e --arg domain "$SNI" '.domain==$domain and .result=="failed"' "$SELF_DIR/renew-status.json" >/dev/null; then return 1; fi
@@ -2220,7 +2316,7 @@ self_renew_ready() {
         && [[ -x "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" ]] && self_file_owned "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx"
 }
 check_self() {
-    need_root; load_metadata
+    need_root; self_operation_lock; load_metadata
     [[ "$NODE_MODE" == self ]] || fail 'check-self 只用于自有域名模式。'
     local SELF_CHECK_FAILURES=0 ip external="${VLESS_EXTERNAL_CHECK:-}"
     ip="$(public_ipv4)" || fail '无法确认当前公网 IPv4。'
@@ -2232,6 +2328,7 @@ check_self() {
     self_report 'Nginx 已加载磁盘上的当前证书' self_loaded_cert_matches "$SNI"
     self_report '本机网站 HTTP/2 200，无跳转' self_http_check "$SNI" 127.0.0.1 8443
     self_report '拒绝未知 SNI 和无 SNI' self_reject_check "$SNI"
+    self_report 'SNI 与 Host/:authority 一致性' self_authority_check "$SNI"
     self_report '公网地址 443 HTTPS 回落（检测源为本机）' self_http_check "$SNI" "$ip" 443
     self_report '证书 timer、最近续期 dry-run 与 deploy hook 记录' self_renew_ready
     self_report '实际 Xray 客户端 REALITY + Vision 握手和 HTTPS 代理请求（本机源）' self_client_probe "$SNI" 127.0.0.1
@@ -2265,7 +2362,7 @@ self_domain_apply() (
     [[ "$NODE_MODE" == self && $# == 1 ]] || fail '仅自有域名模式支持同步域名修改。'
     self_cleanup_preflight || fail '管理文件已改变，无法安全修改。'
     exec 8> "$SELF_DIR/operation.lock"; flock -x 8 || exit 1
-    local domain="${1,,}" old_sni="$SNI" backup committed=0 active=0 timer_active=0
+    local domain="${1,,}" old_sni="$SNI" backup committed=0 active=0 timer_active=0 record=''
     valid_host "$domain" || fail '域名无效。'
     self_dns_check "$domain" || fail '新域名 DNS 检查失败。'
     SELF_METHOD="$(self_state method)"; SELF_EMAIL="$(self_state email)"
@@ -2273,22 +2370,28 @@ self_domain_apply() (
     backup_state "$backup" || fail '无法备份节点。'
     cp -a "$SELF_SITE" "$backup/nginx-site.conf"
     cp -a "$SELF_DIR/state.json" "$SELF_DIR/files.sha256" "$backup/"
+    [[ ! -f "$SELF_DIR/security-dns.json" ]] || cp -a "$SELF_DIR/security-dns.json" "$backup/"
     [[ ! -f "$SELF_DIR/renew-test.json" ]] || cp -a "$SELF_DIR/renew-test.json" "$backup/"
     [[ ! -f "$LINK_FILE" ]] || cp -a "$LINK_FILE" "$backup/link.txt"
     systemctl is-active --quiet xray && active=1
     systemctl is-active --quiet vless-reality-cert.timer && timer_active=1
     # trap 的恢复不能依赖 SSH 会话；本函数由独立 systemd 任务运行。
     trap 'rc=$?; trap - EXIT; if (( ! committed )); then
-        cp -a "$backup/nginx-site.conf" "$SELF_SITE" || rc=1
-        cp -a "$backup/state.json" "$backup/files.sha256" "$SELF_DIR/" || rc=1
-        if [[ -f "$backup/renew-test.json" ]]; then cp -a "$backup/renew-test.json" "$SELF_DIR/"; else rm -f "$SELF_DIR/renew-test.json"; fi
+        if ! cp -a "$backup/nginx-site.conf" "$SELF_SITE" || ! cp -a "$backup/state.json" "$backup/files.sha256" "$SELF_DIR/"; then
+            warn "域名文件回滚未完成，保留备份：$backup" >&2; exit 1
+        fi
+        for record in renew-test.json security-dns.json; do
+            if [[ -f "$backup/$record" ]]; then
+                if ! cp -a "$backup/$record" "$SELF_DIR/"; then warn "域名记录回滚失败，保留备份：$backup" >&2; exit 1; fi
+            elif ! rm -f "$SELF_DIR/$record"; then warn "域名记录回滚失败，保留备份：$backup" >&2; exit 1; fi
+        done
         SNI="$old_sni"
         if ! nginx -t || ! systemctl reload nginx || ! restore_state "$backup" "$active"; then
             warn "域名修改回滚未完成，备份保留：$backup" >&2; exit 1
         fi
-        [[ ! -f "$backup/link.txt" ]] || cp -a "$backup/link.txt" "$LINK_FILE"
+        if [[ -f "$backup/link.txt" ]] && ! cp -a "$backup/link.txt" "$LINK_FILE"; then warn "链接回滚失败，保留备份：$backup" >&2; exit 1; fi
     fi
-    if (( timer_active )); then systemctl start vless-reality-cert.timer || rc=1; fi
+    if (( timer_active )) && ! systemctl start vless-reality-cert.timer; then warn "续期任务未恢复，保留备份：$backup" >&2; exit 1; fi
     rm -rf -- "$backup"; exit "$rc"' EXIT
     if (( timer_active )); then systemctl stop vless-reality-cert.timer; fi
     if systemctl is-active --quiet vless-reality-cert.service; then systemctl stop vless-reality-cert.service; fi
@@ -2309,12 +2412,386 @@ self_domain_apply() (
     jq --arg domain "$domain" '.domain=$domain' "$SELF_DIR/state.json" > "$backup/new-state.json"
     mv "$backup/new-state.json" "$SELF_DIR/state.json"
     self_track "$SELF_DIR/state.json"
+    if ! security_dns_baseline "$SNI"; then rm -f "$SELF_DIR/security-dns.json"; warn '新域名 DNS 基线未保存，请独立核对后手动确认。'; fi
     (show_node >/dev/null) || fail '新域名链接保存失败。'
     if (( active )); then self_client_probe "$domain" 127.0.0.1 || fail '新域名节点实际握手失败。'; fi
     # shellcheck disable=SC2034 # 由 EXIT trap 读取。
     committed=1
     ok '自有域名的证书、Nginx、Xray 和客户端链接已同步修改。'
 )
+
+# 可选回落限速：用当前二进制的 typed 配置确认字段被识别，不能只依赖 JSON 容忍未知字段。
+fallback_capability() (
+    local file="$1" binary="${2:-$XRAY_BIN}" output
+    output="$(mktemp "$SELF_DIR/work/fallback-capability.XXXXXX")" || return 1
+    trap 'rm -f "$output"' EXIT
+    "$binary" convert pb -debug "$file" > "$output" 2>/dev/null || return 1
+    python3 - "$file" "$output" <<'PY_CAP'
+import json, re, sys
+try:
+    expected = json.load(open(sys.argv[1]))['inbounds'][0]['streamSettings']['realitySettings']
+    raw = open(sys.argv[2]).read()
+    # 某些版本在 JSON 前输出读取配置的日志；不把包含私钥的调试内容打印到终端。
+    match = re.search(r'(?m)^\{', raw)
+    if not match:
+        raise ValueError()
+    tree = json.JSONDecoder().raw_decode(raw[match.start():])[0]
+    def objects(value):
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from objects(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from objects(child)
+    keys = ('limitFallbackUpload', 'limitFallbackDownload')
+    def same(obj):
+        for key in keys:
+            if key in expected:
+                if key not in obj or any(int(obj[key].get(f, 0)) != int(expected[key][f])
+                                         for f in ('afterBytes', 'bytesPerSec', 'burstBytesPerSec')):
+                    return False
+        return True
+    if not any(any(k in obj for k in keys) and same(obj) for obj in objects(tree)):
+        raise ValueError()
+except Exception:
+    sys.exit(1)
+PY_CAP
+)
+fallback_limits_json() {
+    python3 - <<'PY_LIMIT'
+import json, secrets
+# 每次显式开启时随机化，两个方向独立；不是全机/全用户总带宽限制。
+def limit():
+    rate = 524288 + secrets.randbelow(1572865)
+    return dict(afterBytes=8388608 + secrets.randbelow(8388609), bytesPerSec=rate,
+                burstBytesPerSec=rate + secrets.randbelow(rate + 1))
+print(json.dumps(dict(upload=limit(), download=limit())))
+PY_LIMIT
+}
+fallback_status() {
+    jq -r '.inbounds[0].streamSettings.realitySettings | if
+       ((.limitFallbackUpload.bytesPerSec // 0)>0 or (.limitFallbackDownload.bytesPerSec // 0)>0)
+       then "回落限速配置：已开启（仅未认证回落连接，按每连接计）\n上传：\(.limitFallbackUpload)\n下载：\(.limitFallbackDownload)"
+       else "回落限速配置：未开启（默认）" end' "$CONFIG"
+}
+fallback_apply() {
+    need_root; self_operation_lock; load_metadata
+    [[ "$NODE_MODE" == self && $# == 1 ]] || fail '回落限速仅用于自有域名模式。'
+    local action="$1" backup was_active=0 limits probe
+    case "$action" in on|off) ;; *) fail '用法：fallback-limit [status|on|off]' ;; esac
+    if [[ "$action" == on ]]; then
+        self_config_check || fail '当前自有域名配置不符合安全约束，未修改。'
+    else
+        self_config_policy "$CONFIG" "$SNI" || fail '当前配置违反安全约束，未修改。'
+    fi
+    if [[ "$action" == on ]] && jq -e '.inbounds[0].streamSettings.realitySettings |
+        (.limitFallbackUpload.bytesPerSec // 0)>0 and (.limitFallbackDownload.bytesPerSec // 0)>0' "$CONFIG" >/dev/null; then fallback_status; return 0; fi
+    if [[ "$action" == off ]] && ! jq -e '.inbounds[0].streamSettings.realitySettings | has("limitFallbackUpload") or has("limitFallbackDownload")' "$CONFIG" >/dev/null; then fallback_status; return 0; fi
+    self_http_check "$SNI" 127.0.0.1 443 || fail '修改前 HTTPS 基线未通过。'
+    self_client_probe "$SNI" 127.0.0.1 || fail '修改前合法节点基线未通过。'
+    backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")" || fail '无法备份节点。'
+    backup_state "$backup" || fail '备份失败。'
+    if systemctl is-active --quiet xray; then was_active=1; fi
+    if [[ "$action" == on ]]; then
+        limits="$(fallback_limits_json)" || fail '无法生成随机限速参数。'
+        probe="$SELF_DIR/work/fallback-probe.json"
+        if ! jq --argjson v "$limits" '.inbounds[0].streamSettings.realitySettings +=
+            {limitFallbackUpload:$v.upload,limitFallbackDownload:$v.download}' "$CONFIG" > "$probe" \
+            || ! fallback_capability "$probe"; then
+            rm -f "$probe"; rm -rf "$backup"
+            fail '当前 Xray 无法确认支持回落限速；未修改配置。'
+        fi
+        rm -f "$probe"
+        if ! edit_config --argjson v "$limits" '.inbounds[0].streamSettings.realitySettings +=
+            {limitFallbackUpload:$v.upload,limitFallbackDownload:$v.download}'; then
+            rm -rf "$backup"; fail '未写入限速配置。'
+        fi
+    else
+        edit_config 'del(.inbounds[0].streamSettings.realitySettings.limitFallbackUpload,
+            .inbounds[0].streamSettings.realitySettings.limitFallbackDownload)' || { rm -rf "$backup"; fail '未关闭限速。'; }
+    fi
+    if config_ok && { (( was_active==0 )) || { systemctl restart xray && wait_service 10; }; } \
+        && self_http_check "$SNI" 127.0.0.1 443 && self_client_probe "$SNI" 127.0.0.1; then
+        rm -rf "$backup"; fallback_status; return 0
+    fi
+    restore_state "$backup" "$was_active" || fail "回滚失败，备份保留在 $backup。"
+    rm -rf "$backup"
+    fail '限速切换或切换后的 HTTPS/合法节点测试失败，已恢复原配置。'
+}
+fallback_command() {
+    need_root; load_metadata
+    [[ "$NODE_MODE" == self ]] || fail '此开关仅适用于自有域名模式。'
+    [[ $# -le 1 ]] || fail '用法：fallback-limit [status|on|off]'
+    local action="${1:-}" script_path
+    if [[ -z "$action" ]]; then
+        fallback_status
+        [[ -t 0 ]] || return 0
+        read -r -p '回落限速 [on 开启 / off 关闭 / 回车不改]：' action || return 0
+        [[ -n "$action" ]] || return 0
+    fi
+    case "$action" in status) fallback_status; return ;; on|off) ;; *) fail '用法：fallback-limit [status|on|off]' ;; esac
+    if [[ "$action" == on ]]; then
+        warn '回落限速可能产生可识别的流量特征；仅限制每条未认证连接，不能阻止多连接攻击。默认关闭。'
+        warn '开启后使用随机阈值和速率；普通 HTTPS 网站也属于回落流量。'
+        if [[ -t 0 ]]; then confirm '确认开启？[y/N]：' || return 0; fi
+    fi
+    script_path="$(readlink -f "$SCRIPT_PATH")" || fail '无法找到管理脚本。'
+    warn '修改会重启 Xray；请使用直连 SSH。临时 systemd 任务会继续验证或回滚。'
+    systemd-run --quiet --wait --collect --unit=vless-reality-fallback \
+        /bin/bash "$script_path" __fallback-apply "$action" || fail '切换失败；查看 journalctl -u vless-reality-fallback。'
+    fallback_status
+}
+# 将前一开发版本的自有域名站点升级到本版本安全模板，不更换 UUID、密钥或证书。
+security_apply() (
+    need_root; self_operation_lock; load_metadata
+    [[ "$NODE_MODE" == self ]] || fail 'security-apply 仅用于自有域名模式。'
+    if ! self_cleanup_preflight || ! self_config_check; then fail '资源归属或 REALITY 安全约束检查失败，未修改。'; fi
+    systemctl is-active --quiet nginx || fail 'Nginx 当前未运行，请先恢复原网站再应用安全模板。'
+    self_wait_tls "$SNI" || fail '原网站 TLS/证书基线未通过，未修改。'
+    local backup committed=0 rc
+    backup="$(mktemp -d "$SELF_DIR/work/security-backup.XXXXXX")" || exit 1
+    if ! cp -a "$SELF_SITE" "$backup/site.conf" || ! cp -a "$SELF_DIR/files.sha256" "$backup/files.sha256"; then
+        rm -rf "$backup"; fail '安全模板备份失败，未修改。'
+    fi
+    trap 'rc=$?; trap - EXIT
+        if (( ! committed )); then
+            if ! cp -a "$backup/site.conf" "$SELF_SITE" || ! cp -a "$backup/files.sha256" "$SELF_DIR/files.sha256" || ! self_nginx_apply; then
+                warn "安全模板回滚失败，保留备份：$backup" >&2; exit 1
+            fi
+        fi
+        rm -rf "$backup"; exit "$rc"' EXIT
+    SELF_METHOD="$(self_state method)"
+    if ! self_nginx_write "$SNI" || ! self_nginx_apply; then fail '安全站点配置应用失败。'; fi
+    self_wait_security "$SNI" || fail '新安全规则的 HTTPS 检测失败。'
+    if systemctl is-active --quiet xray; then self_client_probe "$SNI" 127.0.0.1 || fail '合法节点验证失败。'; fi
+    if [[ ! -f "$SELF_DIR/security-dns.json" ]]; then security_dns_baseline "$SNI" || warn 'DNS 基线未验证，请独立核对后运行 security-check --accept-dns。'; fi
+    # shellcheck disable=SC2034 # EXIT trap 读取提交状态。
+    committed=1
+    ok '自有域名 HTTPS 安全模板已更新；节点认证参数保持原值。'
+)
+self_wait_security() {
+    local attempt
+    for attempt in {1..10}; do
+        if self_wait_tls "$1" && self_reject_check "$1" && self_authority_check "$1"; then return 0; fi
+        sleep 0.3
+    done
+    return 1
+}
+self_authority_check() {
+    local domain="$1" port="${2:-8443}" address="${3:-127.0.0.1}" protocol result
+    for protocol in --http1.1 --http2; do
+        result="$(curl --noproxy '*' -sS "$protocol" --connect-timeout 5 --max-time 10 \
+            --resolve "$domain:$port:$address" -H 'Host: invalid.example' -o /dev/null -w '%{http_version} %{http_code}' "https://$domain:$port/")" || return 1
+        if [[ "$protocol" == --http2 ]]; then [[ "$result" == '2 421' ]] || return 1;
+        else [[ "$result" == '1.1 421' ]] || return 1; fi
+    done
+}
+self_key_pair_check() {
+    python3 - "$CONFIG" "$PUBLIC_KEY" <<'PY_KEY'
+import base64, json, sys
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+try:
+    key = json.load(open(sys.argv[1]))['inbounds'][0]['streamSettings']['realitySettings']['privateKey']
+    value = base64.urlsafe_b64decode(key + '=')
+    pub = X25519PrivateKey.from_private_bytes(value).public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    if base64.urlsafe_b64encode(pub).decode().rstrip('=') != sys.argv[2]:
+        raise ValueError()
+except Exception:
+    sys.exit(1)
+PY_KEY
+}
+security_permissions() {
+    local path mode group
+    group="$(id -g xray)" || return 1
+    for path in "$CONFIG" "$MARKER"; do
+        [[ -f "$path" && ! -L "$path" && "$(stat -c %u "$path")" == 0 && "$(stat -c %g "$path")" == "$group" && "$(stat -c %a "$path")" == 640 ]] || return 1
+    done
+    [[ -d "$CONFIG_DIR" && ! -L "$CONFIG_DIR" && "$(stat -c %u "$CONFIG_DIR")" == 0 && "$(stat -c %g "$CONFIG_DIR")" == "$group" && "$(stat -c %a "$CONFIG_DIR")" == 750 ]] || return 1
+    path="$LINK_FILE"; mode="$(stat -c %a "$path" 2>/dev/null)" || return 1
+    [[ -f "$path" && ! -L "$path" && "$mode" == 600 && "$(stat -c %u "$path")" == 0 ]]
+}
+security_link_check() {
+    local private link uuid sid
+    private="$(jq -er '.inbounds[0].streamSettings.realitySettings.privateKey' "$CONFIG")" || return 1
+    link="$(< "$LINK_FILE")"; uuid="$(config_uuid)" || return 1
+    sid="$(jq -er '.inbounds[0].streamSettings.realitySettings.shortIds | if length==1 then .[0] else empty end' "$CONFIG")" || return 1
+    [[ "$sid" == "$SHORT_ID" && "$link" != *"$private"* && "$link" == "vless://$uuid@$SNI:443?"* && "$link" == *"&sni=$SNI&"* \
+        && "$link" == *"&pbk=$PUBLIC_KEY&"* && "$link" == *"&sid=$SHORT_ID&"* ]]
+}
+security_xray_listener() {
+    local pid
+    systemctl is-active --quiet xray || return 1
+    pid="$(systemctl show xray -p MainPID --value)" || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    ss -H -ltnp 'sport = :443' | grep -F "pid=$pid," >/dev/null
+}
+security_service_user() {
+    local user pid uid
+    user="$(systemctl show xray -p User --value)" || return 1
+    [[ "$user" == xray ]] || return 1
+    pid="$(systemctl show xray -p MainPID --value)" || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    uid="$(stat -c %u "/proc/$pid")" || return 1
+    [[ "$uid" != 0 && "$uid" == "$(id -u xray)" ]]
+}
+security_dns_effective() {
+    local resolver="$1" domain="$2" type="$3" output records
+    while [[ -n "$domain" ]]; do
+        output="$(self_dns_query "$resolver" "$domain" "$type")" || return 1
+        [[ "$output" == *'status: NOERROR'* ]] || return 1
+        records="$(awk -v type="$type" '$4==type {for(i=5;i<=NF;i++) printf "%s%s",$i,(i==NF?"\n":" ")}' <<< "$output" | sort -u)"
+        if [[ -n "$records" || ( "$type" != NS && "$type" != CAA ) ]]; then printf '%s' "$records"; return 0; fi
+        [[ "$domain" == *.* ]] || break
+        domain="${domain#*.}"
+    done
+    [[ "$type" != NS ]]
+}
+security_dns_snapshot() {
+    local domain="$1" resolver type value first='' current
+    for resolver in 1.1.1.1 8.8.8.8; do
+        current='{}'
+        for type in A AAAA CNAME NS CAA; do
+            value="$(security_dns_effective "$resolver" "$domain" "$type")" || return 1
+            current="$(jq -c --arg type "$type" --arg value "$value" '.[$type]=$value' <<< "$current")" || return 1
+        done
+        current="$(jq -cS --arg domain "$domain" '.+{domain:$domain}' <<< "$current")" || return 1
+        if [[ -n "$first" && "$first" != "$current" ]]; then return 1; fi
+        first="$current"
+    done
+    printf '%s\n' "$first"
+}
+security_dns_baseline() {
+    local domain="$1" snapshot tmp
+    self_dns_check "$domain" || return 1
+    snapshot="$(security_dns_snapshot "$domain")" || return 1
+    tmp="$(mktemp "$SELF_DIR/.renew.XXXXXX")" || return 1
+    printf '%s\n' "$snapshot" > "$tmp" && mv "$tmp" "$SELF_DIR/security-dns.json"
+}
+security_dns_changed() {
+    local domain="$1" old current
+    [[ -f "$SELF_DIR/security-dns.json" && ! -L "$SELF_DIR/security-dns.json" ]] || { warn '尚无 DNS 基线，请确认域名账户安全后运行 security-check --accept-dns。'; return 3; }
+    old="$(jq -ecS --arg domain "$domain" 'select(.domain==$domain)' "$SELF_DIR/security-dns.json")" || return 3
+    current="$(security_dns_snapshot "$domain")" || return 3
+    if [[ "$old" != "$current" ]]; then warn 'A/AAAA/CNAME/权威 NS/有效 CAA 与已确认基线不同；无法判断变更意图，请核对注册商/DNS 账户。'; return 2; fi
+}
+
+security_caa_check() {
+    local domain="$1" resolver zone output records summaries=() result
+    for resolver in 1.1.1.1 8.8.8.8; do
+        zone="$domain"; records=''
+        while [[ -n "$zone" ]]; do
+            output="$(self_dns_query "$resolver" "$zone" CAA)" || return 3
+            [[ "$output" == *'status: NOERROR'* ]] || return 3
+            records="$(awk '$4=="CAA" {for(i=5;i<=NF;i++) printf "%s%s",$i,(i==NF?"\n":" ")}' <<< "$output" | sort)"
+            [[ -z "$records" ]] || break
+            [[ "$zone" == *.* ]] || break
+            zone="${zone#*.}"
+        done
+        summaries+=("$records")
+    done
+    [[ "${summaries[0]}" == "${summaries[1]}" ]] || { warn 'CAA 两个解析器结果不一致。'; return 3; }
+    result="$(printf '%s' "${summaries[0]}" | python3 -c '
+import shlex,sys
+rows=[shlex.split(line) for line in sys.stdin if line.strip()]
+try:
+    issues=[r[2] for r in rows if r[1].lower()=="issue"]
+    unknown=any(int(r[0]) & 128 and r[1].lower() not in ("issue","issuewild","iodef") for r in rows)
+    le=[x for x in issues if x.split(";",1)[0].strip().lower()=="letsencrypt.org"]
+    print("unknown" if unknown else "unrestricted" if not issues else "blocked" if not le else "constraints" if any(";" in x for x in le) else "ok")
+except Exception: print("unknown")')" || return 3
+    case "$result" in
+        ok) return 0 ;;
+        blocked) warn 'CAA issue 不允许 LE，后续续期可能失败；未修改 DNS。'; return 1 ;;
+        constraints) warn 'CAA 允许 LE，但包含账户/验证方式等约束，请用 cert renew-test 验证。'; return 2 ;;
+        unrestricted) warn '未设置有效的非通配符 CAA issue 限制；可考虑仅允许 letsencrypt.org。'; return 2 ;;
+        *) warn '无法确认 CAA 的 critical 标志或内容；需人工核对。'; return 3 ;;
+    esac
+}
+security_net_bytes() {
+    awk -F: 'NR>2 {name=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", name); if(name=="lo") next;
+        data=$2; sub(/^[[:space:]]+/, "", data); split(data,c,/[[:space:]]+/); s+=c[1]+c[9]} END{printf "%.0f",s}' /proc/net/dev
+}
+security_bandwidth() {
+    local count first second threshold="${VLESS_WARN_CONNECTIONS:-1000}" rate_threshold="${VLESS_WARN_MIBPS:-100}" rate
+    [[ "$threshold" =~ ^[1-9][0-9]{0,6}$ && "$rate_threshold" =~ ^[1-9][0-9]{0,6}$ ]] || return 1
+    count="$(ss -H -tn state established '( sport = :443 )' | wc -l)" || return 1
+    first="$(security_net_bytes)" || return 1
+    sleep 1
+    second="$(security_net_bytes)" || return 1
+    (( second >= first )) || { warn '接口计数重置，带宽样本未验证。'; return 1; }
+    rate=$(( (second-first)/1048576 ))
+    say "TCP 443 已建立连接：$count；全机非回环接口 1 秒样本约 ${rate} MiB/s（含其他进程和可能重复统计的虚拟接口）。"
+    if (( count > threshold || rate > rate_threshold )); then warn '警告：样本较高，请结合业务核对；这不是恶意访问证据，不自动封禁。'; fi
+}
+security_item() {
+    local label="$1" result=0; shift
+    "$@" || result=$?
+    case "$result" in
+        0) ok "通过：$label" ;;
+        2) warn "警告：$label" ;;
+        3) warn "未验证：$label" ;;
+        *) warn "失败：$label"; SELF_CHECK_FAILURES=$((SELF_CHECK_FAILURES+1)) ;;
+    esac
+}
+security_unauthorized() {
+    local result=0
+    self_client_probe "$SNI" 127.0.0.1 443 "$1" || result=$?
+    (( result != 2 )) || return 3
+    [[ "$result" == 1 ]]
+}
+security_check() {
+    need_root
+    [[ $# -le 1 ]] || fail '用法：security-check [--accept-dns]'
+    self_operation_lock
+    load_metadata
+    [[ "$NODE_MODE" == self ]] || fail 'security-check 用于自有域名模式；普通模式仍可使用 status。'
+    if [[ -n "${1:-}" ]]; then
+        [[ "$1" == --accept-dns ]] || fail '用法：security-check [--accept-dns]'
+        warn '此操作只确认当前 DNS 基线，不会修改 DNS；应先独立确认注册商和 DNS 账户安全。'
+        if [[ -t 0 ]]; then confirm '确认当前 DNS 记录是预期设置？[y/N]：' || return 0; fi
+        security_dns_baseline "$SNI" || fail '无法保存直连且一致的 DNS 基线。'
+        ok 'DNS 安全基线已确认。'; return 0
+    fi
+    local SELF_CHECK_FAILURES=0 baseline=0 tmp
+    self_report 'Xray TCP 443 正常运行且监听归属正确' security_xray_listener
+    self_report 'Nginx 服务运行' systemctl is-active --quiet nginx
+    self_report 'Xray 实际以非 root xray 用户运行' security_service_user
+    self_report 'Nginx 8443 仅监听本机回环' self_listener_check
+    self_report 'REALITY target/SNI/Vision/UUID/非空 Short ID 安全约束' self_config_check
+    self_report '配置、目录、安装记录和链接权限' security_permissions
+    self_report 'REALITY 私钥与客户端公钥配对' self_key_pair_check
+    self_report '客户端链接使用域名且不含私钥' security_link_check
+    self_report 'DNS 直连当前 VPS，无 CDN/CNAME/AAAA' self_dns_check "$SNI"
+    if [[ "$(public_ipv4 || true)" != "$SERVER_IP" ]]; then warn '警告：当前出口 IPv4 与初次安装记录不同，请确认 VPS IP/DNS 变更是否符合预期。'; fi
+    security_item 'DNS 与已确认基线一致' security_dns_changed "$SNI"
+    security_item 'CAA 证书颁发机构约束' security_caa_check "$SNI"
+    self_report 'TLS 1.3 / X25519 / H2 和有效证书' self_tls_check "$SNI" 127.0.0.1:8443
+    self_report 'Nginx 已加载当前证书' self_loaded_cert_matches "$SNI"
+    self_report '网站 HTTP/2 200，无跳转' self_http_check "$SNI" 127.0.0.1 443
+    self_report '未知和无 SNI 被拒绝' self_reject_check "$SNI"
+    self_report 'SNI 与 Host/:authority 不匹配返回 421' self_authority_check "$SNI"
+    self_report '证书续期 timer、dry-run 和 hook' self_renew_ready
+    self_report '证书剩余有效期至少 14 天' openssl x509 -in "$SELF_DIR/acme/live/$SNI/cert.pem" -checkend 1209600 -noout
+    if self_client_probe "$SNI" 127.0.0.1; then baseline=1; ok '通过：合法 REALITY/Vision 实际代理请求（本机源）';
+    else warn '失败：合法节点基线未通过'; SELF_CHECK_FAILURES=$((SELF_CHECK_FAILURES+1)); fi
+    if (( baseline )); then
+        security_item '错误 UUID 未获得代理访问（本机负向测试）' security_unauthorized bad-uuid
+        security_item '错误 REALITY Short ID 未获得代理访问（本机负向测试）' security_unauthorized bad-reality
+        security_item '错误 REALITY 公钥未获得代理访问（本机负向测试）' security_unauthorized bad-public-key
+    else warn '未验证：错误认证负向测试（合法基线失败，不能把网络失败算作安全通过）'; fi
+    fallback_status
+    security_bandwidth || warn '未验证：无法读取连接/带宽样本。'
+    warn '未验证：注册商 MFA/Registrar Lock/自动续费、DNSSEC、DNS 修改提醒和 Token 最小权限须在账户面板确认。'
+    warn '未验证：真正外部网络的 8443 可达性和节点连接；本命令的连接检测源为 VPS 本机。'
+    warn '公开 SNI 可被任何人填写；普通 HTTPS 访问不等于恶意行为，本检查不自动封禁。'
+    tmp="$(mktemp "$SELF_DIR/.renew.XXXXXX")" || return 1
+    jq -n --arg domain "$SNI" --arg time "$(date -u +%FT%TZ)" --argjson failures "$SELF_CHECK_FAILURES" \
+        '{domain:$domain,time:$time,failed_checks:$failures,external:"unverified"}' > "$tmp" \
+        && mv "$tmp" "$SELF_DIR/security-last.json" || return 1
+    (( SELF_CHECK_FAILURES==0 ))
+}
 
 print_help() {
     local cmd
@@ -2328,6 +2805,9 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   check-self                   检查自有域名完整部署
   cert [status|renew-test]      证书和自动续期状态
   website                      查看本地网站状态
+  security-check               检查自有域名认证、权限、DNS、TLS 和回落安全
+  security-apply               将自有域名网站更新到当前安全模板
+  fallback-limit [status|on|off] 可选的回落限速（默认关闭）
   show                         显示 vless:// 导入链接
   status                       查看服务、配置、端口和伪装站点状态
   port [新端口]                修改端口
@@ -2395,6 +2875,9 @@ show_menu() {
     say ' 22. 查看 SSL 证书'
     say ' 23. 测试证书自动续期'
     say ' 24. 一键检查自有域名配置'
+    say ' 25. 自有域名安全检查'
+    say ' 26. 可选回落限速'
+    say ' 27. 更新自有域名安全模板'
     say ' 00. 退出'
     say '=================================='
     menu_status
@@ -2411,7 +2894,7 @@ menu_action() {
         14) status_node ;; 15) log_node ;; 16) show_fastest_sni ;;
         17) tfo_node ;; 19) vlessenc_node ;;
         20) install_self ;; 21) website_status ;; 22) cert_command status ;;
-        23) cert_command renew-test ;; 24) check_self ;; *) return 2 ;;
+        23) cert_command renew-test ;; 24) check_self ;; 25) security_check ;; 26) fallback_command ;; 27) security_apply ;; *) return 2 ;;
     esac
 }
 interactive_menu() {
@@ -2421,8 +2904,8 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-17、19-24，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-7]|19|2[0-4]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-17、19-27，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-7]|19|2[0-7]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
@@ -2436,12 +2919,19 @@ interactive_menu() {
 }
 
 main() {
+    if [[ $- == *x* ]] && { [[ "${1:-}" == install-self ]] || { [[ -f "$MARKER" ]] && [[ "$(sed -n '8p' "$MARKER")" == self ]]; }; }; then
+        fail '自有域名操作包含私密配置，禁止使用 bash -x；请使用状态命令和受保护日志排查。'
+    fi
     case "${1:-}" in
         '') interactive_menu ;;
         help|-h|--help) print_help ;;
         install) shift; install_node "$@" ;;
         install-self) shift; install_self "$@" ;;
         check-self) check_self ;;
+        security-check) shift; security_check "$@" ;;
+        security-apply) security_apply ;;
+        fallback-limit) shift; fallback_command "$@" ;;
+        __fallback-apply) shift; fallback_apply "$@" ;;
         website) website_status ;;
         cert) shift; cert_command "$@" ;;
         __self-domain) shift; self_domain_apply "$@" ;;
@@ -2466,7 +2956,7 @@ main() {
         log|logs) shift; log_node "$@" ;;
         update) update_xray ;;
         uninstall) uninstall_node ;;
-        [1-9]|1[0-7]|19|2[0-4]) need_root; menu_action "$1" ;;
+        [1-9]|1[0-7]|19|2[0-7]) need_root; menu_action "$1" ;;
         *) print_help; exit 2 ;;
     esac
 }

@@ -38,6 +38,7 @@ jobs:
       - name: Existing REALITY handshake and self-domain HTTPS/VLESS
         run: |
           docker run --rm -e LC_ALL=C.UTF-8 -v "$PWD:/src:ro" -v "$XRAY_TEST_BIN:/xray:ro" vless-self-test bash tests/reality_handshake.bash /xray
-          docker run --rm -e LC_ALL=C.UTF-8 -v "$PWD:/src:ro" -v "$XRAY_TEST_BIN:/xray:ro" vless-self-test bash tests/integration/self_tls.bash /xray
+          # Inspect the non-root Xray listener's real PID; Docker otherwise hides its fd ownership.
+          docker run --rm --cap-add SYS_PTRACE -e LC_ALL=C.UTF-8 -v "$PWD:/src:ro" -v "$XRAY_TEST_BIN:/xray:ro" vless-self-test bash tests/integration/self_tls.bash /xray
       - name: Real Certbot HTTP-01 and renewal against isolated Pebble
         run: bash tests/integration/acme.bash

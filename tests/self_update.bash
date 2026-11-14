@@ -9,7 +9,7 @@ SELF_DIR="$TEST_DIR/no-self-state"; mkdir -p "$CONFIG_DIR"
 PORT=443; SNI=node.example.com; NODE_NAME=Self; SERVER_IP=203.0.113.1; PUBLIC_KEY=pub; SHORT_ID=0123456789abcdef; NODE_MODE=self
 chown() { :; }; need_root() { :; }; ensure_dependencies() { :; }; systemctl() { return 1; }
 write_marker
-printf '{"inbounds":[{"streamSettings":{"realitySettings":{"target":"127.0.0.1:8443"}}}]}\n' > "$CONFIG"
+write_config 00000000-0000-4000-8000-000000000000 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 printf 'old binary\n' > "$XRAY_BIN"
 installed_version() { printf 26.11.1; }
 fetch_release_metadata() { RELEASE_VERSION=26.11.9; }

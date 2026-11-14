@@ -9,10 +9,13 @@ confirm() { return 0; }
 account_present=1
 group_present=1
 stop_fails=0
+failed_state=1
 systemctl() {
     case "$1" in
         stop) (( stop_fails == 0 )) ;;
         is-active) return 1 ;;
+        is-failed) (( failed_state == 1 )) ;;
+        reset-failed) failed_state=0 ;;
         is-enabled) return 0 ;;
         disable|daemon-reload) return 0 ;;
         *) return 1 ;;
@@ -34,7 +37,7 @@ SNI_ORPHAN_DIR="$(mktemp -d /tmp/vless-reality-sni.XXXXXX)"
 CLIENT_ORPHAN_DIR="$(mktemp -d /tmp/vless-reality-client.XXXXXX)"
 printf 'vless-reality-setup\n' > "$CLIENT_ORPHAN_DIR/.vless-reality-owned"
 printf '999999999 123\n' > "$CLIENT_ORPHAN_DIR/client.pid"
-touch "$CLIENT_ORPHAN_DIR/client.json" "$CLIENT_ORPHAN_DIR/client.log"
+touch "$CLIENT_ORPHAN_DIR/client.json" "$CLIENT_ORPHAN_DIR/client.log" "$CLIENT_ORPHAN_DIR/credentials"
 trap 'rm -rf -- "$TEST_DIR" "$ORPHAN_DIR" "$SNI_ORPHAN_DIR" "$CLIENT_ORPHAN_DIR"' EXIT
 printf 'vless-reality-setup\n' > "$ORPHAN_DIR/.vless-reality-owned"
 touch "$ORPHAN_DIR/xray.zip"
@@ -69,6 +72,7 @@ make_fixture() {
     touch "${LINK_FILE}.abcdef" "$TEST_DIR/.xray-update.abcdef"
     touch "$CONFIG_DIR/.change-backup.abcdef/config.json"
     touch "$CONFIG_DIR/.change-backup.abcdef/.vless-reality-owned"
+    touch "$CONFIG_DIR/.private.abcdef"
     touch "$CONFIG_DIR/foreign-file"
     printf '%s\n' 'ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json' > "$SERVICE"
     printf '%s\n' "$SHORTCUT_TAG" > "$SHORTCUT"
@@ -102,7 +106,9 @@ uninstall_node >/dev/null
 [[ ! -e "$SNI_ORPHAN_DIR" && ! -e "$CLIENT_ORPHAN_DIR" ]]
 [[ ! -e "$TFO_SYSCTL" && "$(kernel_tfo_value)" == 0 ]]
 [[ ! -e "$CONFIG_DIR/.change-backup.abcdef" && -f "$CONFIG_DIR/foreign-file" ]]
+[[ ! -e "$CONFIG_DIR/.private.abcdef" ]]
 (( account_present == 0 && group_present == 0 ))
+(( failed_state == 0 ))
 
 rm -f -- "$CONFIG_DIR/foreign-file"
 account_present=1

@@ -19,6 +19,8 @@
 - 可选开启 TCP Fast Open，并在菜单或命令行切换
 - 可选开启 VLESS Encryption；生成成对参数并更新客户端导入链接
 - 自有域名模式：Nginx 本机 HTTPS 网站、Let’s Encrypt 证书与隔离自动续期
+- 自有域名安全检查：SNI/Host 严格匹配、实际认证拒绝测试、DNS 变化与 CAA 检查
+- 自有域名可选回落限速：默认关闭，开启前核实当前 Xray 是否识别官方参数
 - 升级失败、配置修改失败和首次安装失败时回滚
 - 卸载时只清理本脚本拥有的文件
 
@@ -48,10 +50,10 @@ wget -O /root/vless-reality-setup.sh https://raw.githubusercontent.com/Soullesli
 尚未合并的自有域名开发分支可用以下命令验证（建议全新的测试 VPS）：
 
 ```bash
-wget -O /root/vless-reality-setup.sh https://raw.githubusercontent.com/Soulleslie/vless-reality-vision/feat/self-domain-reality/install.sh && chmod +x /root/vless-reality-setup.sh && /root/vless-reality-setup.sh
+wget -O /root/vless-reality-setup.sh https://raw.githubusercontent.com/Soulleslie/vless-reality-vision/feat/self-domain-security/install.sh && chmod +x /root/vless-reality-setup.sh && /root/vless-reality-setup.sh
 ```
 
-完整的本地验证与未实测项目见 [开发与测试报告](docs/SELF_DOMAIN_TEST_REPORT.md)。主分支只有在 Pull Request 审查合并后才包含新功能。
+部署和加固在同一个脚本中，无需另外安装防护程序。完整验证与未实测项目见 [安全审查与测试报告](docs/SELF_DOMAIN_SECURITY_REPORT.md) 和 [基础部署测试报告](docs/SELF_DOMAIN_TEST_REPORT.md)。主分支只有在 Pull Request 审查合并后才包含新功能。
 
 使用 curl：
 
@@ -112,6 +114,8 @@ v1.6.1 开启服务端 TFO 时，在新生成的导入链接中附带客户端�
 v1.6.2 移除菜单第 18 项 RealityChecker、安装提示和检测命令；其他菜单编号保持不变。卸载节点仍会清理旧版本由本脚本安装的 RealityChecker 及可识别暂存文件。
 
 v2.0.0 新增自有域名安装、隔离 Certbot 自动续期、本地 Nginx HTTPS、检测与同步域名管理；保留普通模式及旧命令。
+
+v2.1.0 增加严格的 SNI/Host/:authority 过滤、REALITY 安全约束、实际负向认证测试、可选随机回落限速、DNS 基线/CAA 检查和旧站点安全模板升级。密钥及认证资料不通过外部进程参数传递；保留所有旧菜单编号，第 18 项仍不恢复。
 
 ## 非交互安装
 
@@ -176,7 +180,7 @@ VLESS_CF_CREDENTIALS=/root/cloudflare.ini /root/vless-reality-setup.sh install-s
 
 - Xray：公网 IPv4 TCP 443，非 root 的 `xray` 用户运行。
 - 项目 HTTPS 网站：Nginx **只绑定 `127.0.0.1:8443`**，仅 TLS 1.3，支持 X25519 和 ALPN h2，首页 HTTP/2 200，不跳转。
-- Nginx 的拒绝握手默认站点会阻止未知或缺少 SNI 的 TLS 请求；静态站点不提供任意目标的反向代理。
+- Nginx 默认站点拒绝未知或缺少 SNI 的 TLS 握手。正确 SNI 的 HTTP Host / HTTP/2 :authority 还须匹配本域名（允许大小写差异及 `:443`、本地检测用 `:8443`）；不匹配返回 421。静态站仅提供 GET/HEAD，不提供任意目标转发。
 - 可与已运行且无端口冲突的标准 Debian/Ubuntu Nginx 共存，只添加专属 `conf.d/vless-reality-self.conf`。不改主配置或已有站点。已有 Nginx 若启用了其他站点但处于停止状态，会拒绝自动启动，避免意外开放那些入口。非标准主配置未 include `conf.d/*.conf` 时停止。
 - 本次全新安装 Nginx 时，暂时抑制包安装自动启动，并记录/暂存软件包默认站点入口；卸载恢复入口。系统软件包不删除，以免影响后续使用它的软件。
 
@@ -184,7 +188,7 @@ VLESS_CF_CREDENTIALS=/root/cloudflare.ini /root/vless-reality-setup.sh install-s
 
 所有项目证书、账户、续期配置、工作文件和私有日志位于 `/etc/vless-reality-self/`，与 `/etc/letsencrypt` 隔离。专用 `vless-reality-cert.timer` 每日两次带随机延迟地执行 Certbot renew；共享 `certbot.timer` 不会被修改，也不会重复续期本项目的独立目录。
 
-成功续期执行 `nginx -t && systemctl reload nginx`；不重启 Xray，不停止 TCP 443。首次安装必须通过 `certbot renew --dry-run` 和独立执行的 deploy hook 检查，才会显示自动续期成功。每次自动续期和测试的结果/时间均可查询；不足 14 天或失败会写入 systemd 日志并触发告警服务。Certbot 原始输出存入 root 私有日志，Cloudflare Token 会被日志脱敏处理。
+成功续期执行 `nginx -t && systemctl reload nginx`；不重启 Xray，不停止 TCP 443。首次安装必须通过 `certbot renew --dry-run` 和独立执行的 deploy hook 检查，才会显示自动续期成功。每次自动续期和测试的结果/时间均可查询；不足 14 天或失败会写入 systemd 日志并触发告警服务。原有续期任务还会核对 DNS 直连及已确认基线；DNS 变化会告警，但仍尝试续期，不改 DNS、不封禁访问。Certbot 原始输出存入 root 私有日志，Cloudflare Token 会被日志脱敏处理。
 
 ```bash
 vless-reality cert status
@@ -201,19 +205,52 @@ systemctl list-timers vless-reality-cert.timer
 vless-reality show                 # 域名 Address + 域名 SNI 的受保护链接
 vless-reality website              # 本地网站状态
 vless-reality check-self           # 完整检查
+vless-reality security-check       # 安全配置、认证拒绝、DNS/CAA、权限和带宽样本
+vless-reality security-apply       # 旧版自有域名站点应用当前安全模板，支持失败回滚
 vless-reality sni new.example.com  # 同步修改 DNS 检查、证书、Nginx、Xray 和链接
 vless-reality refresh-ip           # 只核对当前 DNS，绝不把 Address 改成 IP
 ```
 
 域名修改由独立 systemd 任务执行，失败恢复旧站点、配置、证书引用、安装记录、链接和续期测试记录。旧证书保留在专用目录便于回滚，卸载时一起清理。失败日志为 `journalctl -u vless-reality-self-change`。更换域名后重新导入链接。
 
-`check-self` 区分通过、失败、警告和未验证。它实际检测 DNS、本地 TLS/证书/X25519/H2、HTTP/2 200、错误 SNI 拒绝、443 HTTPS 回落、正确 target/Vision、续期任务和实际 Xray 客户端代理 HTTPS 请求（测试目的站为 Debian 官网）。公网 IP 回访和节点客户端请求的检测源均为 VPS 本机，**不等于外部网络验证**。如果公网 IP 不支持回环访问，该项会失败；应检查 VPS 的 NAT/回环路由，不能伪装通过。
+`check-self` 区分通过、失败、警告和未验证。它实际检测 DNS、本地 TLS/证书/X25519/H2、HTTP/2 200、错误 SNI 拒绝、SNI/Host 一致性、443 HTTPS 回落、正确 target/Vision、续期任务和实际 Xray 客户端代理 HTTPS 请求（测试目的站为 Debian 官网）。公网 IP 回访和节点客户端请求的检测源均为 VPS 本机，**不等于外部网络验证**。如果公网 IP 不支持回环访问，该项会失败；应检查 VPS 的 NAT/回环路由，不能伪装通过。
 
 从其他网络访问 `https://node.example.com` 并导入节点测试。还可设置 `VLESS_EXTERNAL_CHECK=/root/external-check`（root:700 普通可执行程序），由自己的外部验证工具完成 HTTPS 和 VLESS 两项检查，程序收到域名/IP 参数，成功返回 0。未配置时会明确显示“外部网络未验证”。本项目不会把完整节点链接传给未知在线检测服务。
 
+### 安全检查与旧版本升级
+
+已有普通节点更新管理脚本后仍使用原来的命令。已有 v2.0 自有域名节点，下载本分支的新脚本覆盖 `/root/vless-reality-setup.sh` 后执行：
+
+```bash
+vless-reality security-apply
+vless-reality security-check
+```
+
+`security-apply` 仅更新本项目拥有的 Nginx 站点，验证 TLS、SNI 和 Host 过滤后才提交，不改变 UUID、密钥或证书。站点已被手工修改或共享时停止，避免覆盖用户配置；回滚失败保留备份并报错。更新 Xray 的 `update` 命令只更新核心，不能代替更新管理脚本或站点模板。
+
+`security-check` 检查实际进程 UID、443 套接字归属、8443 绑定、配置/链接权限、密钥配对、DNS、证书和续期状态。先确认合法节点实际请求成功，再尝试错误 UUID、Short ID、公钥；测试准备失败标为未验证，不将网络故障当作安全通过。不输出私钥或完整节点链接。节点状态/安全结果保存在 root 专用目录。
+
+首次安装保存两个解析器一致的 A/AAAA/CNAME、最近的权威 NS 和有效 CAA 基线，忽略 TTL。变化只说明需要核对，不能断言账户被盗。确认是自己修改后可执行 `vless-reality security-check --accept-dns` 接受新基线；这不会修改 DNS。CAA 会按父域继承查询：禁止 LE 的 issue 记录报错，无限制或附带验证方式/账户约束时提示核查；不会自动添加记录。若只签发 LE，可由用户按域名整体需求配置 `CAA 0 issue "letsencrypt.org"`，不要影响其他服务所需的 CA。
+
+连接数和全机 1 秒带宽样本仅用于排查，可能包含其他进程/重复统计的虚拟接口，不是攻击判断。默认提示阈值为 1000 条连接、100 MiB/s，可通过 `VLESS_WARN_CONNECTIONS`、`VLESS_WARN_MIBPS` 调整；不会自动封禁。
+
+### 可选回落限速
+
+```bash
+vless-reality fallback-limit status
+vless-reality fallback-limit on
+vless-reality fallback-limit off
+```
+
+默认关闭。开启会提示可识别的流量特征，并通过当前 Xray 的 typed 配置转换确认 `limitFallbackUpload` / `limitFallbackDownload` 确实被识别；仅 JSON 配置检查通过不足以证明支持。不支持时拒绝应用，核心升级也会重新确认支持。
+
+每次从关闭改为开启时，上传/下载方向分别随机选择 8–16 MiB 的起限阈值、约 0.5–2 MiB/s 的每连接速率和 1–2 倍速率的 burst。普通 HTTPS 属于回落流量，超过阈值会变慢；认证成功的 VLESS Vision 连接不属于限速对象。**这不是全机总带宽限制，也不能抵御多连接或链路级 DDoS**。切换需要重启 Xray，后台临时任务会在 SSH 断开后继续验证正常 HTTPS 和合法节点，失败回滚；没有新增常驻防护服务或端口。
+
+Nginx 保留请求体、超时、持久连接次数等温和约束。`xver=0` 下 Nginx 看到的回落源均为本机回环，按源 IP 限制请求会把所有浏览器共用一个额度，所以不默认设置此类限流，也不信任客户端伪造的 X-Forwarded-For。
+
 ### 回滚与卸载边界
 
-安装前拒绝已有 Xray、项目目录和端口冲突。失败回滚、正常卸载均涵盖本项目的 Nginx 站点、静态网站、专用证书/账户、Token 副本、专用 timer/service/deploy hook、工作目录、私有日志及节点文件。文件清单通过 SHA-256 校验归属；站点被修改、网站目录有额外文件、管理目录出现符号链接或常见其他 Web 配置引用本项目资源时，会停止删除并报告，便于管理员先解除共享/恢复文件再重试。
+安装前拒绝已有 Xray、项目目录和端口冲突。失败回滚、正常卸载均涵盖本项目的 Nginx 站点、静态网站、专用证书/账户、Token 副本、专用 timer/service/deploy hook、工作目录、私有日志、安全/DNS 记录、检测客户端、配置备份和私密参数暂存文件，以及 Xray、专用账号、链接、管理脚本和快捷命令；同时清除项目 unit 的 systemd 失败状态。文件清单通过 SHA-256 校验归属；站点被修改、网站目录有额外文件、管理目录出现符号链接或常见其他 Web 配置引用本项目资源时，会停止删除并报告，便于管理员先解除共享/恢复文件再重试。
 
 不删除其他站点、`/etc/letsencrypt` 里的证书、共享 Certbot timer、用户提供的凭据源文件、外部告警脚本、系统软件包、系统 journal、DNS 或防火墙规则。用户中途新增到保留目录的内容需自行确认，不会为了“零残留”递归删除未知数据。卸载可重试，包括节点已删除但自有域名目录尚未清理的情况。
 
@@ -223,7 +260,9 @@ vless-reality refresh-ip           # 只核对当前 DNS，绝不把 Address 改
 
 公开域名无法阻止第三方把它填写为他们自己的 REALITY SNI。VLESS 访问由 UUID、REALITY 参数及可选加密参数控制；本站回落只提供静态文件，不提供开放代理。不要公开节点链接或 REALITY 私钥。
 
-已调查 Xray 官方的 `limitFallbackUpload/Download`：官方指出回落限速会增加特征，不建议一键脚本统一设置。因此默认不添加未经需要的限速指纹，使用本机静态网站、SNI 拒绝、请求体/超时约束减少回落滥用。遇到实际流量攻击应在了解影响后配置主机/上游防护。
+UUID 必须有效且非全零，Short ID 使用安全随机的非零 8 字节值；target、xver、SNI 和 Vision 的约束在自有域名配置提交及核心升级前复核。私钥和认证资料使用受保护文件传给工具，不放进外部进程命令行；配置 root:xray 640、目录 750、链接 root:600。自有域名管理拒绝 `bash -x`，防止跟踪输出泄漏密钥。UUID/密钥轮换后旧链接失效，须重新导入。
+
+回落限速默认关闭，可在了解指纹和网站速度影响后主动开启。SNI/Host 过滤只限制本机回落站点的行为，不能判断别人使用公开域名的意图；仍允许正确域名的正常 HTTPS 请求。遇到实际流量攻击应结合主机/上游防护。
 
 官方参考：[Xray REALITY](https://xtls.github.io/config/transports/reality.html)、[Nginx HTTPS](https://nginx.org/en/docs/http/configuring_https_servers.html)、[Nginx HTTP/2](https://nginx.org/en/docs/http/ngx_http_v2_module.html)、[Certbot 续期](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates)、[Cloudflare DNS 插件](https://certbot-dns-cloudflare.readthedocs.io/en/stable/)。
 
