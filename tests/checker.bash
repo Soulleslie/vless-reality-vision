@@ -15,8 +15,8 @@ if declare -F checker_command >/dev/null || declare -F install_checker >/dev/nul
     exit 1
 fi
 [[ "$(print_help)" != *checker* ]]
-[[ "$(show_menu)" != *'18.'* ]]
-if menu_action 18; then exit 1; fi
+[[ "$(show_menu)" != *RealityChecker* ]]
+if legacy_numeric_action 18; then exit 1; fi
 printf 'legacy checker\n' > "$CHECKER_BIN"
 digest="$(sha256sum "$CHECKER_BIN" | awk '{print $1}')"
 printf '%s\nversion=v2.2.3\nsha256=%s\n' "$CHECKER_TAG" "$digest" > "$CHECKER_MARKER"

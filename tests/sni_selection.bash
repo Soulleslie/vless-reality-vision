@@ -28,7 +28,7 @@ select_fastest_sni >/dev/null
 OUTPUT_FILE="$(mktemp)"
 trap 'rm -f -- "$OUTPUT_FILE"' EXIT
 SNI=www.amazon.com
-menu_action 16 > "$OUTPUT_FILE"
+menu_action 15 > "$OUTPUT_FILE"
 [[ "$(< "$OUTPUT_FILE")" == *'实测延迟最低的域名：www.samsung.com'* ]]
 [[ "$(< "$OUTPUT_FILE")" == *'不修改节点配置'* ]]
 [[ "$SNI" == www.amazon.com ]]
