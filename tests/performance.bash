@@ -93,5 +93,11 @@ if declare -F apt_update_once >/dev/null; then
         apt_update_once
     )
     [[ "$(wc -l < "$TEST_DIR/apt.calls")" == 4 ]]
-    printf 'apt 索引复用、失败重试与新执行链刷新通过\n'
+    # 无需实际等待 5 分钟；把记录时间调至过期，失败不能继续沿用旧成功标记。
+    VLESS_APT_INDEX_AT=$((SECONDS - 300)); apt_fail=1
+    if apt_update_once; then exit 1; fi
+    [[ "$VLESS_APT_INDEX_READY" == 0 && "$(wc -l < "$TEST_DIR/apt.calls")" == 5 ]]
+    apt_fail=0; apt_update_once
+    [[ "$VLESS_APT_INDEX_READY" == 1 && "$(wc -l < "$TEST_DIR/apt.calls")" == 6 ]]
+    printf 'apt 索引复用、失败重试、新执行链和过期刷新通过\n'
 fi

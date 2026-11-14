@@ -56,6 +56,7 @@ SELF_STARTED=0
 SELF_OPERATION_LOCKED=0
 SELF_POLICY='/usr/sbin/policy-rc.d'
 VLESS_APT_INDEX_READY=0
+VLESS_APT_INDEX_AT=0
 SNI_CANDIDATES=(
     www.amazon.com www.samsung.com www.nvidia.com
     digitalassets.tesla.com electronics.sony.com www.xbox.com amd.com
@@ -166,9 +167,11 @@ confirm() {
 }
 
 apt_update_once() {
-    # 仅复用当前执行链中成功刷新的索引；不写磁盘缓存，失败或下次运行仍重新刷新。
-    if (( VLESS_APT_INDEX_READY == 0 )); then
+    # 仅复用当前执行链 5 分钟内成功刷新的索引；长时间等待用户输入后重新刷新。
+    if (( VLESS_APT_INDEX_READY == 0 || SECONDS < VLESS_APT_INDEX_AT || SECONDS - VLESS_APT_INDEX_AT >= 300 )); then
+        VLESS_APT_INDEX_READY=0
         apt-get update || return 1
+        VLESS_APT_INDEX_AT="$SECONDS"
         VLESS_APT_INDEX_READY=1
     fi
     return 0
