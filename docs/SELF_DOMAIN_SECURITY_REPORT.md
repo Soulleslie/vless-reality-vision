@@ -2,7 +2,7 @@
 
 日期：2026-11-14。合并交付分支：`feat/self-domain-security`，版本 v2.1.0。
 
-基础为 `main@2d706c2`（v1.6.2），包含此前自有域名部署分支截至 `92f2aa5` 的全部修改，以及本次加固。所有功能仍内嵌在 `install.sh`。未部署生产 VPS，未合并 main。基础部署细节见 [原测试报告](SELF_DOMAIN_TEST_REPORT.md)；本报告补充安全审查及当前验收结果。
+基础为 `main@2d706c2`（v1.6.2），包含此前自有域名部署分支截至 `92f2aa5` 的全部修改，以及本次加固。所有功能仍内嵌在 `install.sh`，未部署生产 VPS。交付与合并状态见 [PR #2](https://github.com/Soulleslie/vless-reality-vision/pull/2)。基础部署细节见 [原测试报告](SELF_DOMAIN_TEST_REPORT.md)；本报告补充安全审查及当前验收结果。
 
 ## 修改文件
 

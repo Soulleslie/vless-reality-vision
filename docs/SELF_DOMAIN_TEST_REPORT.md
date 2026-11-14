@@ -1,6 +1,6 @@
 # 自有域名 REALITY 开发与测试报告
 
-日期：2026-11-14。基础版本：`main@2d706c2`（v1.6.2），开发分支：`feat/self-domain-reality`。未在生产 VPS 部署，未合并 main。
+日期：2026-11-14。基础版本：`main@2d706c2`（v1.6.2），开发分支：`feat/self-domain-reality`。本报告记录开发阶段验证，未在生产 VPS 部署；交付与合并状态见 [PR #2](https://github.com/Soulleslie/vless-reality-vision/pull/2)。
 
 后续 v2.1.0 已把部署与安全任务合并至 `feat/self-domain-security`；新增功能和当前完整验收见 [安全审查与测试报告](SELF_DOMAIN_SECURITY_REPORT.md)。
 

@@ -47,13 +47,13 @@
 wget -O /root/vless-reality-setup.sh https://raw.githubusercontent.com/Soulleslie/vless-reality-vision/main/install.sh && chmod +x /root/vless-reality-setup.sh && /root/vless-reality-setup.sh
 ```
 
-尚未合并的自有域名开发分支可用以下命令验证（建议全新的测试 VPS）：
+需要对比开发分支时，可用以下命令验证（建议全新的测试 VPS）：
 
 ```bash
 wget -O /root/vless-reality-setup.sh https://raw.githubusercontent.com/Soulleslie/vless-reality-vision/feat/self-domain-security/install.sh && chmod +x /root/vless-reality-setup.sh && /root/vless-reality-setup.sh
 ```
 
-部署和加固在同一个脚本中，无需另外安装防护程序。完整验证与未实测项目见 [安全审查与测试报告](docs/SELF_DOMAIN_SECURITY_REPORT.md) 和 [基础部署测试报告](docs/SELF_DOMAIN_TEST_REPORT.md)。主分支只有在 Pull Request 审查合并后才包含新功能。
+部署和加固在同一个脚本中，无需另外安装防护程序。日常安装和更新使用上面的 `main` 地址。完整验证与未实测项目见 [安全审查与测试报告](docs/SELF_DOMAIN_SECURITY_REPORT.md) 和 [基础部署测试报告](docs/SELF_DOMAIN_TEST_REPORT.md)。
 
 使用 curl：
 
@@ -66,6 +66,29 @@ curl -fL -o /root/vless-reality-setup.sh https://raw.githubusercontent.com/Soull
 ```bash
 vless-reality
 ```
+
+## 已有节点如何更新
+
+GitHub 更新不会自动修改 VPS 上已运行的节点。原来通过本项目旧命令安装的普通节点可继续使用，无需卸载或重新导入链接。要获得新版菜单和管理功能，以 root 身份更新管理脚本即可：
+
+```bash
+(
+    set -e
+    vless_update_file="$(mktemp /root/.vless-reality-setup.XXXXXX)"
+    trap 'rm -f -- "$vless_update_file"' EXIT
+    curl -fL --connect-timeout 10 --max-time 60 -o "$vless_update_file" https://raw.githubusercontent.com/Soulleslie/vless-reality-vision/main/install.sh
+    bash -n "$vless_update_file"
+    chmod 700 "$vless_update_file"
+    mv -f -- "$vless_update_file" /root/vless-reality-setup.sh
+    /root/vless-reality-setup.sh status
+)
+```
+
+先下载并检查语法，再原子替换；下载失败时保留旧管理脚本，临时文件在退出时清理。此操作只替换管理脚本并查询状态，不重启 Xray，不修改 UUID、REALITY 密钥、端口、SNI、TFO、Encryption 或现有链接，也不会自动安装 Nginx/Certbot。
+
+如需升级 Xray 核心，另行执行 `vless-reality update`；核心升级会按原流程验证和重启，应使用直连 SSH。已有 v2.0 自有域名节点更新脚本后，继续执行下方的 `security-apply` 和 `security-check`。
+
+普通模式不会在更新脚本时自动变成自有域名模式。只有决定切换时，先准备 DNS、保存需要的节点信息，再卸载原节点并选择菜单 20 重新部署；新安装会生成新的认证参数，需要重新导入链接。已有节点会阻止直接覆盖安装。
 
 如果旧版脚本在菜单选择 `1` 后直接返回主菜单，请重新执行上面的下载命令获取最新版。v1.0.1 已修正安装前检查在正常机器上错误退出的问题。
 
@@ -219,7 +242,7 @@ vless-reality refresh-ip           # 只核对当前 DNS，绝不把 Address 改
 
 ### 安全检查与旧版本升级
 
-已有普通节点更新管理脚本后仍使用原来的命令。已有 v2.0 自有域名节点，下载本分支的新脚本覆盖 `/root/vless-reality-setup.sh` 后执行：
+已有普通节点更新管理脚本后仍使用原来的命令。已有 v2.0 自有域名节点，按“已有节点如何更新”替换管理脚本后执行：
 
 ```bash
 vless-reality security-apply
