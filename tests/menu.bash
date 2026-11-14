@@ -34,10 +34,11 @@ rc=0; menu_action 27 || rc=$?; [[ "$rc" == 2 ]]
 
 # 真实终端输入：新 2 返回菜单，新 26 在成功删除管理入口后直接退出。
 printf -v child_command 'bash %q --child-install' "$ROOT/tests/menu.bash"
-output="$(printf '27\n2\n\n00\n' | script -q -e -c "$child_command" /dev/null)"
+output="$(printf '27\n2\n\n00\n' | TERM=xterm-256color script -q -e -c "$child_command" /dev/null)"
 [[ "$output" == *'请输入菜单中的数字。'* && "$output" == *'TEST: install-self'* ]]
 [[ "$output" == *'1. 安装普通 REALITY'*'1. 安装普通 REALITY'* ]]
 [[ "$output" == *'请输入数字 [1-26，00 退出]'* ]]
+[[ "$output" != *$'\033[3J'* ]] # 保留滚动历史，不能清除刚才的安装错误。
 printf -v child_command 'bash %q --child-uninstall' "$ROOT/tests/menu.bash"
 output="$(printf '26\n' | script -q -e -c "$child_command" /dev/null)"
 [[ "$output" == *'TEST: uninstall'* && "$output" != *'按回车返回主菜单'* ]]

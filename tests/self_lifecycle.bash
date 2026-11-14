@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "${1:-}" != --child ]]; then
-    for stage in success dns provider credentials cert renewal renew-record timer nginx xray target; do
+    for stage in success dns provider credentials cert renewal renew-record timer nginx xray target nat-pending nat-auth public-http; do
         bash "${BASH_SOURCE[0]}" --child "$stage" cloudflare
     done
     bash "${BASH_SOURCE[0]}" --child success http
@@ -112,7 +112,10 @@ cp() {
     if [[ "$STAGE" == security-rollback && "${2:-}" == *security-backup.*/site.conf ]]; then return 1; fi
     command cp "$@"
 }
-self_client_probe() { :; }
+self_client_probe() { [[ "$STAGE" != nat-auth ]]; }
+self_public_probe() {
+    case "$STAGE" in nat-pending|nat-auth) return 3 ;; public-http) return 1 ;; *) return 0 ;; esac
+}
 self_nginx_shared() { return 1; }
 # 目标配置错误必须让安装最终检查失败。
 if [[ "$STAGE" == target ]]; then self_config_check() { return 1; }; fi
@@ -120,8 +123,14 @@ set +e
 ( set -e; install_self node.example.com "$METHOD" admin@example.com Test off off > "$TEST_DIR/install.log" 2>&1 )
 result=$?
 set -e
-if (( result == 0 )); then
-    [[ "$STAGE" == success ]] || { echo "故障 $STAGE 未阻止安装"; exit 1; }
+if (( result == 0 )) || [[ "$STAGE" == nat-pending && "$result" == 3 ]]; then
+    [[ "$STAGE" == success || "$STAGE" == nat-pending ]] || { echo "故障 $STAGE 未阻止安装"; exit 1; }
+    if [[ "$STAGE" == nat-pending ]]; then
+        [[ -f "$CONFIG" && -f "$MARKER" && -f "$LINK_FILE" && -f "$MANAGER" ]]
+        [[ -f "$TEST_DIR/units/active-xray" && -f "$TEST_DIR/units/active-nginx" ]]
+        jq -e '.result=="pending" and .external=="unverified"' "$SELF_DIR/network-check.json" >/dev/null
+        [[ "$(< "$TEST_DIR/install.log")" != *'安装完成：'* && "$(< "$TEST_DIR/install.log")" == *'本地部署已保留'* ]]
+    fi
 else
     [[ "$STAGE" != success ]] || { cat "$TEST_DIR/install.log"; exit 1; }
     [[ ! -e "$SELF_DIR" && ! -e "$SELF_WEB" && ! -e "$SELF_SITE" && ! -e "$SELF_RENEW_TIMER" && ! -e "$XRAY_BIN" && ! -e "$CONFIG_DIR" ]] || { echo "故障 $STAGE 回滚有残留"; ls -la "$TEST_DIR"; exit 1; }
