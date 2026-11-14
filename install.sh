@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.1.1'
+SCRIPT_VERSION='2.1.2'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -594,7 +594,7 @@ purge_node_files() {
     fi
     systemctl is-active --quiet xray && return 1
     if systemctl is-failed --quiet xray; then systemctl reset-failed xray || return 1; fi
-    if systemctl is-enabled --quiet xray; then
+    if systemctl is-enabled --quiet xray 2>/dev/null; then
         systemctl disable xray >/dev/null 2>&1 || return 1
     fi
     disable_kernel_tfo || return 1
@@ -950,8 +950,13 @@ EOF
     systemctl daemon-reload
     systemctl enable --now xray
     wait_service 10 || fail "Xray 未正常监听 TCP $PORT；请查看 journalctl -u xray。"
+    local self_check_rc=0
     if [[ "$NODE_MODE" == self ]]; then
-        check_self || fail '自有域名最终检查失败；安装将回滚。'
+        check_self || self_check_rc=$?
+        case "$self_check_rc" in
+            0|3) ;;
+            *) fail '自有域名最终检查失败；安装将回滚。' ;;
+        esac
     fi
     show_node
     ensure_shortcut || true
@@ -959,6 +964,12 @@ EOF
     trap - EXIT
     rm -rf -- "$TEMP_DIR"
     TEMP_DIR=''
+    if (( self_check_rc == 3 )); then
+        warn '本地部署已保留：公网 HTTPS / VLESS 连通性仍未验证（NAT 公网地址回访未通过）。'
+        warn '请从其他网络访问域名并导入节点测试，检查服务商的 TCP 443 映射/安全组。不要再次安装或重复申请证书。'
+        warn '可配置 VLESS_EXTERNAL_CHECK 后重新运行 check-self；当前命令退出码为 3，表示待验证，并非完整安装验证成功。'
+        return 3
+    fi
     ok "安装完成：Xray ${RELEASE_VERSION} 正在监听 TCP ${PORT}。"
     warn "请确认云安全组已放行 TCP ${PORT}。导入链接包含 UUID，请勿公开分享。"
 }
@@ -1027,6 +1038,7 @@ status_node() {
     fi
     if [[ "$NODE_MODE" == self ]]; then
         if self_tls_check "$SNI" 127.0.0.1:8443; then ok '本地网站：TLS 1.3 / X25519 / H2 正常'; else warn '本地网站验证失败'; fi
+        self_network_status
         cert_status
     elif target_tls_ok "$SNI"; then ok '伪装站点：TLS 1.3 正常'; else warn '伪装站点：当前验证失败'; fi
     if config_tfo_enabled && kernel_tfo_server; then
@@ -2126,7 +2138,7 @@ self_cleanup_preflight() {
     for entry in "$SELF_DIR"/* "$SELF_DIR"/.[!.]*; do
         [[ -e "$entry" || -L "$entry" ]] || continue
         case "${entry##*/}" in
-            .owned|.receipt.??????|.renew.??????|files.sha256|cli.ini|state.json|cloudflare.ini|default-target|renew-test.json|renew-status.json|security-last.json|security-dns.json|operation.lock|acme|logs|work) ;;
+            .owned|.receipt.??????|.renew.??????|files.sha256|cli.ini|state.json|cloudflare.ini|default-target|renew-test.json|renew-status.json|network-check.json|security-last.json|security-dns.json|operation.lock|acme|logs|work) ;;
             *) warn "自有域名目录含有未知文件，已保留：$entry" >&2; return 1 ;;
         esac
     done
@@ -2315,10 +2327,78 @@ self_renew_ready() {
         && jq -e --arg domain "$SNI" '.result=="passed" and .domain==$domain' "$SELF_DIR/renew-test.json" >/dev/null \
         && [[ -x "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" ]] && self_file_owned "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx"
 }
+# 仅凭连接失败不能判定 NAT；还须确认公网地址不在本机、路由经网关，且源地址是已配置的私网地址。
+self_public_uses_nat() {
+    local address="$1" addresses route
+    addresses="$(ip -j -4 address show 2>/dev/null)" || return 1
+    route="$(ip -j -4 route get "$address" 2>/dev/null)" || return 1
+    python3 - "$address" "$addresses" "$route" <<'PY_NAT'
+import ipaddress, json, sys
+try:
+    public = ipaddress.IPv4Address(sys.argv[1])
+    configured = {ipaddress.IPv4Address(a['local']) for interface in json.loads(sys.argv[2])
+                  for a in interface.get('addr_info', []) if a.get('family') == 'inet'}
+    routes = json.loads(sys.argv[3])
+    route = routes[0]
+    source = ipaddress.IPv4Address(route.get('prefsrc') or route.get('src'))
+    private = tuple(ipaddress.IPv4Network(n) for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '100.64.0.0/10'))
+    valid = (public.is_global and public not in configured and len(routes) == 1
+             and not public.is_multicast and route.get('gateway') and route.get('dev') != 'lo' and route.get('type') != 'local'
+             and source in configured and any(source in net for net in private))
+    sys.exit(0 if valid else 1)
+except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+    sys.exit(1)
+PY_NAT
+}
+self_public_probe() {
+    local domain="$1" address="$2" result rc=0 protocol code connected tls_connected
+    result="$(curl --noproxy '*' --http2 --tlsv1.3 --tls-max 1.3 -fsS --connect-timeout 5 --max-time 15 \
+        --resolve "$domain:443:$address" -o /dev/null -w '%{http_version} %{http_code} %{time_connect} %{time_appconnect}' "https://$domain:443/")" || rc=$?
+    read -r protocol code connected tls_connected <<< "$result" || return 1
+    if (( rc == 0 )) && [[ "$protocol $code" == '2 200' ]]; then return 0; fi
+    # 只把 NAT 上未建立 TCP 的拒绝/超时分类为未验证；证书、TLS、HTTP/H2 等错误仍是失败。
+    if [[ "$rc" == 7 || "$rc" == 28 ]] && [[ "$code" == 000 \
+        && "$connected" =~ ^0([.]0+)?$ && "$tls_connected" =~ ^0([.]0+)?$ ]] && self_public_uses_nat "$address"; then
+        return 3
+    fi
+    return 1
+}
+self_network_write() {
+    local address="$1" public="$2" external="$3" result="$4" tmp
+    tmp="$(mktemp "$SELF_DIR/.renew.XXXXXX")" || return 1
+    if jq -n --arg domain "$SNI" --arg ip "$address" --arg public "$public" --arg external "$external" \
+        --arg result "$result" --arg time "$(date -u +%FT%TZ)" \
+        '{domain:$domain,ip:$ip,time:$time,public_probe:$public,external:$external,result:$result}' > "$tmp" \
+        && chmod 600 "$tmp" && mv -f -- "$tmp" "$SELF_DIR/network-check.json"; then return 0; fi
+    rm -f -- "$tmp"; return 1
+}
+self_network_status() {
+    local file="$SELF_DIR/network-check.json" brief="${1:-}" result
+    [[ -e "$file" || -L "$file" ]] || return 0
+    if [[ ! -f "$file" || -L "$file" || "$(stat -c %u "$file")" != 0 || "$(stat -c %a "$file")" != 600 ]]; then
+        warn '未验证：网络检查记录归属或权限异常。'; return 0
+    fi
+    if ! jq -e --arg domain "$SNI" 'def probe: .=="passed" or .=="failed" or .=="unverified";
+        .domain==$domain and (.time|type=="string") and (.public_probe|probe) and (.external|probe) and
+        (.result=="pending" or .result=="failed" or .result=="local_verified" or .result=="external_verified")' "$file" >/dev/null 2>&1; then
+        warn '未验证：网络检查记录无效或对应其他域名，请重新运行 check-self。'; return 0
+    fi
+    result="$(jq -r .result "$file")" || return 1
+    if [[ "$brief" == brief ]]; then
+        case "$result" in
+            pending) warn ' 公网连接：待外部验证（NAT 公网地址回访未通过；服务已保留）' ;;
+            failed) warn ' 最近网络检查：失败，请运行 check-self 查看详情' ;;
+        esac
+        return 0
+    fi
+    jq -r 'def zh: if .=="passed" then "通过" elif .=="failed" then "失败" else "未验证" end;
+        "最近网络检查：\(.time)\n公网 443 回访（本机源）：\(.public_probe|zh)\n外部程序验证：\(.external|zh)"' "$file"
+    [[ "$result" != pending ]] || warn '公网可用性未验证：本地部署已保留，请从其他网络测试 HTTPS 与 VLESS。'
+}
 check_self() {
     need_root; self_operation_lock; load_metadata
     [[ "$NODE_MODE" == self ]] || fail 'check-self 只用于自有域名模式。'
-    local SELF_CHECK_FAILURES=0 ip external="${VLESS_EXTERNAL_CHECK:-}"
+    local SELF_CHECK_FAILURES=0 ip external="${VLESS_EXTERNAL_CHECK:-}" public_result=failed external_result=unverified rc=0 result
     ip="$(public_ipv4)" || fail '无法确认当前公网 IPv4。'
     self_report 'DNS A 直连当前 VPS、无 CNAME/CDN、无 AAAA（两个解析器）' self_dns_check "$SNI"
     self_report 'Xray TCP 443 服务和监听' service_ok
@@ -2329,18 +2409,40 @@ check_self() {
     self_report '本机网站 HTTP/2 200，无跳转' self_http_check "$SNI" 127.0.0.1 8443
     self_report '拒绝未知 SNI 和无 SNI' self_reject_check "$SNI"
     self_report 'SNI 与 Host/:authority 一致性' self_authority_check "$SNI"
-    self_report '公网地址 443 HTTPS 回落（检测源为本机）' self_http_check "$SNI" "$ip" 443
+    self_report 'Xray 本机 443 HTTPS 回落，HTTP/2 200' self_http_check "$SNI" 127.0.0.1 443
+    if self_public_probe "$SNI" "$ip"; then
+        public_result=passed; ok '通过：公网地址 443 HTTPS 回落（检测源为本机）'
+    else
+        rc=$?
+        if (( rc == 3 )); then
+            public_result=unverified
+            warn '未验证：NAT 公网地址 443 回访未建立 TCP 连接，不能据此判断外部可达性。'
+            warn '请检查服务商 TCP 443 映射/安全组并从外部网络验证；此项不会被标记为通过。'
+        else
+            warn '失败：公网地址 443 HTTPS 回落（检测源为本机）'
+            SELF_CHECK_FAILURES=$((SELF_CHECK_FAILURES + 1))
+        fi
+    fi
     self_report '证书 timer、最近续期 dry-run 与 deploy hook 记录' self_renew_ready
     self_report '实际 Xray 客户端 REALITY + Vision 握手和 HTTPS 代理请求（本机源）' self_client_probe "$SNI" 127.0.0.1
     if [[ -n "$external" ]]; then
         if [[ -x "$external" && -f "$external" && ! -L "$external" && "$(stat -c %u "$external")" == 0 \
             && "$(stat -c %a "$external")" =~ ^[57]00$ ]]; then
-            self_report '用户配置的外部网络验证程序' timeout 120 "$external" "$SNI" "$ip"
-        else warn '失败：外部验证程序需为 root:700 的普通可执行文件。'; SELF_CHECK_FAILURES=$((SELF_CHECK_FAILURES + 1)); fi
+            if timeout 120 "$external" "$SNI" "$ip"; then
+                external_result=passed; ok '通过：用户配置的外部网络验证程序'
+            else external_result=failed; warn '失败：用户配置的外部网络验证程序'; SELF_CHECK_FAILURES=$((SELF_CHECK_FAILURES + 1)); fi
+        else external_result=failed; warn '失败：外部验证程序需为 root:700 的普通可执行文件。'; SELF_CHECK_FAILURES=$((SELF_CHECK_FAILURES + 1)); fi
     else
         warn '未验证：真正外部网络的 HTTPS/VLESS 连接。请从其他网络访问并导入测试；可用 VLESS_EXTERNAL_CHECK 配置外部验证程序。'
     fi
-    (( SELF_CHECK_FAILURES == 0 ))
+    if (( SELF_CHECK_FAILURES )); then result=failed;
+    elif [[ "$external_result" == passed ]]; then result=external_verified;
+    elif [[ "$public_result" == unverified ]]; then result=pending;
+    else result=local_verified; fi
+    self_network_write "$ip" "$public_result" "$external_result" "$result" || { warn '失败：无法保存网络检查结果。'; return 1; }
+    (( SELF_CHECK_FAILURES == 0 )) || return 1
+    [[ "$result" != pending ]] || return 3
+    return 0
 }
 change_self_domain() {
     local domain="${1:-}" script_path
@@ -2782,6 +2884,7 @@ security_check() {
         security_item '错误 REALITY 公钥未获得代理访问（本机负向测试）' security_unauthorized bad-public-key
     else warn '未验证：错误认证负向测试（合法基线失败，不能把网络失败算作安全通过）'; fi
     fallback_status
+    self_network_status
     security_bandwidth || warn '未验证：无法读取连接/带宽样本。'
     warn '未验证：注册商 MFA/Registrar Lock/自动续费、DNSSEC、DNS 修改提醒和 Token 最小权限须在账户面板确认。'
     warn '未验证：真正外部网络的 8443 可达性和节点连接；本命令的连接检测源为 VPS 本机。'
@@ -2842,10 +2945,11 @@ menu_status() {
     load_metadata
     say " 当前状态：${GREEN}● 已安装${RESET} [Xray $(installed_version)]  ${color}● ${label}${RESET}"
     say " 当前节点：${NODE_NAME}（${SERVER_IP}:${PORT}，SNI ${SNI}）"
+    [[ "$NODE_MODE" != self ]] || self_network_status brief
 }
 
 show_menu() {
-    if [[ -t 1 ]]; then clear 2>/dev/null || true; fi
+    if [[ -t 1 ]]; then clear -x 2>/dev/null || true; fi
     say '=================================='
     say " VLESS + REALITY + Vision ${RED}[v${SCRIPT_VERSION}]${RESET}"
     say '=================================='

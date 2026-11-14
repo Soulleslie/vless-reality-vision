@@ -77,6 +77,9 @@ python3 -m http.server 18080 --bind 0.0.0.0 --directory "$TEST_DIR/origin" > "$T
 curl() {
     local args=() arg
     for arg in "$@"; do
+        if [[ "${NAT_TEST:-0}" == 1 && "$arg" == "$SNI:443:93.184.215.14" ]]; then
+            printf '0 000 0.000000 0.000000'; return 28
+        fi
         [[ "$arg" != https://www.debian.org/ ]] || arg="http://$container_ip:18080/"
         args+=("$arg")
     done
@@ -144,6 +147,18 @@ for mode in off native xorpub random; do
         ) > "$TEST_DIR/security-check.log" 2>&1 || { cat "$TEST_DIR/security-check.log"; exit 1; }
         jq -e '.failed_checks==0 and .external=="unverified"' "$SELF_DIR/security-last.json" >/dev/null
         [[ "$(stat -c %a "$SELF_DIR/security-last.json")" == 600 ]]
+        # 仅注入公网 TCP 超时；NAT 路由判定及本地 TLS、HTTP/2、Vision 客户端均真实执行。
+        (
+            NAT_TEST=1
+            public_ipv4() { printf '93.184.215.14'; }
+            self_dns_check() { return 0; }; self_renew_ready() { return 0; }
+            rc=0; check_self || rc=$?
+            [[ "$rc" == 3 ]]
+            self_http_check "$SNI" 127.0.0.1 443
+            kill -0 "$server_pid"
+        ) > "$TEST_DIR/nat-check.log" 2>&1 || { cat "$TEST_DIR/nat-check.log"; exit 1; }
+        jq -e '.result=="pending" and .external=="unverified" and .public_probe=="unverified"' "$SELF_DIR/network-check.json" >/dev/null
+        [[ "$(stat -c %a "$SELF_DIR/network-check.json")" == 600 ]]
     fi
     stop_server
     printf '真实 HTTPS/Host/SNI、认证拒绝、权限及回落限速/Vision/%s 通过\n' "$mode"
