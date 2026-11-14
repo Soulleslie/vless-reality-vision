@@ -16,6 +16,7 @@
 - 输出标准 `vless://` 客户端导入链接
 - 中文菜单管理启动、停止、重启、日志和状态
 - 修改端口、SNI、UUID、REALITY 密钥和节点名称
+- 两种模式均可切换客户端连接地址为 IP / 自己的域名，保留 SNI 和认证参数，无需重启服务
 - 可选开启 TCP Fast Open，并在菜单或命令行切换
 - 可选开启 VLESS Encryption；生成成对参数并更新客户端导入链接
 - 自有域名模式：Nginx 本机 HTTPS 网站、Let’s Encrypt 证书与隔离自动续期
@@ -35,7 +36,7 @@
 ## 两种安装模式
 
 - **普通 REALITY**：菜单 1 或原命令 `install`，第三方 SNI、任意空闲 TCP 端口、自动优选行为保持兼容，不安装 Nginx/Certbot。
-- **自有域名 REALITY（偷自己）**：菜单 2 或 `install-self`。Address、SNI、证书域名相同；Xray 在 `0.0.0.0:443` 接入，REALITY target 固定为 `127.0.0.1:8443`，普通 HTTPS 请求回落到本机静态 Nginx 网站。此模式不允许修改节点端口，也不允许 `sni auto` 切到第三方域名。
+- **自有域名 REALITY（偷自己）**：菜单 2 或 `install-self`。默认 Address、SNI、证书域名相同；可在安装后将客户端 Address 切换为 VPS 公网 IP，SNI 和证书域名仍匹配。Xray 在 `0.0.0.0:443` 接入，REALITY target 固定为 `127.0.0.1:8443`，普通 HTTPS 请求回落到本机静态 Nginx 网站。此模式不允许修改节点端口，也不允许 `sni auto` 切到第三方域名。
 
 自有域名的所有功能都内嵌在 `install.sh`；不需要下载额外管理模块。建议使用 Debian 12/13、Ubuntu 24.04 或更新的受支持版本，Nginx 至少 1.19.4（未知 SNI 拒绝功能），curl 必须包含 HTTP2。旧系统若仓库 Nginx 过旧会安全中止，不自动添加第三方软件源。
 
@@ -146,6 +147,8 @@ v2.1.1 将交互菜单重排为连续的 1–26，修复 20 插入 1/2 之间及
 
 v2.1.2 修正 NAT VPS 公网地址回访的判定：仅对确认 NAT 且尚未建立 TCP 的超时/拒绝保留“公网待验证”部署，退出码 3，其他实际失败仍回滚。菜单/状态显示待验证记录，记录随卸载清理；菜单清屏保留滚动历史，回滚不再打印预期的 Xray unit 不存在提示。
 
+v2.2.0 将菜单第 12 项扩展为“服务器地址管理”，提供 IP、域名和保持当前选择的公网 IP 刷新；新增 `addr` 命令，旧 `refresh-ip` 和历史数字命令仍兼容。两种安装模式均可使用，地址选择单独保存，修改 UUID、密钥、加密模式或升级 Xray 后继续保留。地址保存失败回滚，新增暂存文件纳入卸载清理。验证范围见 [地址切换测试报告](docs/ADDRESS_TEST_REPORT.md)。
+
 ## 非交互安装
 
 参数顺序为端口、伪装域名、节点名称：
@@ -231,13 +234,13 @@ systemctl list-timers vless-reality-cert.timer
 ### 自有域名管理与检测
 
 ```bash
-vless-reality show                 # 域名 Address + 域名 SNI 的受保护链接
+vless-reality show                 # 按当前 IP/域名选择生成受保护链接
 vless-reality website              # 本地网站状态
 vless-reality check-self           # 完整检查
 vless-reality security-check       # 安全配置、认证拒绝、DNS/CAA、权限和带宽样本
 vless-reality security-apply       # 旧版自有域名站点应用当前安全模板，支持失败回滚
 vless-reality sni new.example.com  # 同步修改 DNS 检查、证书、Nginx、Xray 和链接
-vless-reality refresh-ip           # 只核对当前 DNS，绝不把 Address 改成 IP
+vless-reality refresh-ip           # 刷新公网 IP 缓存，保持当前 IP/域名选择
 ```
 
 域名修改由独立 systemd 任务执行，失败恢复旧站点、配置、证书引用、安装记录、链接和续期测试记录。旧证书保留在专用目录便于回滚，卸载时一起清理。失败日志为 `journalctl -u vless-reality-self-change`。更换域名后重新导入链接。
@@ -333,13 +336,45 @@ vless-reality vlessenc off         关闭 VLESS Encryption
 vless-reality uuid                 重新生成 UUID
 vless-reality rotate-keys          轮换 REALITY 密钥和 Short ID
 vless-reality rename Reality-US    修改节点名称
-vless-reality refresh-ip           刷新链接中的公网 IPv4
+vless-reality addr                 查看服务器地址，终端内可选择 IP / 域名 / 刷新 IP
+vless-reality addr ip              连接地址改用本机当前公网 IPv4
+vless-reality addr domain          改用当前自有域名，或普通模式已保存的连接域名
+vless-reality addr domain node.example.com  普通模式指定自己的连接域名
+vless-reality refresh-ip           刷新公网 IPv4 缓存和链接，保持 IP/域名选择
 vless-reality update               升级 Xray-core
 vless-reality log -f               实时查看日志
 vless-reality uninstall            卸载并清理
 ```
 
 安装前也可以运行 `/root/vless-reality-setup.sh sni-best` 查看测速结果；该命令只显示候选域名，不会安装或修改节点。
+
+## 服务器连接地址：IP / 域名切换
+
+运行 `vless-reality`，选择 **12「服务器地址管理」**：
+
+```text
+1. 连接地址改用公网 IP
+2. 连接地址改用域名
+3. 刷新公网 IP（保持当前地址模式）
+00. 返回
+```
+
+两种安装模式都支持。它只改变客户端链接中的 Address，保留端口、REALITY SNI/target、UUID、公钥、Short ID、Vision、TFO 和 VLESS Encryption；不重启 Xray 或 Nginx，也不重新申请证书。切换后重新导入新链接，已导入的客户端不会自动更新。
+
+| 当前安装模式 | 改用 IP | 改用域名 |
+| --- | --- | --- |
+| 普通 REALITY（第三方 SNI） | 使用当前 VPS 公网 IPv4，SNI 继续用第三方网站 | 填**自己控制且 A 直连 VPS** 的连接域名，不是第三方伪装域名；原第三方 SNI/target 保持不变 |
+| 自有域名 REALITY | 使用当前 VPS 公网 IPv4，SNI/网站/证书仍用自己的域名 | 沿用当前自有域名 SNI；真正更换网站域名仍使用菜单 14 或 `sni 新域名` 同步更新 |
+
+普通模式的连接域名也须满足：两个公共解析器一致、唯一 A 指向本机公网 IPv4、无 CNAME、无 AAAA、无 CDN/Cloudflare 橙云。不满足时拒绝切换并保留旧地址。旧普通节点缺少 `dig` 时仅补装 `dnsutils`，不会安装 Nginx/Certbot，也不会改变安装模式；解析记录由用户自行管理。
+
+自有域名模式切换为 IP 后，仍需维护原域名解析、网站和证书自动续期。DNS 检查失败时可以改用 IP，但会明确警告；切回域名必须重新通过 DNS 检查。第三方模式改用 IP 时保留已保存的连接域名，之后可直接用 `addr domain` 切回。
+
+`refresh-ip` 重新查询当前公网 IPv4，更新本地缓存及链接；它不会让服务商分配新 IP，也不会修改 DNS。当前选 IP 时更新链接中的 IP；当前选域名时先检查 DNS，继续保留域名。公网 IP 未变化时不会改变地址选择。
+
+旧六/七/八行安装记录自动兼容，默认仍是普通模式用 IP、自有域名模式用域名；新记录增加地址模式和连接域名字段。选择会随管理操作保留。地址写入前备份安装记录和私有链接，两者保存失败时恢复；回滚也失败则保留备份并报错。成功操作清理备份，异常残留由卸载按归属清理，不新增常驻服务或端口。
+
+地址切换不会清除 NAT 公网回访“待外部验证”提示，也不能替代外部 HTTPS 和真实节点测试。
 
 ## TCP Fast Open
 

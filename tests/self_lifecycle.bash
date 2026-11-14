@@ -27,7 +27,7 @@ printf 'dns_cloudflare_api_token = abcdefghijklmnopqrstuvwxyz12345\n' > "$TEST_D
 chmod 600 "$TEST_DIR/credentials.ini"
 [[ "$STAGE" != credentials ]] || chmod 644 "$TEST_DIR/credentials.ini"
 export VLESS_CF_CREDENTIALS="$TEST_DIR/credentials.ini"
-need_root() { :; }; need_command() { :; }; ensure_dependencies() { :; }; self_extra_dependencies() { :; }
+need_root() { :; }; need_command() { :; }; ensure_dependencies() { :; }; self_extra_dependencies() { :; }; ensure_dns_tool() { :; }
 security_dns_snapshot() { printf '{"domain":"%s","A":"203.0.113.1","AAAA":"","CNAME":"","NS":"ns1.example.com.","CAA":""}\n' "$1"; }
 self_dns_check() { [[ "$STAGE" != dns ]]; }; self_cloudflare_zone() { [[ "$STAGE" != provider ]]; }; self_tls_check() { :; }; self_reject_check() { :; }; self_authority_check() { [[ "$STAGE" != security-rule && "$STAGE" != security-rollback ]]; }; self_loaded_cert_matches() { :; }
 public_ipv4() { printf '203.0.113.1'; }; chown() { :; }; getent() { return 2; }; groupadd() { :; }; useradd() { :; }
@@ -145,10 +145,14 @@ rm "$SELF_DIR/work"; mv "$TEST_DIR/work-kept" "$SELF_DIR/work"
 # 重复安装受保护。
 if (install_self node.example.com "$METHOD" admin@example.com Test >/dev/null 2>&1); then exit 1; fi
 [[ "$NODE_MODE" == self && "$(< "$LINK_FILE")" == *'@node.example.com:443?'* ]]
+address_node ip >/dev/null; load_metadata
+[[ "$ADDR_MODE" == ip && "$(< "$LINK_FILE")" == *'@203.0.113.1:443?'* ]]
 old_config="$(sha256sum "$CONFIG")"; old_site="$(sha256sum "$SELF_SITE")"
+old_address="$(sha256sum "$MARKER" "$LINK_FILE")"
 STAGE=domain-renewal
 if (self_domain_apply other.example.com >/dev/null 2>&1); then echo '域名续期失败应回滚'; exit 1; fi
 [[ "$(sha256sum "$CONFIG")" == "$old_config" && "$(sha256sum "$SELF_SITE")" == "$old_site" ]]
+[[ "$(sha256sum "$MARKER" "$LINK_FILE")" == "$old_address" ]]
 [[ "$(self_state domain)" == node.example.com ]]
 STAGE=security-rule
 site_before="$(sha256sum "$SELF_SITE" "$SELF_DIR/files.sha256")"
@@ -162,7 +166,9 @@ STAGE=success
 cp -a "$rollback_dir/site.conf" "$SELF_SITE"; cp -a "$rollback_dir/files.sha256" "$SELF_DIR/files.sha256"; rm -rf "$rollback_dir"
 self_domain_apply other.example.com > "$TEST_DIR/domain.log" 2>&1 || { cat "$TEST_DIR/domain.log"; exit 1; }
 load_metadata
-[[ "$SNI" == other.example.com && "$(< "$LINK_FILE")" == *'@other.example.com:443?'* ]]
+[[ "$SNI" == other.example.com && "$ADDR_MODE" == ip && "$(< "$LINK_FILE")" == *'@203.0.113.1:443?'* && "$(< "$LINK_FILE")" == *'&sni=other.example.com&'* ]]
+address_node domain >/dev/null; load_metadata
+[[ "$(< "$LINK_FILE")" == *'@other.example.com:443?'* ]]
 # hook 缺失不能仅凭旧的 dry-run 记录报续期正常。
 mv "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" "$SELF_DIR/work/hook-backup"
 if self_renew_ready >/dev/null 2>&1; then echo '缺失 hook 不应通过检查'; exit 1; fi

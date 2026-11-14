@@ -10,6 +10,7 @@ LINK_FILE="$TEST_DIR/link.txt"; SELF_DIR="$TEST_DIR/self"; SELF_WEB="$TEST_DIR/w
 SELF_RENEW_SERVICE="$TEST_DIR/cert.service"; SELF_RENEW_TIMER="$TEST_DIR/cert.timer"
 mkdir -p "$CONFIG_DIR"
 need_root() { :; }
+ensure_dns_tool() { :; } # 此测试使用下方的 DNS 回复替身，不访问系统包管理器。
 chown() { :; }
 public_ipv4() { printf '203.0.113.1'; }
 DNS_CASE=valid

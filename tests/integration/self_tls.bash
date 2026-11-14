@@ -43,11 +43,13 @@ uuid="$("$XRAY_BIN" uuid)"; mapfile -t keys < <(generate_reality_keys)
 PUBLIC_KEY="${keys[1]}"
 container_ip="$(hostname -I | awk '{print $1}')"
 SERVER_IP="$container_ip"; NODE_NAME=Self-Test
+# 测试域名仅在一次性容器内解析；公网 DNS 校验由独立故障用例覆盖。
+printf '%s node.example.test connect.example.test\n' "$container_ip" >> /etc/hosts
 jq -n --arg domain "$SNI" '{domain:$domain,method:"cloudflare",nginx_active:false,nginx_enabled:false}' > "$SELF_DIR/state.json"
 self_track "$SELF_DIR/state.json"
 if command curl --noproxy '*' --connect-timeout 2 --max-time 3 --resolve "$SNI:8443:$container_ip" -fsS "https://$SNI:8443/" -o /dev/null 2>/dev/null; then echo '非回环接口不应能访问 8443'; exit 1; fi
 start_server() {
-    setpriv --reuid=xray --regid=xray --init-groups "$XRAY_BIN" run -config "$CONFIG" > "$TEST_DIR/server.log" 2>&1 & server_pid=$!
+    setpriv --reuid=xray --regid=xray --init-groups "$XRAY_BIN" run -config "$CONFIG" 7>&- 8>&- 9>&- > "$TEST_DIR/server.log" 2>&1 & server_pid=$!
     sleep 0.3
 }
 stop_server() { kill "$server_pid"; wait "$server_pid" || true; server_pid=''; }
@@ -85,6 +87,11 @@ curl() {
     done
     command curl "${args[@]}"
 }
+switch_address() (
+    public_ipv4() { printf '%s' "$container_ip"; }
+    self_dns_check() { return 0; }
+    address_node "$@" > "$TEST_DIR/address.log"
+)
 for mode in off native xorpub random; do
     CLIENT_ENCRYPTION=none; VLESS_DECRYPTION=none
     if [[ "$mode" != off ]]; then mapfile -t pair < <(generate_vless_encryption_pair "$mode"); VLESS_DECRYPTION="${pair[0]}"; CLIENT_ENCRYPTION="${pair[1]}"; fi
@@ -111,6 +118,29 @@ for mode in off native xorpub random; do
     self_client_probe "$SNI" "$container_ip"
     show_node >/dev/null
     security_permissions; security_link_check; self_key_pair_check; security_service_user
+    # IP/域名两种 Address 均进行真实 REALITY/Vision 请求；地址操作不能触碰配置、网站、证书或运行进程。
+    address_before="$(sha256sum "$CONFIG" "$SELF_SITE" "$SELF_DIR/state.json" "$SELF_DIR/acme/live/$SNI/"*.pem)"
+    address_pid="$server_pid"
+    switch_address ip; load_metadata
+    [[ "$(< "$LINK_FILE")" == *"@$container_ip:443?"* && "$(< "$LINK_FILE")" == *"&sni=$SNI&"* ]]
+    security_link_check; self_client_probe "$SNI" "$(client_address)"
+    switch_address domain; load_metadata
+    [[ "$(< "$LINK_FILE")" == *"@$SNI:443?"* ]]
+    security_link_check; self_client_probe "$SNI" "$(client_address)"
+    if [[ "$mode" == off ]]; then
+        # 普通模式复用同一真实 TLS 目标作隔离替身；连接域名和第三方 SNI 独立保存。
+        NODE_MODE=external; ADDR_MODE=auto; ADDR_DOMAIN=''; write_marker
+        switch_address domain connect.example.test; load_metadata
+        [[ "$(< "$LINK_FILE")" == *'@connect.example.test:443?'* && "$SNI" == node.example.test ]]
+        self_client_probe "$SNI" "$(client_address)"
+        switch_address ip; load_metadata
+        [[ "$(client_address)" == "$container_ip" ]]
+        self_client_probe "$SNI" "$(client_address)"
+        NODE_MODE=self; ADDR_MODE=domain; ADDR_DOMAIN=''; write_marker; show_node >/dev/null
+    fi
+    [[ "$(sha256sum "$CONFIG" "$SELF_SITE" "$SELF_DIR/state.json" "$SELF_DIR/acme/live/$SNI/"*.pem)" == "$address_before" ]]
+    [[ "$server_pid" == "$address_pid" ]]; kill -0 "$address_pid"
+    printf '真实 IP/域名 Address 切换、SNI/证书/配置保留及免重启 / %s 通过\n' "$mode"
     before="$(wc -l < "$TEST_DIR/origin.log")"
     for bad in bad-uuid bad-reality bad-public-key; do
         result=0; self_client_probe "$SNI" "$container_ip" 443 "$bad" || result=$?

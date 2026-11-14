@@ -6,7 +6,7 @@ source <(sed '$d' "$ROOT/install.sh")
 TEST_DIR="$(mktemp -d)"; trap 'rm -rf "$TEST_DIR"' EXIT
 CONFIG_DIR="$TEST_DIR/config"; CONFIG="$CONFIG_DIR/config.json"; MARKER="$CONFIG_DIR/.vless-reality-owned"; XRAY_BIN="$TEST_DIR/xray"
 SELF_DIR="$TEST_DIR/no-self-state"; mkdir -p "$CONFIG_DIR"
-PORT=443; SNI=node.example.com; NODE_NAME=Self; SERVER_IP=203.0.113.1; PUBLIC_KEY=pub; SHORT_ID=0123456789abcdef; NODE_MODE=self
+PORT=443; SNI=node.example.com; NODE_NAME=Self; SERVER_IP=203.0.113.1; PUBLIC_KEY=pub; SHORT_ID=0123456789abcdef; NODE_MODE=self; ADDR_MODE=ip
 chown() { :; }; need_root() { :; }; ensure_dependencies() { :; }; systemctl() { return 1; }
 write_marker
 write_config 00000000-0000-4000-8000-000000000000 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
@@ -25,7 +25,7 @@ old="$(sha256sum "$CONFIG" "$MARKER")"
 (update_xray) >/dev/null
 [[ "$(sha256sum "$CONFIG" "$MARKER")" == "$old" ]]
 load_metadata
-[[ "$NODE_MODE" == self ]]
+[[ "$NODE_MODE" == self && "$ADDR_MODE" == ip && "$(client_address)" == "$SERVER_IP" ]]
 # 旧版本六行安装记录在升级时也不应被重写。
 sed -i '7,$d' "$MARKER"
 old="$(sha256sum "$CONFIG" "$MARKER")"
