@@ -5,11 +5,10 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.6.1'
+SCRIPT_VERSION='1.6.2'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
-CHECKER_API='https://api.github.com/repos/V2RaySSR/RealityChecker/releases/latest'
 CHECKER_BIN='/usr/local/bin/reality-checker'
 CHECKER_MARKER='/usr/local/bin/.vless-reality-checker-owned'
 CHECKER_TAG='# vless-reality-setup: RealityChecker'
@@ -279,13 +278,7 @@ download_verified_release() {
         || fail '安装包 SHA-256 与 GitHub 官方发布信息不一致，已停止。'
 }
 
-checker_asset() {
-    case "$(dpkg --print-architecture 2>/dev/null)" in
-        amd64) printf 'reality-checker-linux-amd64.zip' ;;
-        arm64) printf 'reality-checker-linux-arm64.zip' ;;
-        *) fail 'RealityChecker 仅提供 amd64 和 arm64 安装包。' ;;
-    esac
-}
+# 仅保留旧版本 RealityChecker 的归属检查和卸载清理。
 checker_marker_is_ours() {
     [[ -f "$CHECKER_MARKER" && ! -L "$CHECKER_MARKER" ]] \
         && [[ "$(sed -n '1p' "$CHECKER_MARKER")" == "$CHECKER_TAG" ]] \
@@ -315,200 +308,6 @@ remove_checker() {
     rm -f -- "$CHECKER_MARKER" || return 1
     [[ ! -e "$CHECKER_BIN" && ! -L "$CHECKER_BIN" && ! -e "$CHECKER_MARKER" ]] || return 1
 }
-install_checker() (
-    need_root
-    if checker_binary_is_ours; then
-        if [[ ! -x "$CHECKER_BIN" ]]; then
-            chmod 755 "$CHECKER_BIN" || fail '恢复 RealityChecker 执行权限失败。'
-        fi
-        ok "RealityChecker 已安装：$(sed -n '2s/^version=//p' "$CHECKER_MARKER")。"
-        return 0
-    fi
-    [[ ! -e "$CHECKER_BIN" && ! -L "$CHECKER_BIN" \
-        && ! -e "$CHECKER_MARKER" && ! -L "$CHECKER_MARKER" ]] \
-        || fail '发现已有 RealityChecker 程序或安装记录；为避免覆盖，已停止。'
-    ensure_dependencies
-    local asset stage_dir release_tag asset_json url digest archive binary_hash
-    asset="$(checker_asset)" || fail '无法选择 RealityChecker 安装包。'
-    stage_dir="$(mktemp -d "${CHECKER_BIN%/*}/.vless-reality-checker-stage.XXXXXX")" \
-        || fail '无法创建 RealityChecker 暂存目录。'
-    trap 'rm -rf -- "$stage_dir"' EXIT
-    printf 'vless-reality-setup\n' > "$stage_dir/.vless-reality-owned" \
-        || fail '无法标记 RealityChecker 暂存目录。'
-    curl -fLsS --retry 3 --connect-timeout 10 --max-time 30 \
-        -H 'Accept: application/vnd.github+json' -o "$stage_dir/release.json" "$CHECKER_API" \
-        || fail '无法查询 RealityChecker 官方 GitHub Release。'
-    release_tag="$(jq -er '.tag_name | select(type == "string")' "$stage_dir/release.json")" \
-        || fail 'RealityChecker 发布信息缺少版本号。'
-    [[ "$release_tag" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || fail 'RealityChecker 版本号格式异常。'
-    [[ "$(jq -r '[.draft, .prerelease] | join(",")' "$stage_dir/release.json")" == 'false,false' ]] \
-        || fail 'RealityChecker 最新发布不是正式稳定版。'
-    asset_json="$(jq -c --arg name "$asset" \
-        '[(.assets // [])[] | select(.name == $name)] | if length == 1 then .[0] else null end' \
-        "$stage_dir/release.json")"
-    [[ "$asset_json" != null ]] || fail "RealityChecker 发布中没有 $asset。"
-    url="$(jq -er '.browser_download_url | select(type == "string")' <<< "$asset_json")" \
-        || fail 'RealityChecker 下载地址缺失。'
-    digest="$(jq -er '.digest | select(type == "string")' <<< "$asset_json")" \
-        || fail 'RealityChecker SHA-256 摘要缺失。'
-    [[ "$url" == "https://github.com/V2RaySSR/RealityChecker/releases/download/$release_tag/$asset" ]] \
-        || fail 'RealityChecker 下载地址异常。'
-    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'RealityChecker SHA-256 摘要格式异常。'
-    archive="$stage_dir/reality-checker.zip"
-    curl -fL --retry 3 --connect-timeout 10 --max-time 180 -o "$archive" "$url" \
-        || fail '下载 RealityChecker 失败。'
-    printf '%s  %s\n' "${digest#sha256:}" "$archive" | sha256sum --check --status \
-        || fail 'RealityChecker 压缩包 SHA-256 校验失败。'
-    unzip -q "$archive" reality-checker -d "$stage_dir" || fail '解压 RealityChecker 失败。'
-    [[ -f "$stage_dir/reality-checker" && ! -L "$stage_dir/reality-checker" \
-        && -s "$stage_dir/reality-checker" ]] || fail '压缩包中的程序文件异常。'
-    chmod 755 "$stage_dir/reality-checker" || fail '设置 RealityChecker 执行权限失败。'
-    binary_hash="$(sha256sum -- "$stage_dir/reality-checker" | awk '{print $1}')" \
-        || fail '无法记录 RealityChecker 程序摘要。'
-    printf '%s\nversion=%s\nsha256=%s\n' "$CHECKER_TAG" "$release_tag" "$binary_hash" \
-        > "$stage_dir/receipt" || fail '写入 RealityChecker 安装记录失败。'
-    chmod 600 "$stage_dir/receipt" || fail '设置 RealityChecker 安装记录权限失败。'
-    mv -- "$stage_dir/receipt" "$CHECKER_MARKER" || fail '写入 RealityChecker 安装记录失败。'
-    if ! mv -- "$stage_dir/reality-checker" "$CHECKER_BIN"; then
-        rm -f -- "$CHECKER_MARKER"
-        fail '安装 RealityChecker 程序失败。'
-    fi
-    checker_binary_is_ours || fail 'RealityChecker 安装后校验失败，请运行 checker uninstall 清理。'
-    ok "RealityChecker ${release_tag} 已安装：$CHECKER_BIN"
-)
-checker_status() {
-    if checker_binary_is_ours; then
-        if [[ -x "$CHECKER_BIN" ]]; then
-            say "RealityChecker：已安装 $(sed -n '2s/^version=//p' "$CHECKER_MARKER")（本脚本管理）"
-        else
-            warn 'RealityChecker：程序内容正常，但执行权限已丢失；运行 checker install 可恢复。'
-        fi
-    elif checker_marker_is_ours; then
-        warn 'RealityChecker：安装记录存在，但程序缺失或内容已改变。'
-    elif [[ -e "$CHECKER_MARKER" || -L "$CHECKER_MARKER" ]]; then
-        warn 'RealityChecker：发现无法确认归属的安装记录，已保留。'
-    elif [[ -e "$CHECKER_BIN" || -L "$CHECKER_BIN" ]]; then
-        warn 'RealityChecker：发现同名程序，但不属于本脚本。'
-    else
-        say 'RealityChecker：未安装。'
-    fi
-}
-checker_require_ready() {
-    checker_binary_is_ours || fail '请先安装本脚本管理的 RealityChecker。'
-    [[ -x "$CHECKER_BIN" ]] || fail 'RealityChecker 没有执行权限；请运行 checker install 修复。'
-}
-checker_csv() (
-    local input="$1" stage_dir count
-    checker_require_ready
-    if ! command -v python3 >/dev/null 2>&1; then
-        need_command apt-get
-        say '安装 CSV 解析所需的 Python 3…'
-        apt-get update && apt-get install -y python3 || fail '安装 Python 3 失败。'
-    fi
-    stage_dir="$(mktemp -d /tmp/vless-reality-checker-csv.XXXXXX)" || fail '无法创建 CSV 暂存目录。'
-    trap 'rm -rf -- "$stage_dir"' EXIT
-    printf 'vless-reality-setup\n' > "$stage_dir/.vless-reality-owned" || fail '无法标记 CSV 暂存目录。'
-    count="$(python3 - "$input" "$stage_dir/normalized.csv" <<'PY'
-import csv
-import re
-import sys
-
-source, destination = sys.argv[1:]
-host_pattern = re.compile(r'(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$')
-try:
-    with open(source, newline='', encoding='utf-8-sig') as original:
-        reader = csv.DictReader(original)
-        fields = {name.strip().upper(): name for name in (reader.fieldnames or [])}
-        field = fields.get('CERT_DOMAIN') or fields.get('DOMAIN')
-        if field is None:
-            raise ValueError('缺少 CERT_DOMAIN 或 DOMAIN 列')
-        seen = set()
-        with open(destination, 'w', newline='', encoding='utf-8') as normalized:
-            writer = csv.writer(normalized, lineterminator='\n')
-            writer.writerow(('IP', 'ORIGIN', 'CERT_DOMAIN'))
-            for row in reader:
-                host = (row.get(field) or '').strip().strip('"').lower()
-                if host_pattern.fullmatch(host) and host not in seen:
-                    writer.writerow(('', '', host))
-                    seen.add(host)
-        if not seen:
-            raise ValueError('域名列中没有有效域名')
-        print(len(seen))
-except (OSError, UnicodeError, csv.Error, ValueError) as exc:
-    print(f'CSV 解析失败：{exc}', file=sys.stderr)
-    sys.exit(1)
-PY
-)" || fail 'CSV 无法转换为 RealityChecker 可读取的域名列。'
-    say "从 CSV 域名列提取到 $count 个有效域名；正在检测…"
-    "$CHECKER_BIN" csv "$stage_dir/normalized.csv"
-)
-checker_command() {
-    local action="${1:-status}" host="${2:-}" candidate file
-    local -a domains=()
-    need_root
-    case "$action" in
-        status) [[ $# -le 1 ]] || fail '用法：checker status'; checker_status ;;
-        install) [[ $# -le 1 ]] || fail '用法：checker install'; install_checker ;;
-        uninstall)
-            [[ $# -le 1 ]] || fail '用法：checker uninstall'
-            if ! checker_marker_is_ours; then
-                clean_checker_stage || fail 'RealityChecker 暂存文件未清理。'
-                say '没有本脚本管理的 RealityChecker；未删除其他程序。'
-                return 0
-            fi
-            remove_checker || fail 'RealityChecker 未清理；请检查程序与安装记录。'
-            clean_checker_stage || fail 'RealityChecker 暂存文件未清理。'
-            ok '本脚本安装的 RealityChecker 已清理。'
-            ;;
-        check)
-            [[ $# -eq 2 ]] || fail '用法：checker check 域名'
-            host="${host,,}"
-            valid_host "$host" || fail '请输入纯域名。'
-            checker_require_ready
-            "$CHECKER_BIN" check "$host"
-            ;;
-        batch)
-            [[ $# -ge 2 ]] || fail '用法：checker batch 域名1 域名2 ...'
-            shift
-            for candidate in "$@"; do
-                candidate="${candidate,,}"
-                valid_host "$candidate" || fail "批量检测中含有无效域名：$candidate"
-                domains+=("$candidate")
-            done
-            checker_require_ready
-            "$CHECKER_BIN" batch "${domains[@]}"
-            ;;
-        csv)
-            [[ $# -eq 2 ]] || fail '用法：checker csv 文件路径'
-            file="$host"
-            [[ -f "$file" && -r "$file" ]] || fail "CSV 文件不可读取：$file"
-            [[ "$file" != -* ]] || file="./$file"
-            checker_csv "$file"
-            ;;
-        *) fail '用法：checker [status|install|uninstall|check 域名|batch 域名...|csv 文件]' ;;
-    esac
-}
-checker_menu() {
-    need_root
-    checker_status
-    local choice host file
-    local -a domains=()
-    read -r -p 'RealityChecker [1 安装 / 2 单域名 / 3 批量 / 4 CSV / 5 卸载 / 0 返回]：' choice || return 0
-    case "$choice" in
-        1) checker_command install ;;
-        2) read -r -p '请输入纯域名：' host || return 0; checker_command check "$host" ;;
-        3)
-            read -r -p '请输入多个域名（空格分隔）：' host || return 0
-            read -r -a domains <<< "$host"
-            checker_command batch "${domains[@]}"
-            ;;
-        4) read -r -p '请输入 CSV 文件路径：' file || return 0; checker_command csv "$file" ;;
-        5) checker_command uninstall ;;
-        0|'') return 0 ;;
-        *) warn '请输入 0–5。' ;;
-    esac
-}
-
 installed_version() {
     if [[ -x "$XRAY_BIN" ]]; then
         "$XRAY_BIN" version 2>/dev/null | awk 'NR == 1 {print $2}'
@@ -941,7 +740,7 @@ install_node() {
     . /etc/os-release
     [[ "${ID:-}" == debian || "${ID:-}" == ubuntu ]] || fail '这个脚本仅支持 Debian 和 Ubuntu。'
     check_install_eligibility
-    local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0 tfo_choice="${4:-off}" enc_choice="${5:-off}" enc_mode="${6:-native}" checker_choice=0
+    local interactive=0 raw_port="${1:-}" answer default_name auto_sni=0 tfo_choice="${4:-off}" enc_choice="${5:-off}" enc_mode="${6:-native}"
     default_name="Reality-$(hostname -s)"
 
     if [[ -z "$raw_port" ]]; then
@@ -999,9 +798,6 @@ install_node() {
     elif [[ $# -ge 6 ]]; then
         fail '指定 VLESS Encryption 模式时，必须同时开启 VLESS Encryption。'
     fi
-    if (( interactive )) && confirm '是否安装 RealityChecker 检测工具？默认不安装 [y/N]：'; then
-        checker_choice=1
-    fi
 
     if (( interactive )); then
         say
@@ -1012,7 +808,6 @@ install_node() {
         say "  名称：$NODE_NAME"
         if (( TFO_ENABLED )); then say '  TFO： 开启'; else say '  TFO： 关闭'; fi
         if [[ "$enc_choice" == on ]]; then say "  VLESS Encryption：开启（$enc_mode）"; else say '  VLESS Encryption：关闭'; fi
-        if (( checker_choice )); then say '  RealityChecker： 安装'; else say '  RealityChecker： 不安装'; fi
         warn "  请确认云安全组已放行 TCP ${PORT}，无需开放 TCP 80"
         step '————————————————————————————————'
         confirm '开始安装？[y/N]：' || { say '已取消安装。'; return 0; }
@@ -1109,11 +904,6 @@ EOF
     TEMP_DIR=''
     ok "安装完成：Xray ${RELEASE_VERSION} 正在监听 TCP ${PORT}。"
     warn "请确认云安全组已放行 TCP ${PORT}。导入链接包含 UUID，请勿公开分享。"
-    if (( checker_choice )); then
-        if ! install_checker; then
-            warn '节点已安装，但 RealityChecker 安装失败；稍后可从菜单第 18 项重试。' >&2
-        fi
-    fi
 }
 
 show_node() {
@@ -1733,7 +1523,6 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   port [新端口]                修改端口
   sni [新域名|auto]            修改或自动优选 REALITY 伪装域名
   sni-best                     查看当前测速延迟最低的域名，不修改节点
-  checker [status|install|uninstall|check 域名|batch 域名...|csv 文件]  管理 RealityChecker
   tfo [on|off]                 查看或切换 TCP Fast Open
   vlessenc [on [native|xorpub|random]|off]  查看或切换 VLESS Encryption 模式
   uuid                         重新生成 UUID
@@ -1790,7 +1579,6 @@ show_menu() {
     say ' 15. 查看运行日志'
     say ' 16. 查看当前测速延迟最低的域名'
     say ' 17. 开关 TCP Fast Open'
-    say ' 18. 管理 RealityChecker（可选）'
     say ' 19. 开关 VLESS Encryption / 修改模式'
     say ' 00. 退出'
     say '=================================='
@@ -1806,7 +1594,7 @@ menu_action() {
         10) warn '操作后旧链接立即失效。'; rotate_keys ;;
         11) rename_node ;; 12) refresh_ip ;; 13) show_node ;;
         14) status_node ;; 15) log_node ;; 16) show_fastest_sni ;;
-        17) tfo_node ;; 18) checker_menu ;; 19) vlessenc_node ;; *) return 2 ;;
+        17) tfo_node ;; 19) vlessenc_node ;; *) return 2 ;;
     esac
 }
 interactive_menu() {
@@ -1816,8 +1604,8 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-19，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-9]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-17、19，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-7]|19) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
@@ -1840,7 +1628,6 @@ main() {
         port) shift; change_port "$@" ;;
         sni) shift; change_sni "$@" ;;
         sni-best) show_fastest_sni ;;
-        checker) shift; checker_command "$@" ;;
         tfo) shift; tfo_node "$@" ;;
         __tfo-apply) shift; tfo_apply "$@" ;;
         vlessenc) shift; vlessenc_node "$@" ;;
@@ -1855,7 +1642,7 @@ main() {
         log|logs) shift; log_node "$@" ;;
         update) update_xray ;;
         uninstall) uninstall_node ;;
-        [1-9]|1[0-9]) need_root; menu_action "$1" ;;
+        [1-9]|1[0-7]|19) need_root; menu_action "$1" ;;
         *) print_help; exit 2 ;;
     esac
 }

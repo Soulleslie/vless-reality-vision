@@ -18,7 +18,6 @@
 - 修改端口、SNI、UUID、REALITY 密钥和节点名称
 - 可选开启 TCP Fast Open，并在菜单或命令行切换
 - 可选开启 VLESS Encryption；生成成对参数并更新客户端导入链接
-- 可选安装并运行 [RealityChecker](https://github.com/V2RaySSR/RealityChecker) 检测伪装域名，卸载节点时清理本脚本安装的程序
 - 升级失败、配置修改失败和首次安装失败时回滚
 - 卸载时只清理本脚本拥有的文件
 
@@ -28,7 +27,7 @@
 2. 在云服务商安全组中放行准备使用的 TCP 端口。若使用系统防火墙，也需放行该端口。
 3. 选择端口时直接回车使用 TCP 443；若已占用，脚本会提示重新输入其他端口（例如 8443）。
 4. 安装时伪装域名直接回车，会立即测速并显示实测延迟最低的域名，然后再提示输入节点名称；也可以手动输入一个支持 TLS 1.3 的域名。自动优选从脚本内的 68 个候选域名并发初筛，跳过证书或 TLS 1.3 验证失败的站点，再复测全部通过初筛的域名，选两次握手平均耗时最低的站点。这个耗时是 **VPS 到伪装站点** 的耗时，不是客户端到 VPS 的延迟。若候选全部不可用，请手动指定域名。
-5. 选择是否开启 TCP Fast Open 和 VLESS Encryption；两者直接回车都默认关闭。开启 VLESS Encryption 后可选择 `native`、`xorpub`、`random`，直接回车默认 `native`。安装后可分别通过菜单第 17、19 项切换。交互安装还会询问是否安装 RealityChecker，直接回车默认不安装。
+5. 选择是否开启 TCP Fast Open 和 VLESS Encryption；两者直接回车都默认关闭。开启 VLESS Encryption 后可选择 `native`、`xorpub`、`random`，直接回车默认 `native`。安装后可分别通过菜单第 17、19 项切换。
 
 ## 一键安装
 
@@ -94,6 +93,8 @@ v1.6.0 增加 VLESS Encryption 的 `native`、`xorpub`、`random` 三种模式�
 
 v1.6.1 开启服务端 TFO 时，在新生成的导入链接中附带客户端可选参数 `tfo=1`；切换 TFO 后刷新链接。
 
+v1.6.2 移除菜单第 18 项 RealityChecker、安装提示和检测命令；其他菜单编号保持不变。卸载节点仍会清理旧版本由本脚本安装的 RealityChecker 及可识别暂存文件。
+
 ## 非交互安装
 
 参数顺序为端口、伪装域名、节点名称：
@@ -129,12 +130,6 @@ vless-reality port 8443            修改监听端口
 vless-reality sni www.apple.com    修改 REALITY 伪装域名
 vless-reality sni auto             重新测量并优选伪装域名
 vless-reality sni-best             显示当前测速延迟最低的域名，不修改节点
-vless-reality checker install      安装 RealityChecker
-vless-reality checker check 域名   用 RealityChecker 检测域名
-vless-reality checker batch apple.com tesla.com microsoft.com  批量检测域名
-vless-reality checker csv file.csv 从 CSV 文件检测域名
-vless-reality checker status       查看 RealityChecker 状态
-vless-reality checker uninstall    单独卸载 RealityChecker
 vless-reality tfo                  显示状态，交互式切换 TFO
 vless-reality tfo on               开启 TFO
 vless-reality tfo off              关闭 TFO
@@ -152,14 +147,6 @@ vless-reality uninstall            卸载并清理
 ```
 
 安装前也可以运行 `/root/vless-reality-setup.sh sni-best` 查看测速结果；该命令只显示候选域名，不会安装或修改节点。
-
-## RealityChecker（可选）
-
-交互安装节点时可以选择一并安装 RealityChecker，默认不安装；非交互安装节点后可单独运行 `checker install`。菜单第 18 项可安装、检测或单独卸载；命令行也可运行 `vless-reality checker install`，安装节点前可使用 `/root/vless-reality-setup.sh checker install`。安装时，脚本根据 VPS 的 amd64 或 arm64 架构读取官方最新稳定版的 GitHub Release，校验发布信息给出的 SHA-256 后解压并设置执行权限。程序安装在 `/usr/local/bin/reality-checker`，归属记录写入 `/usr/local/bin/.vless-reality-checker-owned`；不会把压缩包留在当前目录。若工具下载失败，已成功安装的节点仍会保留，可稍后重试。
-
-工具的三种检测方式均可从菜单第 18 项进入，也可使用 `vless-reality checker check example.com`、`vless-reality checker batch apple.com tesla.com microsoft.com` 和 `vless-reality checker csv file.csv`。批量域名以空格分隔；CSV 路径可以是当前目录下的文件名或绝对路径。CSV 必须有 `CERT_DOMAIN` 列（也支持单列 `DOMAIN`）；脚本会跳过无效或重复域名，生成三列的临时文件供 RealityChecker 读取，检测结束即删除临时文件。上游 RealityChecker v2.2.3 直接读取 CSV 时固定使用第 3 列；对包含 `IP,ORIGIN,TLS,...,CERT_DOMAIN` 的 RealiTLScanner 文件，直接执行 `reality-checker csv file.csv` 会把 `TLS 1.3` 错当域名。请使用本脚本的 `checker csv` 入口。CSV 转换使用 Python 3，若 VPS 缺少它，首次使用时会安装。用户提供的原 CSV 不会被修改，卸载时也不会删除。
-
-卸载节点时会连同本脚本管理的 RealityChecker 和可识别的暂存目录一起清理；单独运行 `vless-reality checker uninstall` 也可以清理。脚本不会覆盖或删除未带本脚本归属记录的同名程序。如果程序内容在安装后被改动，卸载会停止并提示检查，以免误删其他程序。以前手动执行 `wget`、`unzip` 留在当前目录中的文件不属于脚本管理范围。
 
 ## TCP Fast Open
 
