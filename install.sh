@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.2.1'
+SCRIPT_VERSION='2.2.2'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -55,6 +55,7 @@ SELF_INPUT_DOMAIN=''
 SELF_STARTED=0
 SELF_OPERATION_LOCKED=0
 SELF_POLICY='/usr/sbin/policy-rc.d'
+VLESS_APT_INDEX_READY=0
 SNI_CANDIDATES=(
     www.amazon.com www.samsung.com www.nvidia.com
     digitalassets.tesla.com electronics.sony.com www.xbox.com amd.com
@@ -164,6 +165,14 @@ confirm() {
     done
 }
 
+apt_update_once() {
+    # 仅复用当前执行链中成功刷新的索引；不写磁盘缓存，失败或下次运行仍重新刷新。
+    if (( VLESS_APT_INDEX_READY == 0 )); then
+        apt-get update || return 1
+        VLESS_APT_INDEX_READY=1
+    fi
+    return 0
+}
 ensure_dependencies() {
     need_command apt-get
     local command_name packages=()
@@ -178,7 +187,7 @@ ensure_dependencies() {
     fi
     if (( ${#packages[@]} )); then
         say "安装缺失的基础工具：${packages[*]}"
-        apt-get update
+        apt_update_once || fail '更新软件包索引失败。'
         apt-get install -y "${packages[@]}"
     fi
     for command_name in curl jq unzip openssl ss awk sed sort tr date systemctl sysctl sha256sum getent install timeout dpkg; do
@@ -351,9 +360,54 @@ probe_target_latency() {
     [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$end" -ge "$start" ]] || return 1
     printf '%s' "$((end - start))"
 }
+# 补满 16 个探测名额，完成一个即可补下一个；不再让每批快任务等待同批最慢任务。
+sni_wait_any_supported() {
+    (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) ))
+}
+sni_wait_slot() {
+    local -n pool="$1"
+    local active pid remaining=()
+    if (( ${#pool[@]} < 16 )); then return 0; fi
+    # 旧 Bash 沿用批次等待，避免旧版 wait -n 不支持限定 PID 列表时误等其他子进程。
+    if ! sni_wait_any_supported; then
+        for pid in "${pool[@]}"; do wait "$pid" || true; done
+        pool=()
+        return 0
+    fi
+    while (( ${#pool[@]} >= 16 )); do
+        wait -n "${pool[@]}" 2>/dev/null || true
+        active=" $(jobs -pr) "
+        active="${active//$'\n'/ }"
+        remaining=()
+        for pid in "${pool[@]}"; do
+            if [[ "$active" == *" $pid "* ]]; then remaining+=("$pid");
+            else wait "$pid" 2>/dev/null || true; fi
+        done
+        pool=("${remaining[@]}")
+    done
+}
+sni_probe_round() {
+    local dir="$1" prefix="$2" label="$3" index pid submitted=0 completed reported=0
+    shift 3
+    local total=$# pids=()
+    for index in "$@"; do
+        sni_wait_slot pids
+        completed=$((submitted - ${#pids[@]}))
+        while (( reported + 16 <= completed )); do
+            (( reported += 16 ))
+            say "  已${label} $reported/$total 个域名"
+        done
+        ( exec 7>&- 8>&- 9>&-; probe_target_latency "${SNI_CANDIDATES[index]}" > "$dir/$prefix.$index" ) &
+        pids+=("$!")
+        (( submitted += 1 ))
+    done
+    for pid in "${pids[@]}"; do wait "$pid" || true; done
+    if (( reported < total )); then say "  已${label} $total/$total 个域名"; fi
+    return 0
+}
 select_fastest_sni() {
-    local host first second score index pid line probe_dir count=0
-    local -a pids=() valid_indices=() ranked=() finalists=()
+    local first second score index line probe_dir
+    local -a all_indices=() valid_indices=() ranked=() finalists=()
     say "正在从 VPS 并发初筛 ${#SNI_CANDIDATES[@]} 个域名（TLS 1.3 与证书校验）…"
     probe_dir="$(mktemp -d /tmp/vless-reality-sni.XXXXXX)" || return 1
     if ! printf '%s\n' vless-reality-setup > "$probe_dir/.vless-reality-owned"; then
@@ -361,15 +415,9 @@ select_fastest_sni() {
         return 1
     fi
     for ((index = 0; index < ${#SNI_CANDIDATES[@]}; index++)); do
-        host="${SNI_CANDIDATES[index]}"
-        (probe_target_latency "$host" > "$probe_dir/result.$index") &
-        pids+=("$!")
-        if (( ${#pids[@]} >= 16 || index == ${#SNI_CANDIDATES[@]} - 1 )); then
-            for pid in "${pids[@]}"; do wait "$pid" || true; done
-            pids=()
-            say "  已初筛 $((index + 1))/${#SNI_CANDIDATES[@]} 个域名"
-        fi
+        all_indices+=("$index")
     done
+    sni_probe_round "$probe_dir" result 初筛 "${all_indices[@]}"
     for ((index = 0; index < ${#SNI_CANDIDATES[@]}; index++)); do
         [[ -f "$probe_dir/result.$index" ]] || continue
         first="$(< "$probe_dir/result.$index")"
@@ -381,17 +429,7 @@ select_fastest_sni() {
         return 1
     fi
     say "初筛通过 ${#valid_indices[@]} 个域名；正在并发复测全部可用候选…"
-    for index in "${valid_indices[@]}"; do
-        host="${SNI_CANDIDATES[index]}"
-        (probe_target_latency "$host" > "$probe_dir/result2.$index") &
-        pids+=("$!")
-        count=$((count + 1))
-        if (( ${#pids[@]} >= 16 || count == ${#valid_indices[@]} )); then
-            for pid in "${pids[@]}"; do wait "$pid" || true; done
-            pids=()
-            say "  已复测 $count/${#valid_indices[@]} 个域名"
-        fi
-    done
+    sni_probe_round "$probe_dir" result2 复测 "${valid_indices[@]}"
     for index in "${valid_indices[@]}"; do
         [[ -f "$probe_dir/result2.$index" ]] || continue
         second="$(< "$probe_dir/result2.$index")"
@@ -1787,7 +1825,7 @@ ensure_dns_tool() {
     if ! command -v dig >/dev/null 2>&1; then
         need_command apt-get
         say '安装域名校验工具 dnsutils…'
-        if ! apt-get update || ! apt-get install -y dnsutils; then fail 'DNS 校验工具安装失败，未修改地址设置。'; fi
+        if ! apt_update_once || ! apt-get install -y dnsutils; then fail 'DNS 校验工具安装失败，未修改地址设置。'; fi
     fi
     need_command dig
 }
@@ -1809,21 +1847,47 @@ self_dns_checked_query() {
     warn "失败：$resolver 查询 $domain 的 $type 记录返回 $status；$reason。" >&2
     return 1
 }
-self_dns_check() {
-    local domain="$1" ip resolver output records aaaa cname
+self_dns_resolver_check() {
+    local domain="$1" ip="$2" resolver="$3" output records aaaa cname
+    output="$(self_dns_checked_query "$resolver" "$domain" A)" || return 1
+    cname="$(awk '$4 == "CNAME" {print $5}' <<< "$output")" || return 1
+    [[ -z "$cname" ]] || { warn '失败：连接域名不接受 CNAME，请使用直接指向 VPS 的 A 记录。' >&2; return 1; }
+    records="$(awk '$4 == "A" {print $5}' <<< "$output" | sort -u)" || return 1
+    [[ "$records" == "$ip" ]] || { warn "失败：$resolver 查询 $domain 的 A 记录为 ${records//$'\n'/, }（空白表示无记录），期望唯一 IPv4 $ip；请核对域名、关闭 CDN/Cloudflare 橙云并等待 DNS 生效。" >&2; return 1; }
+    output="$(self_dns_checked_query "$resolver" "$domain" AAAA)" || return 1
+    aaaa="$(awk '$4 == "AAAA" {print $5}' <<< "$output")" || return 1
+    [[ -z "$aaaa" ]] || { warn '失败：此模式只配置 IPv4 入口，请先移除 AAAA 记录，避免 IPv6 连接绕过本机配置。' >&2; return 1; }
+}
+self_dns_check() (
+    local domain="$1" ip first_fd second_fd pid output rc result=0 diagnostic=''
+    # shellcheck disable=SC2034 # EXIT trap 中作为动态文件描述符使用。
+    local fd
+    local fds=() pids=() index resolvers=(1.1.1.1 8.8.8.8)
+    # 管道只携带本次查询结果，无磁盘缓存或新增残留；结束前关闭管道并回收全部检查进程。
+    trap 'rc=$?; trap - EXIT
+        for fd in "${fds[@]}"; do exec {fd}<&-; done
+        for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+        exit "$rc"' EXIT
+    trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
     valid_host "$domain" || { warn '失败：域名格式无效。' >&2; return 1; }
     ip="$(public_ipv4)" || { warn '失败：无法确认本机公网 IPv4。' >&2; return 1; }
-    for resolver in 1.1.1.1 8.8.8.8; do
-        output="$(self_dns_checked_query "$resolver" "$domain" A)" || return 1
-        cname="$(awk '$4 == "CNAME" {print $5}' <<< "$output")"
-        [[ -z "$cname" ]] || { warn '失败：连接域名不接受 CNAME，请使用直接指向 VPS 的 A 记录。' >&2; return 1; }
-        records="$(awk '$4 == "A" {print $5}' <<< "$output" | sort -u)"
-        [[ "$records" == "$ip" ]] || { warn "失败：$resolver 查询 $domain 的 A 记录为 ${records//$'\n'/, }（空白表示无记录），期望唯一 IPv4 $ip；请核对域名、关闭 CDN/Cloudflare 橙云并等待 DNS 生效。" >&2; return 1; }
-        output="$(self_dns_checked_query "$resolver" "$domain" AAAA)" || return 1
-        aaaa="$(awk '$4 == "AAAA" {print $5}' <<< "$output")"
-        [[ -z "$aaaa" ]] || { warn '失败：此模式只配置 IPv4 入口，请先移除 AAAA 记录，避免 IPv6 连接绕过本机配置。' >&2; return 1; }
+    exec {first_fd}< <(exec 7>&- 8>&- 9>&-; if self_dns_resolver_check "$domain" "$ip" 1.1.1.1 2>&1; then printf 'vless-dns-verified\n'; else exit 1; fi) || return 1
+    pids+=("$!"); fds+=("$first_fd")
+    exec {second_fd}< <(exec 7>&- 8>&- 9>&-; if self_dns_resolver_check "$domain" "$ip" 8.8.8.8 2>&1; then printf 'vless-dns-verified\n'; else exit 1; fi) || return 1
+    pids+=("$!"); fds+=("$second_fd")
+    for index in 0 1; do
+        output=''
+        IFS= read -r -d '' output <&"${fds[index]}" || true
+        if wait "${pids[index]}" && [[ "$output" == $'vless-dns-verified\n' ]]; then :;
+        elif (( result == 0 )); then
+            result=1
+            if [[ -n "$output" ]]; then diagnostic="$output";
+            else printf -v diagnostic '失败：%s 的 DNS 检查未完整执行，请重试。\n' "${resolvers[index]}"; fi
+        fi
     done
-}
+    if (( result )); then printf '%s' "$diagnostic" >&2; fi
+    return "$result"
+)
 self_dns_precheck() {
     valid_host "$1" || { warn '失败：只填完整域名，不要带 https://、端口、路径或空格。' >&2; return 1; }
     ensure_dns_tool || return 1
@@ -1889,7 +1953,7 @@ self_extra_dependencies() {
                 created=1
             fi
             trap 'if (( created )); then if self_file_owned "$policy"; then rm -f -- "$policy"; else warn "安装保护文件已被修改，保留：$policy" >&2; fi; fi' EXIT
-            apt-get update && apt-get install -y "${packages[@]}"
+            apt_update_once && apt-get install -y "${packages[@]}"
         ) || return 1
     fi
     for command_name in dig nginx certbot flock; do need_command "$command_name"; done
