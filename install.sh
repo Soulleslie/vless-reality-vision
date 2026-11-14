@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # VLESS + REALITY + Vision 节点管理脚本：Debian/Ubuntu + Xray-core。
 # 请先下载为普通文件后运行，不支持 curl | bash（安装过程需要读取终端输入）。
+# shellcheck disable=SC2030,SC2031 # 自有域名操作用子 shell 隔离状态，持久化通过安装记录重新读取。
 # shellcheck disable=SC2016 # 下方单引号内的 $name 是 jq 变量，不由 Bash 展开。
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='1.6.2'
+SCRIPT_VERSION='2.0.0'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -39,6 +40,18 @@ MANAGER_COPIED=0
 TFO_ENABLED=0
 VLESS_DECRYPTION='none'
 CLIENT_ENCRYPTION='none'
+NODE_MODE='external'
+SELF_DIR='/etc/vless-reality-self'
+SELF_SITE='/etc/nginx/conf.d/vless-reality-self.conf'
+SELF_WEB='/var/www/vless-reality-self'
+SELF_RENEW_SERVICE='/etc/systemd/system/vless-reality-cert.service'
+SELF_RENEW_TIMER='/etc/systemd/system/vless-reality-cert.timer'
+SELF_METHOD=''
+SELF_EMAIL=''
+SELF_CREDENTIALS=''
+SELF_STARTED=0
+SELF_OPERATION_LOCKED=0
+SELF_POLICY='/usr/sbin/policy-rc.d'
 SNI_CANDIDATES=(
     www.amazon.com www.samsung.com www.nvidia.com
     digitalassets.tesla.com electronics.sony.com www.xbox.com amd.com
@@ -412,8 +425,8 @@ valid_vlessenc_mode() {
 vlessenc_pair_mode() {
     local mode
     for mode in native xorpub random; do
-        if [[ "$1" =~ ^mlkem768x25519plus[.]$mode[.]600s[.][A-Za-z0-9_-]+$ \
-            && "$2" =~ ^mlkem768x25519plus[.]$mode[.]0rtt[.][A-Za-z0-9_-]+$ ]]; then
+        if [[ "$1" =~ ^mlkem768x25519plus[.]${mode}[.]600s[.][A-Za-z0-9_-]+$ \
+            && "$2" =~ ^mlkem768x25519plus[.]${mode}[.]0rtt[.][A-Za-z0-9_-]+$ ]]; then
             printf '%s\n' "$mode"
             return 0
         fi
@@ -443,8 +456,8 @@ generate_vless_encryption_pair() {
 write_marker() {
     local tmp
     tmp="$(mktemp "$CONFIG_DIR/.marker.XXXXXX")" || return 1
-    if printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-        "$PORT" "$SNI" "$NODE_NAME" "$SERVER_IP" "$PUBLIC_KEY" "$SHORT_ID" "$CLIENT_ENCRYPTION" > "$tmp" \
+    if printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$PORT" "$SNI" "$NODE_NAME" "$SERVER_IP" "$PUBLIC_KEY" "$SHORT_ID" "$CLIENT_ENCRYPTION" "$NODE_MODE" > "$tmp" \
         && chown root:xray "$tmp" && chmod 640 "$tmp" && mv -f -- "$tmp" "$MARKER"; then
         return 0
     fi
@@ -463,6 +476,9 @@ load_metadata() {
     PUBLIC_KEY="${lines[4]:-}"
     SHORT_ID="${lines[5]:-}"
     CLIENT_ENCRYPTION="${lines[6]:-none}"
+    NODE_MODE="${lines[7]:-external}"
+    case "$NODE_MODE" in external|self) ;; *) fail '安装模式记录无效。' ;; esac
+    [[ "$NODE_MODE" != self || "$PORT" == 443 ]] || fail '自有域名安装记录的端口必须为 443。'
     valid_port "$PORT" || fail '安装记录中的端口无效。'
     valid_host "$SNI" || fail '安装记录中的 SNI 无效。'
     [[ -n "$NODE_NAME" && -n "$SERVER_IP" && -n "$PUBLIC_KEY" && -n "$SHORT_ID" ]] \
@@ -651,7 +667,7 @@ clean_runtime_residue() (
         [[ "$owner" == "$EUID" ]] || continue
         rm -f -- "$entry" || return 1
     done
-    for dir in /tmp/vless-reality-install.?????? /tmp/vless-reality-update.?????? /tmp/vless-reality-sni.??????; do
+    for dir in /tmp/vless-reality-install.?????? /tmp/vless-reality-update.?????? /tmp/vless-reality-sni.?????? /tmp/vless-reality-client.??????; do
         [[ -d "$dir" && ! -L "$dir" ]] || continue
         owner="$(stat -c %u -- "$dir")" || return 1
         if [[ "$owner" != "$EUID" ]]; then
@@ -663,7 +679,8 @@ clean_runtime_residue() (
             warn "临时目录没有本脚本的标记，已保留：$dir" >&2
             continue
         fi
-        for file in release.json xray.zip xray xray.old; do
+        if [[ "$dir" == /tmp/vless-reality-client.?????? ]]; then stop_client_residue "$dir" || return 1; fi
+        for file in release.json xray.zip xray xray.old client.json client.log test.log client.pid; do
             entry="$dir/$file"
             [[ -f "$entry" && ! -L "$entry" ]] || continue
             rm -f -- "$entry" || return 1
@@ -685,22 +702,27 @@ finish_install() {
     if (( INSTALL_COMMITTED == 0 )); then
         if (( INSTALL_STARTED )); then
             warn '安装未完成，正在撤销本次创建的服务和文件…' >&2
-            if ! purge_node_files; then
-                cleanup_ok=0
-                warn '自动回滚未完成；已保留管理脚本，请检查 Xray 服务和节点文件。' >&2
-            fi
+            if ! purge_node_files; then cleanup_ok=0; fi
         fi
-        if (( MANAGER_COPIED && cleanup_ok )); then rm -f -- "$MANAGER" || true; fi
+        if (( SELF_STARTED )); then
+            if ! self_cleanup; then cleanup_ok=0; fi
+        fi
+        if (( cleanup_ok )); then
+            if (( MANAGER_COPIED )); then rm -f -- "$MANAGER" || true; fi
+        else
+            warn '自动回滚未完成；已保留管理脚本和可用的归属记录，请检查服务并重试卸载。' >&2
+        fi
     fi
     [[ -z "$TEMP_DIR" ]] || rm -rf -- "$TEMP_DIR"
     return "$result"
 }
 
 write_config() {
-    local uuid="$1" private_key="$2"
+    local uuid="$1" private_key="$2" target="${SNI}:443"
+    [[ "$NODE_MODE" != self ]] || target=127.0.0.1:8443
     jq -n \
         --arg uuid "$uuid" --arg privateKey "$private_key" --arg shortId "$SHORT_ID" \
-        --arg sni "$SNI" --arg decryption "$VLESS_DECRYPTION" --argjson port "$PORT" --argjson tfo "$TFO_ENABLED" '
+        --arg target "$target" --arg sni "$SNI" --arg decryption "$VLESS_DECRYPTION" --argjson port "$PORT" --argjson tfo "$TFO_ENABLED" '
         {
           log: {loglevel: "warning"},
           inbounds: [{
@@ -717,7 +739,7 @@ write_config() {
               sockopt: {tcpFastOpen: ($tfo == 1)},
               realitySettings: {
                 show: false,
-                target: ($sni + ":443"),
+                target: $target,
                 xver: 0,
                 serverNames: [$sni],
                 privateKey: $privateKey,
@@ -819,14 +841,19 @@ install_node() {
     port_free "$PORT" || fail "本机 TCP $PORT 已被占用。"
     SERVER_IP="$(public_ipv4)" || fail '无法查询此 VPS 的公网 IPv4。'
     step '[2/5] 验证 REALITY 伪装站点…'
-    target_tls_ok "$SNI" || fail "$SNI:443 未通过 TLS 1.3 与证书校验，请更换可从本机访问的伪装域名。"
-    ok "伪装站点可用：$SNI:443（TLS 1.3）"
+    if [[ "$NODE_MODE" == self ]]; then
+        self_preflight
+    else
+        target_tls_ok "$SNI" || fail "$SNI:443 未通过 TLS 1.3 与证书校验，请更换可从本机访问的伪装域名。"
+        ok "伪装站点可用：$SNI:443（TLS 1.3）"
+    fi
 
     trap finish_install EXIT
     save_manager
     TEMP_DIR="$(mktemp -d /tmp/vless-reality-install.XXXXXX)"
     printf 'vless-reality-setup\n' > "$TEMP_DIR/.vless-reality-owned"
     INSTALL_STARTED=1
+    if [[ "$NODE_MODE" == self ]]; then self_prepare; fi
     step '[3/5] 下载并校验 Xray-core 官方稳定版…'
     local asset archive
     asset="$(arch_asset)"
@@ -896,6 +923,9 @@ EOF
     systemctl daemon-reload
     systemctl enable --now xray
     wait_service 10 || fail "Xray 未正常监听 TCP $PORT；请查看 journalctl -u xray。"
+    if [[ "$NODE_MODE" == self ]]; then
+        check_self || fail '自有域名最终检查失败；安装将回滚。'
+    fi
     show_node
     ensure_shortcut || true
     INSTALL_COMMITTED=1
@@ -909,13 +939,14 @@ EOF
 show_node() {
     need_root
     load_metadata
-    local uuid label link tmp enc_param tfo_param=''
+    local uuid label link tmp address="$SERVER_IP" enc_param tfo_param=''
     uuid="$(config_uuid)" || fail '无法从配置读取 UUID。'
     label="$(jq -rn --arg v "$NODE_NAME" '$v | @uri')" || return 1
     enc_param="$(jq -rn --arg v "$CLIENT_ENCRYPTION" '$v | @uri')" || return 1
     # tfo 是部分客户端识别的扩展参数；服务端开关仍以 Xray 配置为准。
     if config_tfo_enabled; then tfo_param='&tfo=1'; fi
-    link="vless://${uuid}@${SERVER_IP}:${PORT}?encryption=${enc_param}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none${tfo_param}#${label}"
+    [[ "$NODE_MODE" != self ]] || address="$SNI"
+    link="vless://${uuid}@${address}:${PORT}?encryption=${enc_param}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none${tfo_param}#${label}"
     tmp="$(mktemp "${LINK_FILE}.XXXXXX")" || return 1
     if ! printf '%s\n' "$link" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$LINK_FILE"; then
         rm -f -- "$tmp"
@@ -937,7 +968,9 @@ status_node() {
     version="$(installed_version)"
     say "服务状态：$state"
     say "Xray 版本：${version:-未知}"
+    say "安装模式：$NODE_MODE"
     say "监听地址：${SERVER_IP}:${PORT}/TCP"
+    [[ "$NODE_MODE" != self ]] || say "节点地址：${SNI}:443"
     say "REALITY SNI：${SNI}:443"
     flow="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.clients[0].flow][0] // empty' "$CONFIG" 2>/dev/null || true)"
     if [[ "$flow" == xtls-rprx-vision ]]; then
@@ -956,10 +989,15 @@ status_node() {
     if config_ok; then ok '配置检查：通过'; else warn '配置检查：失败'; fi
     if [[ -n "$(ss -H -ltn "sport = :$PORT" 2>/dev/null)" ]]; then ok '端口监听：正常'; else warn '端口监听：未发现'; fi
     current_ip="$(public_ipv4 || true)"
-    if [[ -n "$current_ip" && "$current_ip" != "$SERVER_IP" ]]; then
+    if [[ "$NODE_MODE" == self && -n "$current_ip" && "$current_ip" != "$SERVER_IP" ]]; then
+        warn "公网 IPv4 已变化为 $current_ip；请核对域名 A 记录，Address 保持 $SNI。"
+    elif [[ -n "$current_ip" && "$current_ip" != "$SERVER_IP" ]]; then
         warn "公网 IPv4 已变化：当前 $current_ip，链接中仍为 $SERVER_IP；请运行 $(cmd_name) refresh-ip。"
     fi
-    if target_tls_ok "$SNI"; then ok '伪装站点：TLS 1.3 正常'; else warn '伪装站点：当前验证失败'; fi
+    if [[ "$NODE_MODE" == self ]]; then
+        if self_tls_check "$SNI" 127.0.0.1:8443; then ok '本地网站：TLS 1.3 / X25519 / H2 正常'; else warn '本地网站验证失败'; fi
+        cert_status
+    elif target_tls_ok "$SNI"; then ok '伪装站点：TLS 1.3 正常'; else warn '伪装站点：当前验证失败'; fi
     if config_tfo_enabled && kernel_tfo_server; then
         ok 'TCP Fast Open：已开启（Xray 与内核均生效）'
     elif config_tfo_enabled || tfo_sysctl_is_ours; then
@@ -1014,6 +1052,7 @@ commit_change() {
 
 tfo_apply() {
     need_root
+    self_operation_lock
     [[ $# -eq 1 ]] || fail "用法：$(cmd_name) tfo [on|off]"
     load_metadata
     need_command sysctl
@@ -1115,6 +1154,7 @@ tfo_node() {
 
 vlessenc_apply() {
     need_root
+    self_operation_lock
     [[ $# -ge 1 && $# -le 2 ]] || fail '用法：vlessenc on [native|xorpub|random] 或 vlessenc off'
     load_metadata
     local action="$1" mode="${2:-}" current_mode='' backup was_active=0 old_port="$PORT" server_enc pair=()
@@ -1221,8 +1261,10 @@ vlessenc_node() {
 
 change_port() {
     need_root
+    self_operation_lock
     [[ $# -le 1 ]] || fail "用法：$(cmd_name) port [新端口]"
     load_metadata
+    [[ "$NODE_MODE" != self ]] || fail '自有域名模式固定使用 TCP 443；端口修改只适用于普通模式。'
     local raw="${1:-}" old_port="$PORT" backup was_active=0
     if [[ -z "$raw" ]]; then
         [[ -t 0 ]] || fail '非交互运行时请指定新端口。'
@@ -1249,6 +1291,7 @@ change_sni() {
     need_root
     [[ $# -le 1 ]] || fail "用法：$(cmd_name) sni [新域名]"
     load_metadata
+    if [[ "$NODE_MODE" == self ]]; then change_self_domain "$@"; return; fi
     local new="${1:-}" old_port="$PORT" old_sni="$SNI" backup was_active=0 auto_sni=0
     if [[ -z "$new" ]]; then
         [[ -t 0 ]] || fail '非交互运行时请指定新伪装域名。'
@@ -1288,6 +1331,7 @@ change_sni() {
 
 change_uuid() {
     need_root
+    self_operation_lock
     load_metadata
     local new old_port="$PORT" backup was_active=0
     new="$($XRAY_BIN uuid)"
@@ -1302,6 +1346,7 @@ change_uuid() {
 
 rotate_keys() {
     need_root
+    self_operation_lock
     load_metadata
     local key_lines private old_port="$PORT" backup was_active=0
     mapfile -t key_lines < <(generate_reality_keys)
@@ -1325,6 +1370,7 @@ rotate_keys() {
 
 rename_node() {
     need_root
+    self_operation_lock
     [[ $# -le 1 ]] || fail "用法：$(cmd_name) rename [新名称]"
     load_metadata
     local new="${1:-}"
@@ -1341,7 +1387,13 @@ rename_node() {
 
 refresh_ip() {
     need_root
+    self_operation_lock
     load_metadata
+    if [[ "$NODE_MODE" == self ]]; then
+        self_dns_check "$SNI" || fail 'DNS 未指向当前 VPS；请手动更新 DNS。节点地址仍使用域名。'
+        ok '自有域名 DNS 检查通过；节点 Address 保持域名。'
+        return 0
+    fi
     local ip
     ip="$(public_ipv4)" || fail '无法查询当前公网 IPv4。'
     if [[ "$ip" == "$SERVER_IP" ]]; then ok "公网 IPv4 未变化：$ip"; return 0; fi
@@ -1353,6 +1405,7 @@ refresh_ip() {
 
 update_xray() {
     need_root
+    self_operation_lock
     load_metadata
     ensure_dependencies
     local current asset archive candidate backup was_active=0
@@ -1404,21 +1457,21 @@ update_xray() {
 }
 
 start_node() {
-    need_root; load_metadata
+    need_root; self_operation_lock; load_metadata
     if systemctl is-active --quiet xray; then ok '服务已在运行。'; return 0; fi
     systemctl start xray || fail '启动失败，请查看日志。'
     wait_service 10 || fail '服务已启动但端口未正常监听，请查看日志。'
     ok '服务已启动。'
 }
 stop_node() {
-    need_root; load_metadata
+    need_root; self_operation_lock; load_metadata
     if ! systemctl is-active --quiet xray; then ok '服务已经停止。'; return 0; fi
     if [[ -t 0 ]] && ! confirm '停止后节点将无法连接，确定停止？[y/N]：'; then say '已取消。'; return 0; fi
     systemctl stop xray
     ok '服务已停止。'
 }
 restart_node() {
-    need_root; load_metadata
+    need_root; self_operation_lock; load_metadata
     config_ok || fail '配置检查失败，未重启。'
     systemctl restart xray || fail '重启失败，请查看日志。'
     wait_service 10 || fail '重启后端口未正常监听，请查看日志。'
@@ -1434,6 +1487,8 @@ log_node() {
 
 uninstall_node() {
     need_root
+    self_operation_lock
+    if [[ -e "$SELF_DIR" ]]; then self_cleanup_preflight || fail '自有域名资源已改变或被共享，卸载已停止以保护数据。'; fi
     if [[ ! -e "$MARKER" && ! -L "$MARKER" ]]; then
         [[ ! -e "$SERVICE" && ! -e "$XRAY_BIN" && ! -e "$CONFIG" && ! -e "$LINK_FILE" ]] \
             || fail '安装记录已不存在，但仍发现 Xray 文件；无法确认归属，已停止。'
@@ -1451,12 +1506,13 @@ uninstall_node() {
             shortcut_is_ours || fail '快捷命令不属于本脚本，未删除。'
         fi
         if [[ ! -e "$MANAGER" && ! -e "$SHORTCUT" ]] \
-            && ! tfo_sysctl_is_ours && ! checker_marker_is_ours; then
+            && ! tfo_sysctl_is_ours && ! checker_marker_is_ours && [[ ! -e "$SELF_DIR" ]]; then
             fail '没有发现本脚本的残留文件。'
         fi
-        confirm '节点记录已不存在，清理本脚本的残留管理入口和 TFO 设置？[y/N]：' \
+        confirm '节点记录已不存在，清理本脚本的残留入口、网站/证书和 TFO 设置？[y/N]：' \
             || { say '已取消清理。'; return 0; }
         checker_cleanup_preflight || fail 'RealityChecker 程序已改变，未继续清理。'
+        self_cleanup || fail '清理自有域名资源失败。'
         remove_checker || fail '清理 RealityChecker 失败。'
         disable_kernel_tfo || fail '清理残留 TFO 设置失败。'
         clean_runtime_residue || fail '清理临时文件失败。'
@@ -1480,6 +1536,7 @@ uninstall_node() {
         fail '发现运行中的 xray 服务，但本脚本的服务文件已不存在；未继续删除。'
     fi
     systemctl is-active --quiet xray && fail 'Xray 仍在运行，未继续删除文件。'
+    self_cleanup || fail '自有域名资源未清理；保留节点安装记录以便重试。'
     remove_checker || fail '删除 RealityChecker 失败；保留节点安装记录以便重试。'
     disable_kernel_tfo || fail '恢复内核 TCP Fast Open 设置失败；保留节点文件以便重试。'
     rm -f -- "$SERVICE" || fail '删除 systemd 服务文件失败。'
@@ -1511,6 +1568,754 @@ uninstall_node() {
     ok '节点和本脚本创建的文件已清理。云安全组规则、客户端节点、基础工具和系统日志未改动。'
 }
 
+# 自有域名模式：全部逻辑内嵌，保持单文件下载部署。
+self_exists() { [[ -f "$SELF_DIR/.owned" && ! -L "$SELF_DIR/.owned" && ! -L "$SELF_DIR" && "$(stat -c %u "$SELF_DIR")" == 0 && "$(stat -c %a "$SELF_DIR")" == 700 && "$(< "$SELF_DIR/.owned")" == vless-reality-self-v1 ]]; }
+self_operation_lock() {
+    if self_exists && (( SELF_OPERATION_LOCKED == 0 )); then
+        exec 9> "$SELF_DIR/operation.lock" || fail '无法锁定自有域名操作。'
+        flock -x 9 || fail '无法取得自有域名操作锁。'
+        SELF_OPERATION_LOCKED=1
+    fi
+}
+self_track() {
+    local path="$1" source="${2:-$1}" tmp digest
+    [[ -f "$source" && ! -L "$source" ]] || return 1
+    tmp="$(mktemp "$SELF_DIR/.receipt.XXXXXX")" || return 1
+    if [[ -f "$SELF_DIR/files.sha256" ]]; then
+        awk -v path="$path" 'substr($0,67) != path' "$SELF_DIR/files.sha256" > "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    digest="$(sha256sum -- "$source" | awk '{print $1}')" || { rm -f "$tmp"; return 1; }
+    printf '%s  %s\n' "$digest" "$path" >> "$tmp" && mv -f -- "$tmp" "$SELF_DIR/files.sha256"
+}
+self_publish() {
+    local source="$1" destination="$2" mode="$3"
+    chmod "$mode" "$source" && self_track "$destination" "$source" && mv -f -- "$source" "$destination"
+}
+self_file_owned() {
+    local path="$1" expected
+    [[ ! -e "$path" && ! -L "$path" ]] && return 0
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    expected="$(awk -v path="$path" 'substr($0,67) == path {print substr($0,1,64)}' "$SELF_DIR/files.sha256")"
+    [[ -n "$expected" && "$(sha256sum -- "$path" | awk '{print $1}')" == "$expected" ]]
+}
+self_state() { jq -r --arg key "$1" 'if has($key) then .[$key] else error("missing state field") end' "$SELF_DIR/state.json"; }
+self_dns_query() { dig "@$1" "$2" "$3" +time=4 +tries=1 +noall +answer +comments; }
+self_dns_check() {
+    local domain="$1" ip resolver output records aaaa cname
+    valid_host "$domain" || { warn '失败：域名格式无效。' >&2; return 1; }
+    ip="$(public_ipv4)" || { warn '失败：无法确认本机公网 IPv4。' >&2; return 1; }
+    for resolver in 1.1.1.1 8.8.8.8; do
+        output="$(self_dns_query "$resolver" "$domain" A)" || return 1
+        [[ "$output" == *'status: NOERROR'* ]] || { warn "失败：$resolver 返回 DNS 错误。" >&2; return 1; }
+        cname="$(awk '$4 == "CNAME" {print $5}' <<< "$output")"
+        [[ -z "$cname" ]] || { warn '失败：自有域名模式不接受 CNAME，请使用直接指向 VPS 的 A 记录。' >&2; return 1; }
+        records="$(awk '$4 == "A" {print $5}' <<< "$output" | sort -u)"
+        [[ "$records" == "$ip" ]] || { warn '失败：A 记录不是唯一的当前 VPS IPv4；请关闭 CDN/Cloudflare 橙云并等待 DNS 生效。' >&2; return 1; }
+        output="$(self_dns_query "$resolver" "$domain" AAAA)" || return 1
+        [[ "$output" == *'status: NOERROR'* ]] || return 1
+        aaaa="$(awk '$4 == "AAAA" {print $5}' <<< "$output")"
+        [[ -z "$aaaa" ]] || { warn '失败：此模式只配置 IPv4 入口，请先移除 AAAA 记录，避免 IPv6 连接绕过本机配置。' >&2; return 1; }
+    done
+}
+self_cloudflare_zone() {
+    local zone="$1" ns
+    while [[ "$zone" == *.* ]]; do
+        ns="$(dig @1.1.1.1 "$zone" NS +short +time=4 +tries=1)" || return 1
+        if [[ -n "$ns" ]]; then
+            while IFS= read -r ns; do [[ "$ns" == *.ns.cloudflare.com. ]] || return 1; done <<< "$ns"
+            return 0
+        fi
+        zone="${zone#*.}"
+    done
+    return 1
+}
+self_extra_dependencies() {
+    local packages=() command_name
+    command -v dig >/dev/null || packages+=(dnsutils)
+    command -v nginx >/dev/null || packages+=(nginx)
+    command -v certbot >/dev/null || packages+=(certbot)
+    if [[ "$SELF_METHOD" == cloudflare ]] && ! dpkg-query -W -f='${Status}' python3-certbot-dns-cloudflare 2>/dev/null | grep -q 'install ok installed'; then
+        packages+=(python3-certbot-dns-cloudflare)
+    fi
+    if (( ${#packages[@]} )); then
+        # 防止新安装的 Nginx 在写入安全配置前自动暴露默认 80 站点。
+        (
+            local policy="$SELF_POLICY" created=0
+            if ! command -v nginx >/dev/null; then
+                [[ ! -e "$policy" && ! -L "$policy" ]] || fail '已有 policy-rc.d；请先通过系统包管理器安装 nginx，再运行自有域名安装。'
+                printf '#!/bin/sh\n# vless-reality-self package guard\nexit 101\n' > "$policy"
+                chmod 755 "$policy"
+                self_track "$policy" || exit 1
+                # shellcheck disable=SC2034 # 由 EXIT trap 读取。
+                created=1
+            fi
+            trap 'if (( created )); then if self_file_owned "$policy"; then rm -f -- "$policy"; else warn "安装保护文件已被修改，保留：$policy" >&2; fi; fi' EXIT
+            apt-get update && apt-get install -y "${packages[@]}"
+        ) || return 1
+    fi
+    for command_name in dig nginx certbot flock; do need_command "$command_name"; done
+}
+self_preflight() {
+    local path
+    [[ "$PORT" == 443 ]] || fail '自有域名模式必须使用 TCP 443。'
+    port_free 443 || fail 'TCP 443 已被占用。'
+    port_free 8443 || fail 'TCP 8443 已被占用；不会覆盖已有网站。'
+    for path in "$SELF_DIR" "$SELF_SITE" "$SELF_WEB" "$SELF_RENEW_SERVICE" "$SELF_RENEW_TIMER" "${SELF_RENEW_SERVICE%.service}-alert.service"; do
+        [[ ! -e "$path" && ! -L "$path" ]] || fail "已有资源 $path；为保护现有文件，已停止。"
+    done
+    for path in vless-reality-cert.service vless-reality-cert.timer vless-reality-cert-alert.service; do
+        if systemctl cat "$path" >/dev/null 2>&1; then fail "已存在 $path，未覆盖其他服务。"; fi
+    done
+    [[ "$SELF_METHOD" == cloudflare || "$SELF_METHOD" == http ]] || fail '证书方式只能为 cloudflare 或 http。'
+    [[ "$SELF_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}$ ]] || fail '请输入有效的 LE 通知邮箱。'
+    if [[ "$SELF_METHOD" == http ]]; then
+        port_free 80 || fail 'HTTP-01 需要独占 TCP 80；当前已被占用，请改用 DNS-01。'
+    fi
+}
+self_nginx_write() {
+    local domain="$1" tls="${2:-yes}" http_domain="${3:-$1}" version h2listen='http2' h2directive='' tmp
+    version="$(nginx -v 2>&1 | sed -n 's|.*nginx/\([0-9.]*\).*|\1|p')"
+    dpkg --compare-versions "$version" ge 1.19.4 || return 1
+    if dpkg --compare-versions "$version" ge 1.25.1; then h2listen=''; h2directive='http2 on;'; fi
+    tmp="$(mktemp "$SELF_DIR/work/nginx.XXXXXX")" || return 1
+    {
+        printf '# vless-reality-self managed site\n'
+        if [[ "$SELF_METHOD" == http ]]; then
+            cat <<EOF
+server {
+    listen 80 default_server;
+    server_name _;
+    return 444;
+}
+server {
+    listen 80;
+    server_name $http_domain;
+    location ^~ /.well-known/acme-challenge/ { root $SELF_WEB; default_type text/plain; }
+    location / { return 404; }
+}
+EOF
+        fi
+        if [[ "$tls" == yes ]]; then
+            cat <<EOF
+server {
+    listen 127.0.0.1:8443 ssl $h2listen default_server;
+    $h2directive
+    server_name _;
+    ssl_protocols TLSv1.3;
+    ssl_ecdh_curve X25519:prime256v1;
+    ssl_reject_handshake on;
+}
+server {
+    listen 127.0.0.1:8443 ssl $h2listen;
+    $h2directive
+    server_name $domain;
+    ssl_protocols TLSv1.3;
+    ssl_ecdh_curve X25519:prime256v1;
+    ssl_certificate $SELF_DIR/acme/live/$domain/fullchain.pem;
+    ssl_certificate_key $SELF_DIR/acme/live/$domain/privkey.pem;
+    server_tokens off;
+    root $SELF_WEB;
+    index index.html;
+    client_max_body_size 16k;
+    client_header_timeout 10s;
+    client_body_timeout 10s;
+    keepalive_timeout 15s;
+    access_log off;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+    add_header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'" always;
+    if (\$ssl_server_name != "$domain") { return 444; }
+    location / { limit_except GET HEAD { deny all; } try_files \$uri \$uri/ =404; }
+    location ~ /\. { deny all; }
+}
+EOF
+        fi
+    } > "$tmp"
+    self_publish "$tmp" "$SELF_SITE" 644
+}
+self_nginx_apply() { nginx -t && { if systemctl is-active --quiet nginx; then systemctl reload nginx; else systemctl start nginx; fi; }; }
+self_site_write() {
+    install -d -m 755 "$SELF_WEB"
+    cat > "$SELF_WEB/index.html" <<'HTML'
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>小径 · 留白</title><style>*{box-sizing:border-box}body{margin:0;background:#f3f0e9;color:#23382e;font:18px/1.8 system-ui,sans-serif}main{max-width:1050px;margin:auto;padding:12vh 7vw}small{letter-spacing:.2em}h1{font-size:clamp(48px,8vw,100px);line-height:1.15;font-weight:500;letter-spacing:-.06em}p{max-width:550px;color:#55665b}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:28px;margin-top:70px;border-top:1px solid #ccd2c8;padding-top:30px}article{font-size:15px}footer{margin-top:90px;font-size:13px;color:#778577}</style><main><small>FIELD NOTES / 日常观察</small><h1>走慢一点，<br>看见更多。</h1><p>这里记录微小而值得留意的事：清晨的光、窗边的植物，以及一段安静的阅读时间。</p><section class="grid"><article><b>01 / 自然</b><p>在四季之间，收集新的颜色。</p></article><article><b>02 / 阅读</b><p>给好奇心留下一页空白。</p></article><article><b>03 / 生活</b><p>把日常过成喜欢的样子。</p></article></section><footer>小径 · 留白 — 一个关于观察与生活的静态空间</footer></main></html>
+HTML
+    chmod 644 "$SELF_WEB/index.html"
+    self_track "$SELF_WEB/index.html"
+}
+self_scrub_logs() {
+    [[ -f "$SELF_DIR/cloudflare.ini" ]] || return 0
+    python3 - "$SELF_DIR" <<'PY_SCRUB'
+import pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+m = re.search(r"^dns_cloudflare_api_token\s*=\s*(\S+)", (root / "cloudflare.ini").read_text(), re.M)
+if m:
+    token = m.group(1).encode()
+    for p in (root / "logs").rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            data = p.read_bytes()
+            if token in data:
+                p.write_bytes(data.replace(token, b"[REDACTED]"))
+PY_SCRUB
+}
+self_http_challenge_check() {
+    local domain="$1" ip="$2" path result=0
+    path="$(openssl rand -hex 16)" || return 1
+    install -d -m 755 "$SELF_WEB/.well-known/acme-challenge" || return 1
+    printf '%s' "$path" > "$SELF_WEB/.well-known/acme-challenge/$path" || return 1
+    chmod 644 "$SELF_WEB/.well-known/acme-challenge/$path" || return 1
+    [[ "$(curl --noproxy '*' -fsS --max-time 10 --resolve "$domain:80:$ip" "http://$domain/.well-known/acme-challenge/$path")" == "$path" ]] || result=1
+    rm -f "$SELF_WEB/.well-known/acme-challenge/$path" || return 1
+    return "$result"
+}
+self_managed_paths_ok() {
+    self_exists || return 1
+    local path
+    for path in "$SELF_DIR/acme" "$SELF_DIR/work" "$SELF_DIR/logs"; do
+        [[ -d "$path" && ! -L "$path" && "$(stat -c %u "$path")" == 0 ]] || return 1
+    done
+    [[ -f "$SELF_DIR/state.json" ]] && self_file_owned "$SELF_DIR/state.json" || return 1
+    if [[ -e "$SELF_DIR/cloudflare.ini" || -L "$SELF_DIR/cloudflare.ini" ]]; then
+        self_file_owned "$SELF_DIR/cloudflare.ini" && [[ "$(stat -c %a "$SELF_DIR/cloudflare.ini")" == 600 ]] || return 1
+    fi
+}
+self_certbot() {
+    self_managed_paths_ok || { warn '证书目录或凭据归属异常，已停止 Certbot 操作。' >&2; return 1; }
+    local result=0
+    certbot "$@" --config "$SELF_DIR/cli.ini" --config-dir "$SELF_DIR/acme" --work-dir "$SELF_DIR/work" --logs-dir "$SELF_DIR/logs" || result=$?
+    self_scrub_logs || return 1
+    return "$result"
+}
+self_issue_cert() {
+    local domain="$1" args=()
+    if [[ "$SELF_METHOD" == cloudflare ]]; then
+        self_cloudflare_zone "$domain" || { warn '域名的权威 DNS 不是 Cloudflare；请改用 HTTP-01 或独立 DNS 插件。' >&2; return 1; }
+        args=(--dns-cloudflare --dns-cloudflare-credentials "$SELF_DIR/cloudflare.ini" --dns-cloudflare-propagation-seconds 60)
+    else
+        args=(--webroot --webroot-path "$SELF_WEB")
+    fi
+    self_certbot certonly --non-interactive --agree-tos --email "$SELF_EMAIL" \
+        --server https://acme-v02.api.letsencrypt.org/directory --cert-name "$domain" -d "$domain" \
+        --key-type ecdsa "${args[@]}" > "$SELF_DIR/logs/issue.log" 2>&1
+}
+self_tls_check() {
+    local domain="$1" address="$2" output
+    output="$(timeout 15 openssl s_client -connect "$address" -servername "$domain" -tls1_3 -groups X25519 \
+        -alpn h2 -verify_hostname "$domain" -verify_return_error -CApath /etc/ssl/certs </dev/null 2>&1)" || return 1
+    [[ "$output" == *'Verify return code: 0 (ok)'* && "$output" == *'TLSv1.3'* \
+        && "$output" == *'X25519'* && "$output" == *'ALPN protocol: h2'* ]]
+}
+self_loaded_cert_matches() {
+    local domain="$1" loaded disk
+    loaded="$(timeout 15 openssl s_client -connect 127.0.0.1:8443 -servername "$domain" -tls1_3 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256)" || return 1
+    disk="$(openssl x509 -in "$SELF_DIR/acme/live/$domain/cert.pem" -noout -fingerprint -sha256)" || return 1
+    [[ "$loaded" == "$disk" ]]
+}
+self_http_check() {
+    local domain="$1" address="$2" port="$3" result
+    result="$(curl --noproxy '*' --http2 --tlsv1.3 --tls-max 1.3 -fsS --connect-timeout 5 --max-time 15 \
+        --resolve "$domain:$port:$address" -o /dev/null -w '%{http_version} %{http_code}' "https://$domain:$port/")" || return 1
+    [[ "$result" == '2 200' ]]
+}
+self_wait_tls() {
+    local attempt
+    for attempt in {1..10}; do
+        if self_tls_check "$1" 127.0.0.1:8443 && self_loaded_cert_matches "$1" && self_http_check "$1" 127.0.0.1 8443; then return 0; fi
+        sleep 1
+    done
+    return 1
+}
+self_listener_check() {
+    local lines
+    lines="$(ss -H -ltn 'sport = :8443')" || return 1
+    [[ -n "$lines" ]] || return 1
+    awk '$4 != "127.0.0.1:8443" {bad=1} END {exit bad}' <<< "$lines"
+}
+self_reload_hook_write() {
+    install -d -m 700 "$SELF_DIR/acme/renewal-hooks/deploy"
+    cat > "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" <<'HOOK'
+#!/bin/sh
+# vless-reality-self deploy hook
+set -eu
+nginx -t
+systemctl reload nginx
+HOOK
+    chmod 700 "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx"
+    self_track "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx"
+}
+self_timer_write() {
+    cat > "$SELF_DIR/work/cert.service" <<EOF
+# vless-reality-self managed unit
+[Unit]
+Description=Renew isolated VLESS REALITY website certificate
+After=network-online.target nginx.service
+Wants=network-online.target
+OnFailure=vless-reality-cert-alert.service
+[Service]
+Type=oneshot
+UMask=0077
+TimeoutStartSec=20min
+ExecStart=/bin/bash $MANAGER __cert-renew
+EOF
+    self_publish "$SELF_DIR/work/cert.service" "$SELF_RENEW_SERVICE" 644 || return 1
+    cat > "$SELF_DIR/work/cert.timer" <<'EOF'
+# vless-reality-self managed unit
+[Unit]
+Description=VLESS REALITY isolated certificate renewal
+[Timer]
+OnCalendar=*-*-* 03,15:00:00
+RandomizedDelaySec=3600
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+    self_publish "$SELF_DIR/work/cert.timer" "$SELF_RENEW_TIMER" 644 || return 1
+    cat > "$SELF_DIR/work/cert-alert.service" <<EOF
+# vless-reality-self managed unit
+[Unit]
+Description=VLESS REALITY certificate alert
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $MANAGER __cert-alert
+EOF
+    self_publish "$SELF_DIR/work/cert-alert.service" "${SELF_RENEW_SERVICE%.service}-alert.service" 644 || return 1
+    systemctl daemon-reload && systemctl enable --now vless-reality-cert.timer
+}
+self_cert_alert() {
+    need_root
+    self_exists || return 1
+    local domain hook=/etc/vless-reality-cert-alert
+    domain="$(self_state domain)" || return 1
+    logger -p daemon.err -t vless-reality-cert -- "证书到期预警或续期失败：$domain；请检查 journalctl -u vless-reality-cert。"
+    if [[ -x "$hook" && -f "$hook" && ! -L "$hook" && "$(stat -c %u "$hook")" == 0 \
+        && "$(stat -c %a "$hook")" =~ ^[57]00$ ]]; then "$hook" "$domain"; fi
+}
+self_cert_renew() (
+    need_root
+    self_exists || return 1
+    exec 8> "$SELF_DIR/operation.lock"; flock -x 8 || return 1
+    local domain rc=0
+    domain="$(self_state domain)" || return 1
+    self_certbot renew --non-interactive --quiet --cert-name "$domain" > "$SELF_DIR/logs/renew.log" 2>&1 || rc=1
+    if ! self_wait_tls "$domain"; then rc=1; fi
+    if ! openssl x509 -in "$SELF_DIR/acme/live/$domain/cert.pem" -checkend 1209600 -noout; then
+        self_cert_alert
+        rc=1
+    fi
+    local result=passed tmp
+    (( rc == 0 )) || result=failed
+    tmp="$(mktemp "$SELF_DIR/.renew.XXXXXX")" || return 1
+    jq -n --arg domain "$domain" --arg result "$result" --arg time "$(date -u +%FT%TZ)" \
+        '{domain:$domain,result:$result,time:$time}' > "$tmp" && mv "$tmp" "$SELF_DIR/renew-status.json"
+    if (( rc )); then logger -p daemon.err -t vless-reality-cert -- "证书续期失败：$domain；请以 root 检查项目私有日志。"; fi
+    return "$rc"
+)
+self_renew_test() {
+    local domain="$1" result=failed tmp
+    [[ -x "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" ]] && self_file_owned "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" && self_certbot renew --dry-run --non-interactive --cert-name "$domain" > "$SELF_DIR/logs/renew-test.log" 2>&1 \
+        && "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" >> "$SELF_DIR/logs/renew-test.log" 2>&1 \
+        && self_wait_tls "$domain" && result=passed
+    tmp="$(mktemp "$SELF_DIR/.renew.XXXXXX")" || return 1
+    jq -n --arg domain "$domain" --arg result "$result" --arg date "$(date -u +%FT%TZ)" \
+        '{domain:$domain,result:$result,time:$date}' > "$tmp" && mv -f "$tmp" "$SELF_DIR/renew-test.json"
+    [[ "$result" == passed ]]
+}
+cert_status() {
+    self_exists || { warn '未发现本脚本的自有域名证书。'; return 1; }
+    local domain
+    domain="$(self_state domain)" || return 1
+    say "证书域名：$domain"
+    openssl x509 -in "$SELF_DIR/acme/live/$domain/cert.pem" -noout -issuer -enddate -checkhost "$domain" || return 1
+    if systemctl is-enabled --quiet vless-reality-cert.timer && systemctl is-active --quiet vless-reality-cert.timer; then
+        ok '续期任务：已启用且运行中（每日两次，带随机延迟）'
+    else warn '失败：证书续期 timer 未启用或未运行。'; fi
+    if [[ ! -x "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" ]] || ! self_file_owned "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx"; then warn '失败：证书 reload hook 缺失或已被修改。'; fi
+    if [[ -f "$SELF_DIR/renew-status.json" ]]; then jq -r '"最近自动续期：\(.result) / \(.time)"' "$SELF_DIR/renew-status.json"; fi
+    if [[ -f "$SELF_DIR/renew-test.json" ]]; then jq -r '"最近续期测试：\(.result) / \(.time) / \(.domain)"' "$SELF_DIR/renew-test.json"; else warn '未验证：尚无续期测试记录。'; fi
+    if self_tls_check "$domain" 127.0.0.1:8443 && self_loaded_cert_matches "$domain"; then ok 'Nginx 证书加载：有效且匹配域名'; else warn '失败：Nginx TLS/证书检查未通过'; fi
+    if ! openssl x509 -in "$SELF_DIR/acme/live/$domain/cert.pem" -checkend 1209600 -noout >/dev/null; then warn '警告：证书不足 14 天有效期。'; fi
+}
+cert_command() {
+    need_root
+    [[ $# -le 1 ]] || fail '用法：cert [status|renew-test]'
+    self_exists || fail '仅自有域名模式有本脚本管理的证书。'
+    case "${1:-status}" in
+        status) cert_status ;;
+        renew-test) if ( exec 8> "$SELF_DIR/operation.lock"; flock -x 8; self_renew_test "$(self_state domain)" ); then ok '证书续期 dry-run 和 Nginx reload hook 均通过。';
+            else fail "续期验证失败；详见 $SELF_DIR/logs/renew-test.log（root 专用）。"; fi ;;
+        *) fail '用法：cert [status|renew-test]' ;;
+    esac
+}
+website_status() {
+    need_root; load_metadata
+    [[ "$NODE_MODE" == self ]] || fail '此命令仅用于自有域名模式。'
+    local SELF_CHECK_FAILURES=0
+    say "网站：https://$SNI（本机 127.0.0.1:8443）"
+    self_report 'Nginx 服务运行' systemctl is-active --quiet nginx
+    self_report '8443 仅回环监听' self_listener_check
+    self_report 'TLS 1.3 / X25519 / H2 与证书' self_tls_check "$SNI" 127.0.0.1:8443
+    self_report '首页 HTTP/2 200，无跳转' self_http_check "$SNI" 127.0.0.1 8443
+    (( SELF_CHECK_FAILURES == 0 ))
+}
+self_prepare() {
+    local active=false enabled=false had_nginx=false token=''
+    systemctl is-active --quiet nginx && active=true
+    systemctl is-enabled --quiet nginx && enabled=true
+    command -v nginx >/dev/null && had_nginx=true
+    if [[ "$had_nginx" == true && "$active" == false ]] && self_nginx_shared; then
+        fail 'Nginx 已有启用站点但服务未运行；请先处理已有站点，避免启动未审查的公网入口。'
+    fi
+    SELF_STARTED=1
+    install -d -m 700 "$SELF_DIR" "$SELF_DIR/logs" "$SELF_DIR/work" "$SELF_DIR/acme"
+    printf 'vless-reality-self-v1\n' > "$SELF_DIR/.owned"
+    : > "$SELF_DIR/files.sha256"
+    : > "$SELF_DIR/cli.ini"
+    self_track "$SELF_DIR/cli.ini"
+    jq -n --arg domain "$SNI" --arg method "$SELF_METHOD" --arg email "$SELF_EMAIL" \
+        --argjson active "$active" --argjson enabled "$enabled" --argjson had "$had_nginx" \
+        '{domain:$domain,method:$method,email:$email,nginx_active:$active,nginx_enabled:$enabled,had_nginx:$had}' > "$SELF_DIR/state.json"
+    self_track "$SELF_DIR/state.json"
+    if [[ "$SELF_METHOD" == cloudflare ]]; then
+        if [[ -n "$SELF_CREDENTIALS" ]]; then
+            [[ -f "$SELF_CREDENTIALS" && ! -L "$SELF_CREDENTIALS" && "$(stat -c %u "$SELF_CREDENTIALS")" == 0 \
+                && "$(stat -c %a "$SELF_CREDENTIALS")" == 600 ]] || fail 'Cloudflare 凭据文件必须为 root 所有的 600 普通文件。'
+            token="$(sed -n 's/^dns_cloudflare_api_token *= *\([A-Za-z0-9_-]*\) *$/\1/p' "$SELF_CREDENTIALS")"
+        else
+            [[ -t 0 ]] || fail '非交互 DNS-01 需要设置 VLESS_CF_CREDENTIALS 为 root:600 凭据文件路径。'
+            read -r -s -p 'Cloudflare API Token（仅此 Zone 的 DNS Edit + Zone Read，不回显）：' token || fail '已取消。'
+            say
+        fi
+        [[ "$token" =~ ^[A-Za-z0-9_-]{20,200}$ ]] || fail 'Cloudflare Token 格式无效。'
+        printf 'dns_cloudflare_api_token = %s\n' "$token" > "$SELF_DIR/cloudflare.ini"
+        chmod 600 "$SELF_DIR/cloudflare.ini"
+        unset token
+        self_track "$SELF_DIR/cloudflare.ini"
+    fi
+    self_extra_dependencies || fail '自有域名依赖安装失败。'
+    self_dns_check "$SNI" || fail 'DNS 检查未通过。'
+    curl --version | grep -q HTTP2 || fail '系统 curl 必须支持 HTTP/2。'
+    # 只处理本次新安装软件包创建的默认入口，预存站点不动。
+    if [[ "$had_nginx" == false && -L /etc/nginx/sites-enabled/default ]]; then
+        readlink /etc/nginx/sites-enabled/default > "$SELF_DIR/default-target"
+        self_track "$SELF_DIR/default-target"
+        rm -- /etc/nginx/sites-enabled/default
+    fi
+    nginx -T 2>&1 | grep -F 'include /etc/nginx/conf.d/*.conf;' >/dev/null || fail 'Nginx 主配置未包含 conf.d/*.conf，未修改已有主配置。'
+    self_site_write
+    if [[ "$SELF_METHOD" == http ]]; then
+        if ! { self_nginx_write "$SNI" no && self_nginx_apply; }; then fail 'HTTP-01 验证入口启动失败。'; fi
+        self_http_challenge_check "$SNI" "$SERVER_IP" || fail 'HTTP-01 的公网地址回访失败；请检查 TCP 80 安全组、防火墙和路由。'
+    fi
+    self_issue_cert "$SNI" || fail "LE 证书申请失败；详见 $SELF_DIR/logs/issue.log。"
+    if ! { self_nginx_write "$SNI" && self_nginx_apply; }; then fail 'Nginx HTTPS 配置或启动失败。'; fi
+    systemctl enable nginx || fail '无法启用 Nginx 开机启动。'
+    if ! { self_wait_tls "$SNI" && self_listener_check; }; then fail '本地 TLS 1.3 / X25519 / H2 / 证书 / HTTP 200 检查失败。'; fi
+    self_reload_hook_write || fail '自动续期 hook 配置失败。'
+    self_renew_test "$SNI" || fail '证书续期 dry-run 或 reload hook 失败。'
+    self_timer_write || fail '自动续期任务配置失败。'
+    if ! { systemctl is-enabled --quiet vless-reality-cert.timer && systemctl is-active --quiet vless-reality-cert.timer; }; then fail '续期 timer 未实际生效。'; fi
+    ok '证书自动续期配置成功（dry-run 与 reload hook 已验证）。'
+}
+install_self() (
+    need_root
+    [[ $- != *x* ]] || fail '包含 DNS 凭据的安装禁止使用 bash -x。'
+    [[ $# -le 7 ]] || fail '用法：install-self [域名] [cloudflare|http] [邮箱] [名称] [TFO:on|off] [加密:on|off] [模式]'
+    [[ $# -lt 7 || "${6:-off}" == on ]] || fail '指定加密模式时须同时开启 VLESS Encryption。'
+    NODE_MODE=self
+    local domain="${1:-}" method="${2:-}" email="${3:-}" name="${4:-Reality-Self}" tfo="${5:-off}" enc="${6:-off}" mode="${7:-native}" answer args=()
+    if [[ -z "$domain" ]]; then
+        [[ -t 0 ]] || fail '请指定自有域名。'
+        read -r -p '自有域名（A 直连 VPS，无 AAAA / CNAME / CDN）：' domain || fail '已取消。'
+        read -r -p '证书验证 [cloudflare DNS-01 / http HTTP-01]（回车 cloudflare）：' method || fail '已取消。'
+        method="${method:-cloudflare}"
+        read -r -p 'LE 通知邮箱：' email || fail '已取消。'
+        read -r -p '节点名称（回车 Reality-Self）：' answer || fail '已取消。'
+        name="${answer:-Reality-Self}"
+        if confirm '是否开启 TCP Fast Open？默认关闭 [y/N]：'; then tfo=on; fi
+        if confirm '是否开启 VLESS Encryption？默认关闭 [y/N]：'; then
+            enc=on; show_vlessenc_modes
+            read -r -p '选择模式（回车 native）：' mode || fail '已取消。'
+            mode="${mode:-native}"
+        fi
+        say "自有域名 $domain；公网 443 → 本机 8443；证书方式 $method。"
+        confirm '同意 LE 服务条款并开始安装？[y/N]：' || return 0
+    fi
+    SELF_METHOD="$method"; SELF_EMAIL="$email"; SELF_CREDENTIALS="${VLESS_CF_CREDENTIALS:-}"
+    domain="${domain,,}"
+    args=(443 "$domain" "$name" "$tfo" "$enc")
+    [[ "$enc" != on ]] || args+=("$mode")
+    install_node "${args[@]}"
+)
+
+self_cleanup_preflight() {
+    [[ -e "$SELF_DIR" || -L "$SELF_DIR" ]] || return 0
+    self_exists || { warn '自有域名目录无有效归属记录，未删除。' >&2; return 1; }
+    [[ -f "$SELF_DIR/files.sha256" && ! -L "$SELF_DIR/files.sha256" ]] || return 1
+    local _sum path reference entry
+    for path in "$SELF_WEB" "$SELF_DIR/acme" "$SELF_DIR/logs" "$SELF_DIR/work"; do
+        [[ ! -L "$path" ]] || { warn "管理目录已变成符号链接，保留：$path" >&2; return 1; }
+    done
+    while read -r _sum path; do
+        case "$path" in
+            "$SELF_POLICY"|"$SELF_SITE"|"$SELF_WEB/index.html"|"$SELF_DIR/cli.ini"|"$SELF_DIR/state.json"|"$SELF_DIR/default-target"|"$SELF_DIR/cloudflare.ini"|"$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx"|"$SELF_RENEW_SERVICE"|"$SELF_RENEW_TIMER"|"${SELF_RENEW_SERVICE%.service}-alert.service") ;;
+            *) warn '归属清单中出现未知路径，未继续清理。' >&2; return 1 ;;
+        esac
+        self_file_owned "$path" || { warn "文件已被修改或不是普通文件，保留：$path" >&2; return 1; }
+    done < "$SELF_DIR/files.sha256"
+    for path in "$SELF_SITE" "$SELF_RENEW_SERVICE" "$SELF_RENEW_TIMER" "${SELF_RENEW_SERVICE%.service}-alert.service"; do
+        self_file_owned "$path" || return 1
+    done
+    for entry in "$SELF_DIR"/* "$SELF_DIR"/.[!.]*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        case "${entry##*/}" in
+            .owned|.receipt.??????|.renew.??????|files.sha256|cli.ini|state.json|cloudflare.ini|default-target|renew-test.json|renew-status.json|operation.lock|acme|logs|work) ;;
+            *) warn "自有域名目录含有未知文件，已保留：$entry" >&2; return 1 ;;
+        esac
+    done
+    if [[ -d "$SELF_WEB" ]]; then
+        while IFS= read -r path; do
+            case "$path" in "$SELF_WEB/index.html"|"$SELF_WEB/.well-known"|"$SELF_WEB/.well-known/acme-challenge"|"$SELF_WEB/.well-known/acme-challenge/"*) ;;
+                *) warn "网站目录有其他数据，已保留：$path" >&2; return 1 ;; esac
+        done < <(find "$SELF_WEB" -mindepth 1 -print)
+    fi
+    # 检测常见 Web 服务是否引用了本项目网站或证书，防止删除共享资源。
+    for entry in /etc/nginx /etc/apache2 /etc/caddy /etc/haproxy; do
+        [[ -d "$entry" ]] || continue
+        while IFS= read -r reference; do
+            [[ "$reference" == "$SELF_SITE" ]] || { warn "其他配置引用自有域名资源，已保留：$reference" >&2; return 1; }
+        done < <(grep -rlF -e "$SELF_DIR/acme" -e "$SELF_WEB" "$entry" 2>/dev/null || true)
+    done
+}
+self_nginx_shared() {
+    local entry
+    for entry in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        [[ "$entry" == "$SELF_SITE" ]] || return 0
+    done
+    return 1
+}
+self_cleanup() (
+    [[ -e "$SELF_DIR" || -L "$SELF_DIR" ]] || return 0
+    self_cleanup_preflight || return 1
+    if (( SELF_OPERATION_LOCKED == 0 )); then
+        exec 8> "$SELF_DIR/operation.lock"
+        flock -x 8 || return 1
+    fi
+    self_cleanup_preflight || return 1
+    local unit active=false enabled=false
+    active="$(self_state nginx_active)" || return 1
+    enabled="$(self_state nginx_enabled)" || return 1
+    # 先停专用续期任务，绝不操作共享的 certbot.timer。
+    for unit in vless-reality-cert.timer vless-reality-cert.service vless-reality-cert-alert.service; do
+        if systemctl is-active --quiet "$unit"; then systemctl stop "$unit" || return 1; fi
+    done
+    if systemctl is-enabled --quiet vless-reality-cert.timer; then systemctl disable vless-reality-cert.timer || return 1; fi
+    if [[ -f "$SELF_SITE" ]]; then
+        cp -a "$SELF_SITE" "$SELF_DIR/work/site-before-cleanup"
+        rm -- "$SELF_SITE" || return 1
+    fi
+    if [[ "$active" == false ]] && ! self_nginx_shared; then
+        if systemctl is-active --quiet nginx; then systemctl stop nginx || return 1; fi
+        if [[ "$enabled" == false ]] && systemctl is-enabled --quiet nginx; then systemctl disable nginx || return 1; fi
+    elif systemctl is-active --quiet nginx; then
+        [[ "$active" != false ]] || warn 'Nginx 现由其他站点共享，保留它的运行及开机状态。' >&2
+        if ! nginx -t || ! systemctl reload nginx; then
+            if [[ -f "$SELF_DIR/work/site-before-cleanup" ]]; then cp -a "$SELF_DIR/work/site-before-cleanup" "$SELF_SITE"; fi
+            warn 'Nginx 移除站点后重载失败，已恢复站点；保留全部证书供修复。' >&2
+            return 1
+        fi
+    fi
+    if [[ -f "$SELF_DIR/default-target" && ! -e /etc/nginx/sites-enabled/default && ! -L /etc/nginx/sites-enabled/default ]]; then
+        ln -s "$(< "$SELF_DIR/default-target")" /etc/nginx/sites-enabled/default || return 1
+    fi
+    rm -f -- "$SELF_RENEW_SERVICE" "$SELF_RENEW_TIMER" "${SELF_RENEW_SERVICE%.service}-alert.service" || return 1
+    systemctl daemon-reload || return 1
+    # 专用目录在创建时必须不存在，且上面已验证归属、额外数据和共享引用。
+    if awk -v path="$SELF_POLICY" 'substr($0,67)==path {found=1} END {exit !found}' "$SELF_DIR/files.sha256"; then
+        self_file_owned "$SELF_POLICY" && rm -f -- "$SELF_POLICY" || return 1
+    fi
+    rm -rf -- "$SELF_WEB" "$SELF_DIR" || return 1
+    [[ ! -e "$SELF_SITE" && ! -e "$SELF_WEB" && ! -e "$SELF_DIR" ]]
+)
+stop_client_residue() {
+    local dir="$1" pid start actual state attempt
+    [[ -f "$dir/client.pid" && ! -L "$dir/client.pid" ]] || return 0
+    read -r pid start < "$dir/client.pid" || return 1
+    [[ "$pid" =~ ^[0-9]+$ && "$start" =~ ^[0-9]+$ ]] && (( pid > 1 )) || return 1
+    [[ -r "/proc/$pid/stat" ]] || return 0
+    state="$(awk '{print $3}' "/proc/$pid/stat")" || return 1
+    [[ "$state" != Z ]] || return 0
+    actual="$(awk '{print $22}' "/proc/$pid/stat")" || return 1
+    [[ "$actual" == "$start" ]] || return 0
+    local args=()
+    mapfile -d '' -t args < "/proc/$pid/cmdline" || return 1
+    [[ "${args[1]:-}" == run && "${args[2]:-}" == -config && "${args[3]:-}" == "$dir/client.json" \
+        && "$(stat -c %u "/proc/$pid")" == "$EUID" ]] || return 1
+    kill "$pid" 2>/dev/null || return 1
+    for attempt in {1..10}; do
+        [[ -r "/proc/$pid/stat" ]] || return 0
+        state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)" || return 0
+        [[ "$state" != Z ]] || return 0
+        sleep 0.2
+    done
+    return 1
+}
+self_client_probe() (
+    local domain="$1" address="$2" server_port="${3:-443}" test_dir pid='' socks_port uuid
+    test_dir="$(mktemp -d /tmp/vless-reality-client.XXXXXX)" || return 1
+    trap 'rc=$?; trap - EXIT
+        if [[ -n "$pid" ]]; then
+            if stop_client_residue "$test_dir"; then wait "$pid" 2>/dev/null || true;
+            else warn "检查客户端未能安全停止；保留归属目录供卸载重试：$test_dir" >&2; exit 1; fi
+        fi
+        rm -rf -- "$test_dir"; exit "$rc"' EXIT
+    printf 'vless-reality-setup\n' > "$test_dir/.vless-reality-owned"
+    socks_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" || return 1
+    uuid="$(config_uuid)" || return 1
+    jq -n --arg id "$uuid" --arg host "$address" --argjson port "$server_port" --argjson socks "$socks_port" \
+        --arg sni "$domain" --arg pub "$PUBLIC_KEY" --arg sid "$SHORT_ID" --arg enc "$CLIENT_ENCRYPTION" '{
+        log:{loglevel:"warning"}, inbounds:[{listen:"127.0.0.1",port:$socks,protocol:"socks",settings:{auth:"noauth"}}],
+        outbounds:[{protocol:"vless",settings:{vnext:[{address:$host,port:$port,users:[{id:$id,flow:"xtls-rprx-vision",encryption:$enc}]}]},
+          streamSettings:{network:"tcp",security:"reality",realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$sid}}}]
+        }' > "$test_dir/client.json" || return 1
+    "$XRAY_BIN" run -test -config "$test_dir/client.json" > "$test_dir/test.log" 2>&1 || return 1
+    "$XRAY_BIN" run -config "$test_dir/client.json" > "$test_dir/client.log" 2>&1 &
+    pid=$!
+    printf '%s %s\n' "$pid" "$(awk '{print $22}' "/proc/$pid/stat")" > "$test_dir/client.pid"
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if curl --noproxy '' --proxy "socks5h://127.0.0.1:$socks_port" -fsS --connect-timeout 5 --max-time 20 \
+            'https://www.debian.org/' -o /dev/null 2>/dev/null; then
+            kill -0 "$pid" 2>/dev/null && return 0
+            return 1
+        fi
+        kill -0 "$pid" 2>/dev/null || return 1
+        sleep 1
+    done
+    return 1
+)
+self_reject_check() {
+    local domain="$1" output
+    output="$(timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername invalid.example -tls1_3 </dev/null 2>&1 || true)"
+    [[ "$output" == *'no peer certificate available'* ]] || return 1
+    output="$(timeout 10 openssl s_client -connect 127.0.0.1:8443 -noservername -tls1_3 </dev/null 2>&1 || true)"
+    [[ "$output" == *'no peer certificate available'* && "$domain" != invalid.example ]]
+}
+self_report() {
+    local label="$1"; shift
+    if "$@"; then ok "通过：$label"; else warn "失败：$label"; SELF_CHECK_FAILURES=$((SELF_CHECK_FAILURES + 1)); fi
+}
+self_config_check() {
+    jq -e --arg sni "$SNI" '
+      [.inbounds[] | select(.protocol=="vless" and .listen=="0.0.0.0" and .port==443) |
+        select(.streamSettings.network=="tcp" and .streamSettings.security=="reality") |
+        select(.streamSettings.realitySettings.target=="127.0.0.1:8443") |
+        select(.streamSettings.realitySettings.serverNames==[$sni]) |
+        select(any(.settings.clients[]; .flow=="xtls-rprx-vision"))] | length==1' "$CONFIG" >/dev/null && config_ok
+}
+self_renew_ready() {
+    if systemctl is-failed --quiet vless-reality-cert.service; then return 1; fi
+    if [[ -f "$SELF_DIR/renew-status.json" ]] && jq -e --arg domain "$SNI" '.domain==$domain and .result=="failed"' "$SELF_DIR/renew-status.json" >/dev/null; then return 1; fi
+    systemctl is-enabled --quiet vless-reality-cert.timer && systemctl is-active --quiet vless-reality-cert.timer \
+        && jq -e --arg domain "$SNI" '.result=="passed" and .domain==$domain' "$SELF_DIR/renew-test.json" >/dev/null \
+        && [[ -x "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" ]] && self_file_owned "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx"
+}
+check_self() {
+    need_root; load_metadata
+    [[ "$NODE_MODE" == self ]] || fail 'check-self 只用于自有域名模式。'
+    local SELF_CHECK_FAILURES=0 ip external="${VLESS_EXTERNAL_CHECK:-}"
+    ip="$(public_ipv4)" || fail '无法确认当前公网 IPv4。'
+    self_report 'DNS A 直连当前 VPS、无 CNAME/CDN、无 AAAA（两个解析器）' self_dns_check "$SNI"
+    self_report 'Xray TCP 443 服务和监听' service_ok
+    self_report 'Nginx 8443 仅 IPv4 回环监听' self_listener_check
+    self_report 'REALITY 本机 target、域名和 Vision 配置' self_config_check
+    self_report 'Nginx TLS 1.3 / X25519 / ALPN h2 / 证书链与域名' self_tls_check "$SNI" 127.0.0.1:8443
+    self_report 'Nginx 已加载磁盘上的当前证书' self_loaded_cert_matches "$SNI"
+    self_report '本机网站 HTTP/2 200，无跳转' self_http_check "$SNI" 127.0.0.1 8443
+    self_report '拒绝未知 SNI 和无 SNI' self_reject_check "$SNI"
+    self_report '公网地址 443 HTTPS 回落（检测源为本机）' self_http_check "$SNI" "$ip" 443
+    self_report '证书 timer、最近续期 dry-run 与 deploy hook 记录' self_renew_ready
+    self_report '实际 Xray 客户端 REALITY + Vision 握手和 HTTPS 代理请求（本机源）' self_client_probe "$SNI" 127.0.0.1
+    if [[ -n "$external" ]]; then
+        if [[ -x "$external" && -f "$external" && ! -L "$external" && "$(stat -c %u "$external")" == 0 \
+            && "$(stat -c %a "$external")" =~ ^[57]00$ ]]; then
+            self_report '用户配置的外部网络验证程序' timeout 120 "$external" "$SNI" "$ip"
+        else warn '失败：外部验证程序需为 root:700 的普通可执行文件。'; SELF_CHECK_FAILURES=$((SELF_CHECK_FAILURES + 1)); fi
+    else
+        warn '未验证：真正外部网络的 HTTPS/VLESS 连接。请从其他网络访问并导入测试；可用 VLESS_EXTERNAL_CHECK 配置外部验证程序。'
+    fi
+    (( SELF_CHECK_FAILURES == 0 ))
+}
+change_self_domain() {
+    local domain="${1:-}" script_path
+    if [[ -z "$domain" ]]; then
+        [[ -t 0 ]] || fail '请指定新自有域名；不支持 auto。'
+        read -r -p '新自有域名（将同步证书、网站与 Xray）：' domain || fail '已取消。'
+    fi
+    domain="${domain,,}"
+    valid_host "$domain" || fail '新自有域名格式无效；自有域名模式不允许 auto。'
+    [[ "$domain" != "$SNI" ]] || { ok '域名未改变。'; return 0; }
+    script_path="$(readlink -f "$SCRIPT_PATH")" || fail '找不到当前脚本。'
+    warn '即将申请新证书并重启 Xray；请使用 VPS 直连 SSH。成功后须重新导入链接。'
+    systemd-run --quiet --wait --collect --unit=vless-reality-self-change \
+        /bin/bash "$script_path" __self-domain "$domain" || fail '域名修改失败；查看 journalctl -u vless-reality-self-change。'
+    show_node
+}
+self_domain_apply() (
+    need_root; load_metadata
+    [[ "$NODE_MODE" == self && $# == 1 ]] || fail '仅自有域名模式支持同步域名修改。'
+    self_cleanup_preflight || fail '管理文件已改变，无法安全修改。'
+    exec 8> "$SELF_DIR/operation.lock"; flock -x 8 || exit 1
+    local domain="${1,,}" old_sni="$SNI" backup committed=0 active=0 timer_active=0
+    valid_host "$domain" || fail '域名无效。'
+    self_dns_check "$domain" || fail '新域名 DNS 检查失败。'
+    SELF_METHOD="$(self_state method)"; SELF_EMAIL="$(self_state email)"
+    backup="$(mktemp -d "$SELF_DIR/work/domain-backup.XXXXXX")"
+    backup_state "$backup" || fail '无法备份节点。'
+    cp -a "$SELF_SITE" "$backup/nginx-site.conf"
+    cp -a "$SELF_DIR/state.json" "$SELF_DIR/files.sha256" "$backup/"
+    [[ ! -f "$SELF_DIR/renew-test.json" ]] || cp -a "$SELF_DIR/renew-test.json" "$backup/"
+    [[ ! -f "$LINK_FILE" ]] || cp -a "$LINK_FILE" "$backup/link.txt"
+    systemctl is-active --quiet xray && active=1
+    systemctl is-active --quiet vless-reality-cert.timer && timer_active=1
+    # trap 的恢复不能依赖 SSH 会话；本函数由独立 systemd 任务运行。
+    trap 'rc=$?; trap - EXIT; if (( ! committed )); then
+        cp -a "$backup/nginx-site.conf" "$SELF_SITE" || rc=1
+        cp -a "$backup/state.json" "$backup/files.sha256" "$SELF_DIR/" || rc=1
+        if [[ -f "$backup/renew-test.json" ]]; then cp -a "$backup/renew-test.json" "$SELF_DIR/"; else rm -f "$SELF_DIR/renew-test.json"; fi
+        SNI="$old_sni"
+        if ! nginx -t || ! systemctl reload nginx || ! restore_state "$backup" "$active"; then
+            warn "域名修改回滚未完成，备份保留：$backup" >&2; exit 1
+        fi
+        [[ ! -f "$backup/link.txt" ]] || cp -a "$backup/link.txt" "$LINK_FILE"
+    fi
+    if (( timer_active )); then systemctl start vless-reality-cert.timer || rc=1; fi
+    rm -rf -- "$backup"; exit "$rc"' EXIT
+    if (( timer_active )); then systemctl stop vless-reality-cert.timer; fi
+    if systemctl is-active --quiet vless-reality-cert.service; then systemctl stop vless-reality-cert.service; fi
+    if [[ "$SELF_METHOD" == http ]]; then
+        if ! { self_nginx_write "$old_sni" yes "$domain" && self_nginx_apply; }; then fail '新域名 HTTP 验证入口失败。'; fi
+    fi
+    self_issue_cert "$domain" || fail '新域名证书申请失败。'
+    if ! { self_nginx_write "$domain" && self_nginx_apply; }; then fail '新域名 Nginx 配置失败。'; fi
+    if ! { self_wait_tls "$domain"; }; then fail '新域名网站验证失败。'; fi
+    SNI="$domain"
+    edit_config --arg sni "$SNI" '(.inbounds[] | select(.protocol=="vless") | .streamSettings.realitySettings.serverNames)=[$sni] |
+        (.inbounds[] | select(.protocol=="vless") | .streamSettings.realitySettings.target)="127.0.0.1:8443"' || fail '新域名 Xray 修改失败。'
+    if ! { write_marker && config_ok; }; then fail '新域名 Xray 配置校验失败。'; fi
+    if (( active )); then
+        if ! systemctl restart xray || ! wait_service 10; then fail '新域名节点启动失败。'; fi
+    fi
+    self_renew_test "$domain" || fail '新域名证书续期验证失败。'
+    jq --arg domain "$domain" '.domain=$domain' "$SELF_DIR/state.json" > "$backup/new-state.json"
+    mv "$backup/new-state.json" "$SELF_DIR/state.json"
+    self_track "$SELF_DIR/state.json"
+    (show_node >/dev/null) || fail '新域名链接保存失败。'
+    if (( active )); then self_client_probe "$domain" 127.0.0.1 || fail '新域名节点实际握手失败。'; fi
+    # shellcheck disable=SC2034 # 由 EXIT trap 读取。
+    committed=1
+    ok '自有域名的证书、Nginx、Xray 和客户端链接已同步修改。'
+)
+
 print_help() {
     local cmd
     cmd="$(cmd_name)"
@@ -1518,6 +2323,11 @@ print_help() {
 VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
 用法：${cmd} [命令]
   install [端口] [SNI] [名称] [TFO:on|off] [VLESS加密:on|off] [模式]  安装节点
+  install-self [域名] [cloudflare|http] [邮箱] [名称] [TFO] [加密] [模式]
+                               安装自有域名 REALITY（固定 443）
+  check-self                   检查自有域名完整部署
+  cert [status|renew-test]      证书和自动续期状态
+  website                      查看本地网站状态
   show                         显示 vless:// 导入链接
   status                       查看服务、配置、端口和伪装站点状态
   port [新端口]                修改端口
@@ -1555,11 +2365,12 @@ menu_status() {
 }
 
 show_menu() {
-    [[ -t 1 ]] && clear 2>/dev/null || true
+    if [[ -t 1 ]]; then clear 2>/dev/null || true; fi
     say '=================================='
     say " VLESS + REALITY + Vision ${RED}[v${SCRIPT_VERSION}]${RESET}"
     say '=================================='
-    say '  1. 安装节点'
+    say '  1. 安装普通 REALITY（第三方 SNI）'
+    say ' 20. 安装自有域名 REALITY（偷自己）'
     say '  2. 卸载节点'
     say '  3. 升级 Xray-core'
     say '----------------------------------'
@@ -1580,6 +2391,10 @@ show_menu() {
     say ' 16. 查看当前测速延迟最低的域名'
     say ' 17. 开关 TCP Fast Open'
     say ' 19. 开关 VLESS Encryption / 修改模式'
+    say ' 21. 查看自有域名网站状态'
+    say ' 22. 查看 SSL 证书'
+    say ' 23. 测试证书自动续期'
+    say ' 24. 一键检查自有域名配置'
     say ' 00. 退出'
     say '=================================='
     menu_status
@@ -1594,7 +2409,9 @@ menu_action() {
         10) warn '操作后旧链接立即失效。'; rotate_keys ;;
         11) rename_node ;; 12) refresh_ip ;; 13) show_node ;;
         14) status_node ;; 15) log_node ;; 16) show_fastest_sni ;;
-        17) tfo_node ;; 19) vlessenc_node ;; *) return 2 ;;
+        17) tfo_node ;; 19) vlessenc_node ;;
+        20) install_self ;; 21) website_status ;; 22) cert_command status ;;
+        23) cert_command renew-test ;; 24) check_self ;; *) return 2 ;;
     esac
 }
 interactive_menu() {
@@ -1604,8 +2421,8 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-17、19，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-7]|19) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-17、19-24，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-7]|19|2[0-4]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
@@ -1623,6 +2440,13 @@ main() {
         '') interactive_menu ;;
         help|-h|--help) print_help ;;
         install) shift; install_node "$@" ;;
+        install-self) shift; install_self "$@" ;;
+        check-self) check_self ;;
+        website) website_status ;;
+        cert) shift; cert_command "$@" ;;
+        __self-domain) shift; self_domain_apply "$@" ;;
+        __cert-renew) self_cert_renew ;;
+        __cert-alert) self_cert_alert ;;
         show) show_node ;;
         status) status_node ;;
         port) shift; change_port "$@" ;;
@@ -1642,7 +2466,7 @@ main() {
         log|logs) shift; log_node "$@" ;;
         update) update_xray ;;
         uninstall) uninstall_node ;;
-        [1-9]|1[0-7]|19) need_root; menu_action "$1" ;;
+        [1-9]|1[0-7]|19|2[0-4]) need_root; menu_action "$1" ;;
         *) print_help; exit 2 ;;
     esac
 }

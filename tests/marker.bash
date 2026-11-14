@@ -29,7 +29,12 @@ write_marker
 [[ "$(sed -n '2p' "$MARKER")" == www.amazon.com ]]
 [[ "$(sed -n '7p' "$MARKER")" == none ]]
 printf '{}\n' > "$CONFIG_DIR/config.json"
-sed -i '7d' "$MARKER"
+CLIENT_ENCRYPTION=mlkem768x25519plus.native.0rtt.legacykey
+write_marker
+sed -i '8d' "$MARKER"
+load_metadata
+[[ "$NODE_MODE" == external && "$CLIENT_ENCRYPTION" == mlkem768x25519plus.native.0rtt.legacykey ]]
+sed -i '7,$d' "$MARKER"
 CLIENT_ENCRYPTION=stale
 load_metadata
 [[ "$CLIENT_ENCRYPTION" == none ]]
