@@ -1,0 +1,44 @@
+name: Script and isolated protocol tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      matrix:
+        debian: [bookworm, trixie]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, Node.js 24
+      - name: Build isolated Nginx and Certbot environment
+        run: docker build --build-arg DEBIAN_IMAGE=debian:${{ matrix.debian }}-slim -t vless-self-test -f tests/integration/Dockerfile .
+      - name: Syntax, ShellCheck and unit/fault tests
+        run: |
+          bash -n install.sh tests/*.bash tests/integration/*.bash
+          docker run --rm -e LC_ALL=C.UTF-8 -v "$PWD:/src:ro" vless-self-test shellcheck install.sh
+          docker run --rm -e LC_ALL=C.UTF-8 -v "$PWD:/src:ro" vless-self-test bash tests/systemd_units.bash
+          for file in tests/*.bash; do
+            [[ "$file" == tests/reality_handshake.bash ]] && continue
+            bash "$file"
+          done
+      - name: Obtain and verify official stable Xray
+        shell: bash
+        run: |
+          source <(sed '$d' install.sh)
+          TEMP_DIR="$(mktemp -d)"
+          fetch_release_metadata latest "$(arch_asset)"
+          download_verified_release "$TEMP_DIR/xray.zip"
+          unzip -q "$TEMP_DIR/xray.zip" xray -d "$TEMP_DIR"
+          chmod 755 "$TEMP_DIR/xray"
+          echo "XRAY_TEST_BIN=$TEMP_DIR/xray" >> "$GITHUB_ENV"
+      - name: Existing REALITY handshake and self-domain HTTPS/VLESS
+        run: |
+          docker run --rm -e LC_ALL=C.UTF-8 -v "$PWD:/src:ro" -v "$XRAY_TEST_BIN:/xray:ro" vless-self-test bash tests/reality_handshake.bash /xray
+          # Inspect the non-root Xray listener's real PID; Docker otherwise hides its fd ownership.
+          docker run --rm --cap-add SYS_PTRACE -e LC_ALL=C.UTF-8 -v "$PWD:/src:ro" -v "$XRAY_TEST_BIN:/xray:ro" vless-self-test bash tests/integration/self_tls.bash /xray
+      - name: Real Certbot HTTP-01 and renewal against isolated Pebble
+        run: bash tests/integration/acme.bash
