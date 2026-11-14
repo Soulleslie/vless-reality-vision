@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.1.2'
+SCRIPT_VERSION='2.2.0'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -41,6 +41,8 @@ TFO_ENABLED=0
 VLESS_DECRYPTION='none'
 CLIENT_ENCRYPTION='none'
 NODE_MODE='external'
+ADDR_MODE='auto'
+ADDR_DOMAIN=''
 SELF_DIR='/etc/vless-reality-self'
 SELF_SITE='/etc/nginx/conf.d/vless-reality-self.conf'
 SELF_WEB='/var/www/vless-reality-self'
@@ -96,6 +98,12 @@ valid_host() {
     (( ${#1} <= 253 )) || return 1
     [[ "$1" == *.* && "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?[.])+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
 }
+valid_ipv4() {
+    local part parts=()
+    [[ "$1" =~ ^(0|[1-9][0-9]{0,2})([.](0|[1-9][0-9]{0,2})){3}$ ]] || return 1
+    IFS=. read -r -a parts <<< "$1"
+    for part in "${parts[@]}"; do (( 10#$part <= 255 )) || return 1; done
+}
 valid_port() {
     [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
 }
@@ -135,7 +143,7 @@ public_ipv4() {
     local url ip
     for url in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
         ip="$(curl -4fsS --connect-timeout 5 --max-time 10 "$url" 2>/dev/null | tr -d '[:space:]')" || continue
-        if [[ "$ip" =~ ^[0-9]{1,3}([.][0-9]{1,3}){3}$ ]]; then
+        if valid_ipv4 "$ip"; then
             printf '%s' "$ip"
             return 0
         fi
@@ -456,8 +464,9 @@ generate_vless_encryption_pair() {
 write_marker() {
     local tmp
     tmp="$(mktemp "$CONFIG_DIR/.marker.XXXXXX")" || return 1
-    if printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-        "$PORT" "$SNI" "$NODE_NAME" "$SERVER_IP" "$PUBLIC_KEY" "$SHORT_ID" "$CLIENT_ENCRYPTION" "$NODE_MODE" > "$tmp" \
+    # 第 9/10 行保存客户端地址选择；auto 保留旧版默认：普通模式用 IP，自有模式用 SNI 域名。
+    if printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$PORT" "$SNI" "$NODE_NAME" "$SERVER_IP" "$PUBLIC_KEY" "$SHORT_ID" "$CLIENT_ENCRYPTION" "$NODE_MODE" "$ADDR_MODE" "$ADDR_DOMAIN" > "$tmp" \
         && chown root:xray "$tmp" && chmod 640 "$tmp" && mv -f -- "$tmp" "$MARKER"; then
         return 0
     fi
@@ -477,14 +486,37 @@ load_metadata() {
     SHORT_ID="${lines[5]:-}"
     CLIENT_ENCRYPTION="${lines[6]:-none}"
     NODE_MODE="${lines[7]:-external}"
+    ADDR_MODE="${lines[8]:-auto}"
+    ADDR_DOMAIN="${lines[9]:-}"
     case "$NODE_MODE" in external|self) ;; *) fail '安装模式记录无效。' ;; esac
     [[ "$NODE_MODE" != self || "$PORT" == 443 ]] || fail '自有域名安装记录的端口必须为 443。'
     valid_port "$PORT" || fail '安装记录中的端口无效。'
     valid_host "$SNI" || fail '安装记录中的 SNI 无效。'
+    valid_ipv4 "$SERVER_IP" || fail '安装记录中的 IPv4 地址无效。'
+    case "$ADDR_MODE" in auto|ip|domain) ;; *) fail '安装记录中的客户端地址模式无效。' ;; esac
+    [[ -z "$ADDR_DOMAIN" ]] || valid_host "$ADDR_DOMAIN" || fail '安装记录中的连接域名无效。'
+    [[ "$NODE_MODE" != self || -z "$ADDR_DOMAIN" ]] || fail '自有域名模式的连接域名应沿用当前 SNI，请使用 sni 同步管理域名。'
+    [[ "$NODE_MODE" != external || "$ADDR_MODE" != domain || -n "$ADDR_DOMAIN" ]] || fail '普通模式缺少自有连接域名。'
     [[ -n "$NODE_NAME" && -n "$SERVER_IP" && -n "$PUBLIC_KEY" && -n "$SHORT_ID" ]] \
         || fail '安装记录不完整。'
     [[ "$CLIENT_ENCRYPTION" == none || "$CLIENT_ENCRYPTION" =~ ^mlkem768x25519plus[.](native|xorpub|random)[.]0rtt[.][A-Za-z0-9_-]+$ ]] \
         || fail '安装记录中的 VLESS Encryption 参数无效。'
+}
+
+client_address_mode() {
+    if [[ "$ADDR_MODE" != auto ]]; then printf '%s' "$ADDR_MODE";
+    elif [[ "$NODE_MODE" == self ]]; then printf domain;
+    else printf ip; fi
+}
+client_address() {
+    if [[ "$(client_address_mode)" == ip ]]; then printf '%s' "$SERVER_IP";
+    elif [[ "$NODE_MODE" == self ]]; then printf '%s' "$SNI";
+    else printf '%s' "$ADDR_DOMAIN"; fi
+}
+client_address_status() {
+    local kind='IP'
+    [[ "$(client_address_mode)" != domain ]] || kind='域名'
+    say "客户端连接地址：$kind $(client_address):$PORT"
 }
 
 config_uuid() {
@@ -615,11 +647,11 @@ clean_config_residue() (
         unknown=0
         for entry in "$backup"/*; do
             case "${entry##*/}" in
-                config.json|.vless-reality-owned|tfo.sysctl) ;;
+                config.json|.vless-reality-owned|tfo.sysctl|link.txt|link-output.txt) ;;
                 *) unknown=1 ;;
             esac
         done
-        rm -f -- "$backup/config.json" "$backup/.vless-reality-owned" "$backup/tfo.sysctl" || return 1
+        rm -f -- "$backup/config.json" "$backup/.vless-reality-owned" "$backup/tfo.sysctl" "$backup/link.txt" "$backup/link-output.txt" || return 1
         if (( unknown )); then
             warn "保留含有其他文件的备份目录：$backup" >&2
         else
@@ -974,10 +1006,12 @@ EOF
     warn "请确认云安全组已放行 TCP ${PORT}。导入链接包含 UUID，请勿公开分享。"
 }
 
-show_node() {
+show_node() (
     need_root
+    self_operation_lock
     load_metadata
-    local uuid label link tmp address="$SERVER_IP" enc_param tfo_param=''
+    local uuid label link tmp address enc_param tfo_param=''
+    address="$(client_address)" || return 1
     uuid="$(config_uuid)" || fail '无法从配置读取 UUID。'
     if [[ "$NODE_MODE" == self ]]; then
         [[ "$PUBLIC_KEY" =~ ^[A-Za-z0-9_-]{43}$ && "$SHORT_ID" =~ ^[0-9a-f]{16}$ ]] || fail '自有域名安装记录中的公钥或 Short ID 无效。'
@@ -987,7 +1021,6 @@ show_node() {
     enc_param="$(jq -rn --arg v "$CLIENT_ENCRYPTION" '$v | @uri')" || return 1
     # tfo 是部分客户端识别的扩展参数；服务端开关仍以 Xray 配置为准。
     if config_tfo_enabled; then tfo_param='&tfo=1'; fi
-    [[ "$NODE_MODE" != self ]] || address="$SNI"
     link="vless://${uuid}@${address}:${PORT}?encryption=${enc_param}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none${tfo_param}#${label}"
     tmp="$(mktemp "${LINK_FILE}.XXXXXX")" || return 1
     if ! printf '%s\n' "$link" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$LINK_FILE"; then
@@ -1000,7 +1033,7 @@ show_node() {
     printf '%s%s%s\n' "$BOLD" "$link" "$RESET"
     say
     say "已保存到：$LINK_FILE"
-}
+)
 
 status_node() {
     need_root
@@ -1011,8 +1044,8 @@ status_node() {
     say "服务状态：$state"
     say "Xray 版本：${version:-未知}"
     say "安装模式：$NODE_MODE"
-    say "监听地址：${SERVER_IP}:${PORT}/TCP"
-    [[ "$NODE_MODE" != self ]] || say "节点地址：${SNI}:443"
+    say "记录公网入口：${SERVER_IP}:${PORT}/TCP"
+    client_address_status
     say "REALITY SNI：${SNI}:443"
     flow="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.clients[0].flow][0] // empty' "$CONFIG" 2>/dev/null || true)"
     if [[ "$flow" == xtls-rprx-vision ]]; then
@@ -1031,10 +1064,12 @@ status_node() {
     if config_ok; then ok '配置检查：通过'; else warn '配置检查：失败'; fi
     if [[ -n "$(ss -H -ltn "sport = :$PORT" 2>/dev/null)" ]]; then ok '端口监听：正常'; else warn '端口监听：未发现'; fi
     current_ip="$(public_ipv4 || true)"
-    if [[ "$NODE_MODE" == self && -n "$current_ip" && "$current_ip" != "$SERVER_IP" ]]; then
-        warn "公网 IPv4 已变化为 $current_ip；请核对域名 A 记录，Address 保持 $SNI。"
-    elif [[ -n "$current_ip" && "$current_ip" != "$SERVER_IP" ]]; then
-        warn "公网 IPv4 已变化：当前 $current_ip，链接中仍为 $SERVER_IP；请运行 $(cmd_name) refresh-ip。"
+    if [[ -n "$current_ip" && "$current_ip" != "$SERVER_IP" ]]; then
+        if [[ "$(client_address_mode)" == ip ]]; then
+            warn "公网 IPv4 已变化：当前 $current_ip，链接中仍为 $SERVER_IP；请运行 $(cmd_name) refresh-ip 并重新导入链接。"
+        else
+            warn "公网 IPv4 已变化为 $current_ip；请核对连接域名的 A 记录，再运行 $(cmd_name) refresh-ip 更新缓存，连接地址仍保留域名。"
+        fi
     fi
     if [[ "$NODE_MODE" == self ]]; then
         if self_tls_check "$SNI" 127.0.0.1:8443; then ok '本地网站：TLS 1.3 / X25519 / H2 正常'; else warn '本地网站验证失败'; fi
@@ -1335,6 +1370,8 @@ change_sni() {
     [[ $# -le 1 ]] || fail "用法：$(cmd_name) sni [新域名]"
     load_metadata
     if [[ "$NODE_MODE" == self ]]; then change_self_domain "$@"; return; fi
+    self_operation_lock
+    load_metadata
     local new="${1:-}" old_port="$PORT" old_sni="$SNI" backup was_active=0 auto_sni=0
     if [[ -z "$new" ]]; then
         [[ -t 0 ]] || fail '非交互运行时请指定新伪装域名。'
@@ -1428,23 +1465,103 @@ rename_node() {
     show_node
 }
 
-refresh_ip() {
+# 地址切换只提交安装记录和客户端链接，不修改 Xray/Nginx 或重启服务。
+commit_address_change() (
+    local mode="$1" domain="$2" ip="$3" backup committed=0 had_link=0 rc
+    [[ -f "$MARKER" && ! -L "$MARKER" && ! -L "$LINK_FILE" ]] || fail '安装记录或链接文件归属异常，未修改。'
+    [[ ! -e "$LINK_FILE" || -f "$LINK_FILE" ]] || fail '节点链接不是普通文件，未修改。'
+    backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")" || fail '无法备份地址设置。'
+    if ! cp -a -- "$MARKER" "$backup/.vless-reality-owned"; then rm -rf -- "$backup"; fail '备份安装记录失败。'; fi
+    if [[ -f "$LINK_FILE" ]]; then
+        if ! cp -a -- "$LINK_FILE" "$backup/link.txt"; then rm -rf -- "$backup"; fail '备份节点链接失败。'; fi
+        # shellcheck disable=SC2034 # EXIT trap 决定是否恢复旧链接。
+        had_link=1
+    fi
+    trap 'rc=$?; trap - EXIT
+        if (( ! committed )); then
+            if ! mv -f -- "$backup/.vless-reality-owned" "$MARKER"; then warn "地址设置回滚失败，保留备份：$backup" >&2; exit 1; fi
+            if (( had_link )); then
+                if ! mv -f -- "$backup/link.txt" "$LINK_FILE"; then warn "链接回滚失败，保留备份：$backup" >&2; exit 1; fi
+            elif ! rm -f -- "$LINK_FILE"; then warn "链接清理失败，保留备份：$backup" >&2; exit 1; fi
+        fi
+        rm -rf -- "$backup"; exit "$rc"' EXIT
+    ADDR_MODE="$mode"; ADDR_DOMAIN="$domain"; SERVER_IP="$ip"
+    if ! write_marker || ! show_node > "$backup/link-output.txt"; then fail '地址设置或链接保存失败，正在恢复原设置。'; fi
+    # shellcheck disable=SC2034 # EXIT trap 保持/清理事务。
+    committed=1
+    ok '客户端连接地址已更新，服务无需重启；请重新导入下面的新链接。'
+    cat "$backup/link-output.txt"
+)
+address_node() (
     need_root
+    [[ $# -le 2 ]] || fail "用法：$(cmd_name) addr [ip|domain [连接域名]]"
+    load_metadata
+    local action="${1:-}" domain="${2:-}" answer ip
+    if [[ -z "$action" ]]; then
+        client_address_status
+        say "REALITY SNI：$SNI（切换连接地址不会修改它）"
+        [[ -t 0 ]] || return 0
+        say '  1. 连接地址改用公网 IP'
+        say '  2. 连接地址改用域名'
+        say '  3. 刷新公网 IP（保持当前地址模式）'
+        say ' 00. 返回'
+        while true; do
+            read -r -p '请选择 [1-3，回车返回]：' answer || return 0
+            case "$answer" in
+                1) action=ip; break ;; 2) action=domain; break ;;
+                3) refresh_ip; return ;; ''|00|0|q|Q) return 0 ;;
+                *) warn '请选择 1、2、3 或回车返回。' ;;
+            esac
+        done
+    fi
+    action="${action,,}"
+    case "$action" in ip|domain) ;; *) fail "用法：$(cmd_name) addr [ip|domain [连接域名]]" ;; esac
+    [[ "$action" != ip || -z "$domain" ]] || fail 'IP 模式会自动获取本机公网 IPv4，无需另填地址。'
+    if [[ "$action" == domain && "$NODE_MODE" == external && -z "$domain" ]]; then
+        domain="$ADDR_DOMAIN"
+        if [[ -t 0 ]]; then
+            read -r -p "自己的连接域名（A 直连 VPS；回车沿用 ${domain:-未设置}；不要填第三方 SNI）：" answer || fail '已取消。'
+            domain="${answer:-$domain}"
+        fi
+        [[ -n "$domain" ]] || fail '普通模式请提供自己的连接域名，例如 addr domain node.example.com。'
+    fi
     self_operation_lock
     load_metadata
-    if [[ "$NODE_MODE" == self ]]; then
-        self_dns_check "$SNI" || fail 'DNS 未指向当前 VPS；请手动更新 DNS。节点地址仍使用域名。'
-        ok '自有域名 DNS 检查通过；节点 Address 保持域名。'
-        return 0
+    ip="$(public_ipv4)" || fail '无法查询本机公网 IPv4，未修改。'
+    valid_ipv4 "$ip" || fail '公网 IPv4 格式无效，未修改。'
+    if [[ "$action" == domain ]]; then
+        domain="${domain,,}"
+        if [[ "$NODE_MODE" == self ]]; then
+            [[ -z "$domain" || "$domain" == "$SNI" ]] || fail '自有域名模式沿用当前 SNI；更换站点域名请使用 sni 命令。'
+            domain="$SNI"
+        fi
+        valid_host "$domain" || fail '连接域名格式不正确，未修改。'
+        ensure_dns_tool
+        self_dns_check "$domain" || fail '连接域名未直连当前 VPS，未修改地址设置。'
+        [[ "$NODE_MODE" != self ]] || domain=''
+    else
+        domain="$ADDR_DOMAIN"
+        if [[ "$NODE_MODE" == self ]] && ! self_dns_check "$SNI" >/dev/null 2>&1; then
+            warn '警告：自有域名 DNS 检查未通过；切换 IP 不会修正 DNS，网站与证书监测仍需维护正确解析。'
+        fi
+        warn '使用 IP 后，VPS 公网 IP 变化时需要刷新 IP 并重新导入链接；REALITY SNI 保持不变。'
     fi
+    commit_address_change "$action" "$domain" "$ip"
+)
+refresh_ip() (
+    need_root; self_operation_lock; load_metadata
     local ip
     ip="$(public_ipv4)" || fail '无法查询当前公网 IPv4。'
-    if [[ "$ip" == "$SERVER_IP" ]]; then ok "公网 IPv4 未变化：$ip"; return 0; fi
-    SERVER_IP="$ip"
-    write_marker
-    ok "链接中的服务器地址已更新为 $SERVER_IP，服务无需重启。"
-    show_node
-}
+    valid_ipv4 "$ip" || fail '公网 IPv4 格式无效，未修改。'
+    if [[ "$(client_address_mode)" == domain ]]; then
+        ensure_dns_tool
+        self_dns_check "$(client_address)" || fail '连接域名 DNS 检查未通过；请手动更新解析，原地址设置保持。'
+    elif [[ "$NODE_MODE" == self ]] && ! self_dns_check "$SNI" >/dev/null 2>&1; then
+        warn '警告：自有域名解析未通过检查，刷新 IP 不会自动修改 DNS。'
+    fi
+    if [[ "$ip" == "$SERVER_IP" ]]; then ok "公网 IPv4 未变化：$ip"; show_node; return 0; fi
+    commit_address_change "$ADDR_MODE" "$ADDR_DOMAIN" "$ip"
+)
 
 update_xray() {
     need_root
@@ -1621,11 +1738,25 @@ uninstall_node() {
 # 自有域名模式：全部逻辑内嵌，保持单文件下载部署。
 self_exists() { [[ -f "$SELF_DIR/.owned" && ! -L "$SELF_DIR/.owned" && ! -L "$SELF_DIR" && "$(stat -c %u "$SELF_DIR")" == 0 && "$(stat -c %a "$SELF_DIR")" == 700 && "$(< "$SELF_DIR/.owned")" == vless-reality-self-v1 ]]; }
 self_operation_lock() {
-    if self_exists && (( SELF_OPERATION_LOCKED == 0 )); then
-        exec 9> "$SELF_DIR/operation.lock" || fail '无法锁定自有域名操作。'
-        flock -x 9 || fail '无法取得自有域名操作锁。'
-        SELF_OPERATION_LOCKED=1
+    local locked=0 directory
+    if (( SELF_OPERATION_LOCKED == 0 )); then
+        # 对目录本身加锁，不留下普通模式的额外锁文件；与其他节点修改串行，避免覆盖最新密钥/地址记录。
+        if [[ -d "$CONFIG_DIR" && -f "$MARKER" && -f "$CONFIG" ]]; then
+            [[ ! -L "$CONFIG_DIR" && ! -L "$MARKER" ]] || fail '节点目录或安装记录异常，未修改。'
+            exec 9< "$CONFIG_DIR" || fail '无法打开节点操作锁。'
+            flock -x 9 || fail '无法取得节点操作锁。'
+            directory="$(stat -Lc '%d:%i' /proc/self/fd/9)" || fail '无法核对节点目录。'
+            [[ "$directory" == "$(stat -c '%d:%i' "$CONFIG_DIR" 2>/dev/null)" ]] || fail '等待期间节点目录已变化，请重新运行命令。'
+            locked=1
+        fi
+        if self_exists; then
+            exec 7> "$SELF_DIR/operation.lock" || fail '无法锁定自有域名操作。'
+            flock -x 7 || fail '无法取得自有域名操作锁。'
+            locked=1
+        fi
+        SELF_OPERATION_LOCKED="$locked"
     fi
+    return 0
 }
 self_track() {
     local path="$1" source="${2:-$1}" tmp digest
@@ -1649,6 +1780,14 @@ self_file_owned() {
     [[ -n "$expected" && "$(sha256sum -- "$path" | awk '{print $1}')" == "$expected" ]]
 }
 self_state() { jq -r --arg key "$1" 'if has($key) then .[$key] else error("missing state field") end' "$SELF_DIR/state.json"; }
+ensure_dns_tool() {
+    if ! command -v dig >/dev/null 2>&1; then
+        need_command apt-get
+        say '安装域名校验工具 dnsutils…'
+        if ! apt-get update || ! apt-get install -y dnsutils; then fail 'DNS 校验工具安装失败，未修改地址设置。'; fi
+    fi
+    need_command dig
+}
 self_dns_query() { dig "@$1" "$2" "$3" +time=4 +tries=1 +noall +answer +comments; }
 self_dns_check() {
     local domain="$1" ip resolver output records aaaa cname
@@ -1658,7 +1797,7 @@ self_dns_check() {
         output="$(self_dns_query "$resolver" "$domain" A)" || return 1
         [[ "$output" == *'status: NOERROR'* ]] || { warn "失败：$resolver 返回 DNS 错误。" >&2; return 1; }
         cname="$(awk '$4 == "CNAME" {print $5}' <<< "$output")"
-        [[ -z "$cname" ]] || { warn '失败：自有域名模式不接受 CNAME，请使用直接指向 VPS 的 A 记录。' >&2; return 1; }
+        [[ -z "$cname" ]] || { warn '失败：连接域名不接受 CNAME，请使用直接指向 VPS 的 A 记录。' >&2; return 1; }
         records="$(awk '$4 == "A" {print $5}' <<< "$output" | sort -u)"
         [[ "$records" == "$ip" ]] || { warn '失败：A 记录不是唯一的当前 VPS IPv4；请关闭 CDN/Cloudflare 橙云并等待 DNS 生效。' >&2; return 1; }
         output="$(self_dns_query "$resolver" "$domain" AAAA)" || return 1
@@ -2267,7 +2406,8 @@ self_client_probe() (
         }' > "$test_dir/client.json" || return 2
     rm -f -- "$test_dir/credentials" || return 2
     "$XRAY_BIN" run -test -config "$test_dir/client.json" > "$test_dir/test.log" 2>&1 || return 2
-    "$XRAY_BIN" run -config "$test_dir/client.json" > "$test_dir/client.log" 2>&1 &
+    # 临时检测客户端不继承管理锁；异常退出后也不能阻塞后续管理/卸载。
+    "$XRAY_BIN" run -config "$test_dir/client.json" 7>&- 8>&- 9>&- > "$test_dir/client.log" 2>&1 &
     pid=$!
     printf '%s %s\n' "$pid" "$(awk '{print $22}' "/proc/$pid/stat")" > "$test_dir/client.pid"
     local attempt
@@ -2460,13 +2600,14 @@ change_self_domain() {
     show_node
 }
 self_domain_apply() (
-    need_root; load_metadata
+    need_root; self_operation_lock; load_metadata
     [[ "$NODE_MODE" == self && $# == 1 ]] || fail '仅自有域名模式支持同步域名修改。'
     self_cleanup_preflight || fail '管理文件已改变，无法安全修改。'
-    exec 8> "$SELF_DIR/operation.lock"; flock -x 8 || exit 1
-    local domain="${1,,}" old_sni="$SNI" backup committed=0 active=0 timer_active=0 record=''
+    local domain="${1,,}" old_sni="$SNI" backup committed=0 active=0 timer_active=0 record='' new_ip
     valid_host "$domain" || fail '域名无效。'
     self_dns_check "$domain" || fail '新域名 DNS 检查失败。'
+    new_ip="$(public_ipv4)" || fail '无法确认当前公网 IPv4。'
+    valid_ipv4 "$new_ip" || fail '公网 IPv4 格式无效。'
     SELF_METHOD="$(self_state method)"; SELF_EMAIL="$(self_state email)"
     backup="$(mktemp -d "$SELF_DIR/work/domain-backup.XXXXXX")"
     backup_state "$backup" || fail '无法备份节点。'
@@ -2504,6 +2645,7 @@ self_domain_apply() (
     if ! { self_nginx_write "$domain" && self_nginx_apply; }; then fail '新域名 Nginx 配置失败。'; fi
     if ! { self_wait_tls "$domain"; }; then fail '新域名网站验证失败。'; fi
     SNI="$domain"
+    SERVER_IP="$new_ip"
     edit_config --arg sni "$SNI" '(.inbounds[] | select(.protocol=="vless") | .streamSettings.realitySettings.serverNames)=[$sni] |
         (.inbounds[] | select(.protocol=="vless") | .streamSettings.realitySettings.target)="127.0.0.1:8443"' || fail '新域名 Xray 修改失败。'
     if ! { write_marker && config_ok; }; then fail '新域名 Xray 配置校验失败。'; fi
@@ -2715,11 +2857,12 @@ security_permissions() {
     [[ -f "$path" && ! -L "$path" && "$mode" == 600 && "$(stat -c %u "$path")" == 0 ]]
 }
 security_link_check() {
-    local private link uuid sid
+    local private link uuid sid address
+    address="$(client_address)" || return 1
     private="$(jq -er '.inbounds[0].streamSettings.realitySettings.privateKey' "$CONFIG")" || return 1
     link="$(< "$LINK_FILE")"; uuid="$(config_uuid)" || return 1
     sid="$(jq -er '.inbounds[0].streamSettings.realitySettings.shortIds | if length==1 then .[0] else empty end' "$CONFIG")" || return 1
-    [[ "$sid" == "$SHORT_ID" && "$link" != *"$private"* && "$link" == "vless://$uuid@$SNI:443?"* && "$link" == *"&sni=$SNI&"* \
+    [[ "$sid" == "$SHORT_ID" && "$link" != *"$private"* && "$link" == "vless://$uuid@$address:$PORT?"* && "$link" == *"&sni=$SNI&"* \
         && "$link" == *"&pbk=$PUBLIC_KEY&"* && "$link" == *"&sid=$SHORT_ID&"* ]]
 }
 security_xray_listener() {
@@ -2864,9 +3007,9 @@ security_check() {
     self_report 'REALITY target/SNI/Vision/UUID/非空 Short ID 安全约束' self_config_check
     self_report '配置、目录、安装记录和链接权限' security_permissions
     self_report 'REALITY 私钥与客户端公钥配对' self_key_pair_check
-    self_report '客户端链接使用域名且不含私钥' security_link_check
+    self_report '客户端链接地址符合当前模式且不含私钥' security_link_check
     self_report 'DNS 直连当前 VPS，无 CDN/CNAME/AAAA' self_dns_check "$SNI"
-    if [[ "$(public_ipv4 || true)" != "$SERVER_IP" ]]; then warn '警告：当前出口 IPv4 与初次安装记录不同，请确认 VPS IP/DNS 变更是否符合预期。'; fi
+    if [[ "$(public_ipv4 || true)" != "$SERVER_IP" ]]; then warn '警告：当前出口 IPv4 与安装记录的 IP 缓存不同，请确认 VPS IP/DNS 变更是否符合预期。'; fi
     security_item 'DNS 与已确认基线一致' security_dns_changed "$SNI"
     security_item 'CAA 证书颁发机构约束' security_caa_check "$SNI"
     self_report 'TLS 1.3 / X25519 / H2 和有效证书' self_tls_check "$SNI" 127.0.0.1:8443
@@ -2912,6 +3055,7 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   security-apply               将自有域名网站更新到当前安全模板
   fallback-limit [status|on|off] 可选的回落限速（默认关闭）
   show                         显示 vless:// 导入链接
+  addr [ip|domain [连接域名]]   切换客户端连接地址（不修改 REALITY SNI）
   status                       查看服务、配置、端口和伪装站点状态
   port [新端口]                修改端口
   sni [新域名|auto]            修改或自动优选 REALITY 伪装域名
@@ -2921,7 +3065,7 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   uuid                         重新生成 UUID
   rotate-keys                  轮换 REALITY 密钥和 Short ID
   rename [新名称]              修改节点名称
-  refresh-ip                   更新链接中的公网 IPv4
+  refresh-ip                   刷新公网 IPv4 缓存和链接，保持 IP/域名选择
   start|stop|restart           管理服务
   log [-f|行数]                查看日志
   update                       升级 Xray-core
@@ -2944,7 +3088,8 @@ menu_status() {
     esac
     load_metadata
     say " 当前状态：${GREEN}● 已安装${RESET} [Xray $(installed_version)]  ${color}● ${label}${RESET}"
-    say " 当前节点：${NODE_NAME}（${SERVER_IP}:${PORT}，SNI ${SNI}）"
+    say " 当前节点：${NODE_NAME}（$(client_address):${PORT}，SNI ${SNI}）"
+    client_address_status
     [[ "$NODE_MODE" != self ]] || self_network_status brief
 }
 
@@ -2967,7 +3112,7 @@ show_menu() {
     say '  9. 轮换 REALITY 密钥'
     say ' 10. 修改端口'
     say ' 11. 修改节点名称'
-    say ' 12. 刷新公网 IP'
+    say ' 12. 服务器地址管理（IP / 域名 / 刷新 IP）'
     say ' 13. 升级 Xray-core'
     say '----------------------------------'
     say '【高级功能】'
@@ -3000,7 +3145,7 @@ menu_action() {
         5) start_node ;; 6) stop_node ;; 7) restart_node ;;
         8) warn '操作后旧链接立即失效。'; change_uuid ;;
         9) warn '操作后旧链接立即失效。'; rotate_keys ;;
-        10) change_port ;; 11) rename_node ;; 12) refresh_ip ;; 13) update_xray ;;
+        10) change_port ;; 11) rename_node ;; 12) address_node ;; 13) update_xray ;;
         14) change_sni ;; 15) show_fastest_sni ;; 16) tfo_node ;; 17) vlessenc_node ;;
         18) website_status ;; 19) cert_command status ;; 20) cert_command renew-test ;;
         21) check_self ;; 22) security_check ;; 23) fallback_command ;; 24) security_apply ;;
@@ -3064,6 +3209,7 @@ main() {
         __cert-renew) self_cert_renew ;;
         __cert-alert) self_cert_alert ;;
         show) show_node ;;
+        addr) shift; address_node "$@" ;;
         status) status_node ;;
         port) shift; change_port "$@" ;;
         sni) shift; change_sni "$@" ;;

@@ -24,8 +24,11 @@ numbers="$(show_menu | awk '/^[[:space:]]+[0-9]+\./ {number=$1; sub(/\.$/, "", n
 # 安装与卸载不允许因为重排而反向分派；命令行旧数字仍保持旧语义。
 install_self() { say install-self; }; uninstall_node() { say uninstall; }
 show_node() { say show; }; website_status() { say website; }; security_apply() { say security-apply; }
+address_node() { say addr; }; refresh_ip() { say refresh-ip; }
 [[ "$(menu_action 2)" == install-self && "$(menu_action 26)" == uninstall ]]
 [[ "$(menu_action 18)" == website ]]
+[[ "$(menu_action 12)" == addr && "$(main addr ip)" == addr ]]
+[[ "$(main 12 2>/dev/null)" == refresh-ip ]]
 [[ "$(main 2 2>/dev/null)" == uninstall && "$(main 20 2>/dev/null)" == install-self ]]
 [[ "$(main 27 2>/dev/null)" == security-apply ]]
 [[ "$(main install-self)" == install-self && "$(main show)" == show ]]

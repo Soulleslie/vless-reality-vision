@@ -72,6 +72,7 @@ make_fixture() {
     touch "${LINK_FILE}.abcdef" "$TEST_DIR/.xray-update.abcdef"
     touch "$CONFIG_DIR/.change-backup.abcdef/config.json"
     touch "$CONFIG_DIR/.change-backup.abcdef/.vless-reality-owned"
+    touch "$CONFIG_DIR/.change-backup.abcdef/link.txt" "$CONFIG_DIR/.change-backup.abcdef/link-output.txt"
     touch "$CONFIG_DIR/.private.abcdef"
     touch "$CONFIG_DIR/foreign-file"
     printf '%s\n' 'ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json' > "$SERVICE"
