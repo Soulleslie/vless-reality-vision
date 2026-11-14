@@ -15,10 +15,17 @@ chown() { :; }
 public_ipv4() { printf '203.0.113.1'; }
 DNS_CASE=valid
 self_dns_query() {
+    case "$DNS_CASE" in
+        NXDOMAIN|SERVFAIL|REFUSED) printf ';; status: %s, id: 1\n' "$DNS_CASE"; return 0 ;;
+        timeout) printf 'communications error: timed out\n' >&2; return 9 ;;
+        noheader) printf 'unrecognized response\n'; return 0 ;;
+        aaaa-error) if [[ "$3" == AAAA ]]; then printf ';; status: SERVFAIL, id: 1\n'; return 0; fi ;;
+        resolver-error) if [[ "$1" == 8.8.8.8 ]]; then printf ';; status: REFUSED, id: 1\n'; return 0; fi ;;
+    esac
     printf ';; ->>HEADER<<- status: NOERROR, id: 1\n'
     if [[ "$3" == A ]]; then
         case "$DNS_CASE" in
-            valid) printf '%s 60 IN A 203.0.113.1\n' "$2" ;;
+            valid|aaaa-error|resolver-error) printf '%s 60 IN A 203.0.113.1\n' "$2" ;;
             wrong) printf '%s 60 IN A 203.0.113.2\n' "$2" ;;
             cname) printf '%s 60 IN CNAME cdn.example.com.\n%s 60 IN A 203.0.113.1\n' "$2" "$2" ;;
             missing) : ;;
@@ -29,6 +36,20 @@ self_dns_check node.example.com
 for DNS_CASE in wrong cname missing ipv6; do
     if self_dns_check node.example.com >/dev/null 2>&1; then echo "DNS 应拒绝 $DNS_CASE"; exit 1; fi
 done
+for DNS_CASE in NXDOMAIN SERVFAIL REFUSED timeout noheader aaaa-error resolver-error; do
+    if output="$(self_dns_check node.example.com 2>&1)"; then echo "DNS 应拒绝 $DNS_CASE"; exit 1; fi
+    [[ "$output" == *'node.example.com'* ]]
+    case "$DNS_CASE" in
+        NXDOMAIN|SERVFAIL|REFUSED) [[ "$output" == *"$DNS_CASE"* ]] ;;
+        timeout) [[ "$output" == *'未完成'* ]] ;;
+        noheader) [[ "$output" == *'UNKNOWN'* ]] ;;
+        aaaa-error) [[ "$output" == *'AAAA'*'SERVFAIL'* ]] ;;
+        resolver-error) [[ "$output" == *'8.8.8.8'*'REFUSED'* ]] ;;
+    esac
+done
+DNS_CASE=wrong
+output="$(self_dns_check node.example.com 2>&1 || true)"
+[[ "$output" == *'203.0.113.2'*'203.0.113.1'* ]]
 DNS_CASE=valid
 PORT=443; SNI=node.example.com; SERVER_IP=203.0.113.1; NODE_NAME=Test; PUBLIC_KEY=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB; SHORT_ID=0123456789abcdef
 NODE_MODE=self; VLESS_DECRYPTION=none
