@@ -53,8 +53,8 @@ fi
 
 command -v script >/dev/null 2>&1 || { printf '缺少 script 命令\n' >&2; exit 1; }
 printf -v child_command 'bash %q --child' "$ROOT/tests/tfo_menu.bash"
-output="$(printf '17\ny\n\n00\n' | script -q -e -c "$child_command" /dev/null)"
+output="$(printf '16\ny\n\n00\n' | script -q -e -c "$child_command" /dev/null)"
 [[ "$output" == *'TCP Fast Open 已开启'* ]]
 [[ "$output" == *'如果 SSH 经过此节点，连接可能中断。后台任务会继续执行'* ]]
-[[ "$output" == *'17. 开关 TCP Fast Open'*'17. 开关 TCP Fast Open'* ]]
+[[ "$output" == *'16. 开关 TCP Fast Open'*'16. 开关 TCP Fast Open'* ]]
 printf 'TFO 菜单交互验证通过\n'

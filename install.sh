@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.1.0'
+SCRIPT_VERSION='2.1.1'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -2829,7 +2829,7 @@ EOF
 menu_status() {
     if [[ ! -f "$MARKER" ]]; then say " 当前状态：${RED}● 未安装${RESET}"; return 0; fi
     if [[ ! -f "$CONFIG" ]]; then
-        warn ' 当前状态：● 节点文件不完整；可选择 2 重试卸载'
+        warn ' 当前状态：● 节点文件不完整；可选择 26 重试卸载'
         return 0
     fi
     local state color label
@@ -2849,41 +2849,63 @@ show_menu() {
     say '=================================='
     say " VLESS + REALITY + Vision ${RED}[v${SCRIPT_VERSION}]${RESET}"
     say '=================================='
+    say '【安装】'
     say '  1. 安装普通 REALITY（第三方 SNI）'
-    say ' 20. 安装自有域名 REALITY（偷自己）'
-    say '  2. 卸载节点'
-    say '  3. 升级 Xray-core'
+    say '  2. 安装自有域名 REALITY（偷自己）'
     say '----------------------------------'
-    say '  4. 启动服务'
-    say '  5. 停止服务'
-    say '  6. 重启服务'
-    say '----------------------------------'
-    say '  7. 修改端口'
-    say '  8. 修改伪装域名（支持自动优选）'
-    say '  9. 重新生成 UUID'
-    say ' 10. 轮换 REALITY 密钥'
+    say '【节点管理】'
+    say '  3. 查看导入链接'
+    say '  4. 查看运行状态'
+    say '  5. 启动服务'
+    say '  6. 停止服务'
+    say '  7. 重启服务'
+    say '  8. 重新生成 UUID'
+    say '  9. 轮换 REALITY 密钥'
+    say ' 10. 修改端口'
     say ' 11. 修改节点名称'
     say ' 12. 刷新公网 IP'
+    say ' 13. 升级 Xray-core'
     say '----------------------------------'
-    say ' 13. 查看导入链接'
-    say ' 14. 查看运行状态'
-    say ' 15. 查看运行日志'
-    say ' 16. 查看当前测速延迟最低的域名'
-    say ' 17. 开关 TCP Fast Open'
-    say ' 19. 开关 VLESS Encryption / 修改模式'
-    say ' 21. 查看自有域名网站状态'
-    say ' 22. 查看 SSL 证书'
-    say ' 23. 测试证书自动续期'
-    say ' 24. 一键检查自有域名配置'
-    say ' 25. 自有域名安全检查'
-    say ' 26. 可选回落限速'
-    say ' 27. 更新自有域名安全模板'
+    say '【高级功能】'
+    say ' 14. 修改伪装域名（支持自动优选）'
+    say ' 15. 查看当前测速延迟最低的域名'
+    say ' 16. 开关 TCP Fast Open'
+    say ' 17. 开关 VLESS Encryption / 修改模式'
+    say '----------------------------------'
+    say '【自有域名管理（仅自有域名模式）】'
+    say ' 18. 查看自有域名网站状态'
+    say ' 19. 查看 SSL 证书'
+    say ' 20. 测试证书自动续期'
+    say ' 21. 一键检查自有域名配置'
+    say ' 22. 自有域名安全检查'
+    say ' 23. 可选回落限速'
+    say ' 24. 更新自有域名安全模板'
+    say '----------------------------------'
+    say '【其他】'
+    say ' 25. 查看运行日志'
+    say ' 26. 卸载节点'
     say ' 00. 退出'
     say '=================================='
     menu_status
     say
 }
 menu_action() {
+    case "$1" in
+        1) install_node ;; 2) install_self ;;
+        3) show_node ;; 4) status_node ;;
+        5) start_node ;; 6) stop_node ;; 7) restart_node ;;
+        8) warn '操作后旧链接立即失效。'; change_uuid ;;
+        9) warn '操作后旧链接立即失效。'; rotate_keys ;;
+        10) change_port ;; 11) rename_node ;; 12) refresh_ip ;; 13) update_xray ;;
+        14) change_sni ;; 15) show_fastest_sni ;; 16) tfo_node ;; 17) vlessenc_node ;;
+        18) website_status ;; 19) cert_command status ;; 20) cert_command renew-test ;;
+        21) check_self ;; 22) security_check ;; 23) fallback_command ;; 24) security_apply ;;
+        25) log_node ;; 26) uninstall_node ;; *) return 2 ;;
+    esac
+}
+# 命令行历史数字参数保留原语义，避免旧自动化把卸载误解为安装等操作。
+# 新交互菜单仅由 menu_action 分派；非交互建议使用 install-self/show/uninstall 等命名命令。
+legacy_numeric_action() {
     case "$1" in
         1) install_node ;; 2) uninstall_node ;; 3) update_xray ;;
         4) start_node ;; 5) stop_node ;; 6) restart_node ;;
@@ -2904,14 +2926,14 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-17、19-27，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-7]|19|2[0-7]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-26，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-9]|2[0-6]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
         rc=$?
         set -e
-        [[ "$choice" == 2 && ! -f "$MANAGER" ]] && return 0
+        [[ "$choice" == 26 && ! -f "$MANAGER" ]] && return 0
         (( rc == 0 )) || say
         say
         read -r -p '* 按回车返回主菜单 *' || return 0
@@ -2956,7 +2978,10 @@ main() {
         log|logs) shift; log_node "$@" ;;
         update) update_xray ;;
         uninstall) uninstall_node ;;
-        [1-9]|1[0-7]|19|2[0-7]) need_root; menu_action "$1" ;;
+        [1-9]|1[0-7]|19|2[0-7])
+            need_root
+            warn '数字命令参数沿用旧编号；交互菜单已重新编号，建议使用 install-self/show/uninstall 等命名命令。' >&2
+            legacy_numeric_action "$1" ;;
         *) print_help; exit 2 ;;
     esac
 }
