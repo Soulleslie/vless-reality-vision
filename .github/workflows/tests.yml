@@ -37,7 +37,7 @@ jobs:
           echo "XRAY_TEST_BIN=$TEMP_DIR/xray" >> "$GITHUB_ENV"
       - name: Existing REALITY handshake and self-domain HTTPS/VLESS
         run: |
-          bash tests/reality_handshake.bash "$XRAY_TEST_BIN"
+          docker run --rm -e LC_ALL=C.UTF-8 -v "$PWD:/src:ro" -v "$XRAY_TEST_BIN:/xray:ro" vless-self-test bash tests/reality_handshake.bash /xray
           docker run --rm -e LC_ALL=C.UTF-8 -v "$PWD:/src:ro" -v "$XRAY_TEST_BIN:/xray:ro" vless-self-test bash tests/integration/self_tls.bash /xray
       - name: Real Certbot HTTP-01 and renewal against isolated Pebble
         run: bash tests/integration/acme.bash
