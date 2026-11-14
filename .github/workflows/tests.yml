@@ -13,7 +13,7 @@ jobs:
       matrix:
         debian: [bookworm, trixie]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, Node.js 24
       - name: Build isolated Nginx and Certbot environment
         run: docker build --build-arg DEBIAN_IMAGE=debian:${{ matrix.debian }}-slim -t vless-self-test -f tests/integration/Dockerfile .
       - name: Syntax, ShellCheck and unit/fault tests

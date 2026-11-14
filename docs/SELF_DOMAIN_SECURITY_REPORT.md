@@ -22,7 +22,7 @@
 | `tests/integration/Dockerfile` | 两代 Debian 的一次性真实协议环境 |
 | `tests/integration/self_tls.bash` | 实际 Nginx/Xray、正负认证、Host、限速、站点升级及实际卸载 |
 | `tests/integration/acme.bash`、`acme_client.bash`、`pebble.json` | 真实 Certbot 与隔离 Pebble 的 HTTP-01 签发、续期和 reload hook |
-| `.github/workflows/tests.yml` | Debian Bookworm/Trixie 双矩阵运行以上检查；仅测试容器增加查看非 root fd 所需的 SYS_PTRACE |
+| `.github/workflows/tests.yml` | Debian Bookworm/Trixie 双矩阵运行以上检查；仅测试容器增加查看非 root fd 所需的 SYS_PTRACE；checkout 固定到官方 v7.0.1 commit（Node.js 24），消除旧运行时弃用提示 |
 
 ## 安全审查与实现
 
