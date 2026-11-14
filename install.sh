@@ -1905,7 +1905,7 @@ self_cert_renew() (
     (( rc == 0 )) || result=failed
     tmp="$(mktemp "$SELF_DIR/.renew.XXXXXX")" || return 1
     jq -n --arg domain "$domain" --arg result "$result" --arg time "$(date -u +%FT%TZ)" \
-        '{domain:$domain,result:$result,time:$time}' > "$tmp" && mv "$tmp" "$SELF_DIR/renew-status.json"
+        '{domain:$domain,result:$result,time:$time}' > "$tmp" && mv "$tmp" "$SELF_DIR/renew-status.json" || return 1
     if (( rc )); then logger -p daemon.err -t vless-reality-cert -- "证书续期失败：$domain；请以 root 检查项目私有日志。"; fi
     return "$rc"
 )
@@ -1916,7 +1916,7 @@ self_renew_test() {
         && self_wait_tls "$domain" && result=passed
     tmp="$(mktemp "$SELF_DIR/.renew.XXXXXX")" || return 1
     jq -n --arg domain "$domain" --arg result "$result" --arg date "$(date -u +%FT%TZ)" \
-        '{domain:$domain,result:$result,time:$date}' > "$tmp" && mv -f "$tmp" "$SELF_DIR/renew-test.json"
+        '{domain:$domain,result:$result,time:$date}' > "$tmp" && mv -f "$tmp" "$SELF_DIR/renew-test.json" || return 1
     [[ "$result" == passed ]]
 }
 cert_status() {

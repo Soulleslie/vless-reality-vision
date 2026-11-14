@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "${1:-}" != --child ]]; then
-    for stage in success dns provider credentials cert renewal timer nginx xray target; do
+    for stage in success dns provider credentials cert renewal renew-record timer nginx xray target; do
         bash "${BASH_SOURCE[0]}" --child "$stage" cloudflare
     done
     bash "${BASH_SOURCE[0]}" --child success http
@@ -85,6 +85,10 @@ curl() {
     if [[ "$1" == --version ]]; then printf 'curl HTTP2\n';
     elif [[ "$*" == *'.well-known/acme-challenge/'* ]]; then cat "$SELF_WEB/.well-known/acme-challenge/${*: -1:1}" 2>/dev/null || printf '%s' "${*: -1}" | awk -F/ '{print $NF}';
     else printf '2 200'; fi
+}
+mv() {
+    [[ "$STAGE" != renew-record || "${@: -1}" != "$SELF_DIR/renew-test.json" ]] || return 1
+    command mv "$@"
 }
 self_certbot() {
     if [[ "$1" == certonly ]]; then
