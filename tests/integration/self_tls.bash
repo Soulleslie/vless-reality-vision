@@ -10,7 +10,7 @@ trap '[[ -z "$server_pid" ]] || kill "$server_pid" 2>/dev/null || true; [[ -z "$
 [[ $EUID == 0 && -f /.dockerenv ]] || { echo '仅限一次性容器'; exit 1; }
 rm -f /etc/nginx/sites-enabled/default
 SELF_DIR=/etc/vless-reality-self; SELF_WEB=/var/www/vless-reality-self
-mkdir -p "$SELF_DIR/acme/live/node.example.test" "$SELF_DIR/work"; : > "$SELF_DIR/files.sha256"
+mkdir -p "$SELF_DIR/acme/live/node.example.test" "$SELF_DIR/work" "$SELF_DIR/logs"; : > "$SELF_DIR/files.sha256"
 openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj /CN=Test-CA -keyout "$TEST_DIR/ca.key" -out "$TEST_DIR/ca.crt" >/dev/null 2>&1
 cp "$TEST_DIR/ca.crt" /usr/local/share/ca-certificates/vless-test-ca.crt
 update-ca-certificates >/dev/null 2>&1
@@ -146,6 +146,20 @@ for mode in off native xorpub random; do
     [[ "$(sha256sum "$CONFIG" "$SELF_SITE" "$SELF_WEB/index.html" "$SELF_DIR/state.json" "$SELF_DIR/acme/live/$SNI/"*.pem)" == "$address_before" ]]
     [[ "$server_pid" == "$address_pid" ]]; kill -0 "$address_pid"
     printf '真实 IP/域名 Address 切换、SNI/证书/配置保留及免重启 / %s 通过\n' "$mode"
+    page_invariants="$(sha256sum "$CONFIG" "$MARKER" "$LINK_FILE" "$SELF_SITE" "$SELF_DIR/state.json" "$SELF_DIR/acme/live/$SNI/"*.pem)"
+    nginx_pid="$(< /run/nginx.pid)"
+    page_started="$(date +%s%3N)"
+    website_random > "$TEST_DIR/website-random.log" 2>&1 || { cat "$TEST_DIR/website-random.log"; exit 1; }
+    printf '网页更换本机实测 / %s：%s ms\n' "$mode" "$(( $(date +%s%3N) - page_started ))"
+    [[ "$(sha256sum "$SELF_WEB/index.html")" != "$page_digest" ]]
+    page_digest="$(sha256sum "$SELF_WEB/index.html")"
+    [[ "$(sha256sum "$CONFIG" "$MARKER" "$LINK_FILE" "$SELF_SITE" "$SELF_DIR/state.json" "$SELF_DIR/acme/live/$SNI/"*.pem)" == "$page_invariants" ]]
+    [[ "$server_pid" == "$address_pid" && "$(< /run/nginx.pid)" == "$nginx_pid" ]]; kill -0 "$address_pid"
+    self_file_owned "$SELF_WEB/index.html"; self_site_http_matches "$SNI" "$SELF_WEB/index.html"
+    self_http_check "$SNI" "$container_ip" 443
+    self_client_probe "$SNI" "$container_ip"
+    [[ -z "$(find "$SELF_DIR/work" -name 'site-backup.*' -o -name 'site-response.*')" && -z "$(find "$SELF_WEB" -name '.page.*')" ]]
+    printf '真实随机网页更换、HTTPS/H2 内容、节点/证书/链接保留及免重启 / %s 通过\n' "$mode"
     before="$(wc -l < "$TEST_DIR/origin.log")"
     for bad in bad-uuid bad-reality bad-public-key; do
         result=0; self_client_probe "$SNI" "$container_ip" 443 "$bad" || result=$?
@@ -208,6 +222,8 @@ printf 'ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.jso
 mkdir -p "$SELF_DIR/logs"; printf 'private log\n' > "$SELF_DIR/logs/test.log"
 # 模拟 SIGKILL 留在私有工作目录的半成品，卸载应一并清理。
 printf 'interrupted page\n' > "$SELF_DIR/work/site.orphan"
+printf 'interrupted public HTML\n' > "$SELF_WEB/.well-known/acme-challenge/.page.orphan"
+mkdir "$SELF_DIR/work/site-backup.orphan"; cp "$SELF_WEB/index.html" "$SELF_DIR/work/site-backup.orphan/index.html"
 printf 'dns_cloudflare_api_token = cleanup-test-only\n' > "$SELF_DIR/cloudflare.ini"
 self_track "$SELF_DIR/cloudflare.ini"
 confirm() { return 0; }

@@ -25,8 +25,9 @@ def pick(n):
     return real(n)
 secrets.randbelow = pick
 secrets.choice = lambda values: values[(0, -1, -2)[variant]]
+sys.argv = ["site-render", *sys.argv[4:]]
 exec(compile(sys.stdin.read(), "site-render", "exec"))
-' "$theme_index" "$variant"
+' "$theme_index" "$variant" "$@"
 }
 for index in {0..13}; do
     theme_index=$((index % 6)); variant=$((index / 6))

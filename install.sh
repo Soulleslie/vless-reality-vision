@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.3.0'
+SCRIPT_VERSION='2.3.1'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -1810,7 +1810,9 @@ self_track() {
         awk -v path="$path" 'substr($0,67) != path' "$SELF_DIR/files.sha256" > "$tmp" || { rm -f "$tmp"; return 1; }
     fi
     digest="$(sha256sum -- "$source" | awk '{print $1}')" || { rm -f "$tmp"; return 1; }
-    printf '%s  %s\n' "$digest" "$path" >> "$tmp" && mv -f -- "$tmp" "$SELF_DIR/files.sha256"
+    if ! printf '%s  %s\n' "$digest" "$path" >> "$tmp" || ! mv -f -- "$tmp" "$SELF_DIR/files.sha256"; then
+        rm -f -- "$tmp"; return 1
+    fi
 }
 self_publish() {
     local source="$1" destination="$2" mode="$3"
@@ -2048,21 +2050,14 @@ EOF
     self_publish "$tmp" "$SELF_SITE" 644
 }
 self_nginx_apply() { nginx -t && { if systemctl is-active --quiet nginx; then systemctl reload nginx; else systemctl start nginx; fi; }; }
-self_site_write() (
-    local tmp
-    [[ -d "$SELF_DIR" && ! -L "$SELF_DIR" && -d "$SELF_DIR/work" && ! -L "$SELF_DIR/work" \
-        && -f "$SELF_DIR/files.sha256" && ! -L "$SELF_DIR/files.sha256" ]] || return 1
-    [[ ! -L "$SELF_WEB" && ( ! -e "$SELF_WEB" || -d "$SELF_WEB" ) ]] || return 1
-    if [[ -e "$SELF_WEB/index.html" || -L "$SELF_WEB/index.html" ]]; then
-        self_file_owned "$SELF_WEB/index.html" || { warn '网页已被修改或无法确认归属，未覆盖。' >&2; return 1; }
-        return 0
-    fi
-    tmp="$(mktemp "$SELF_DIR/work/site.XXXXXX")" || return 1
-    trap 'rm -f -- "$tmp"' EXIT
-    # 只在新安装时运行一次；全部图形、样式和内容内嵌，无网络请求、额外素材或模板元数据。
-    if ! python3 - > "$tmp" <<'PY_SITE'
+self_site_render() {
+    # 仅安装或用户明确更换时生成；无网络请求、额外素材或模板元数据。
+    python3 - "$@" <<'PY_SITE'
 import html
+import pathlib
+import re
 import secrets
+import sys
 from random import SystemRandom
 
 themes = [
@@ -2115,6 +2110,10 @@ themes = [
                   ("傍晚的方向", "跟着逐渐变长的影子慢慢走，留意一天结束之前，街边的声音和颜色。"),
                   ("季节的片段", "风的温度、树梢的新芽和渐晚的日落，常常比日历更早提醒季节正在变化。")]),
 ]
+if len(sys.argv) > 1:
+    previous = re.search(r'<body class="([a-z]+)"', pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+    if previous:
+        themes = [theme for theme in themes if theme["kind"] != previous[1]]
 theme = themes[secrets.randbelow(len(themes))]
 paper, panel, ink, muted, accent, line = secrets.choice([
     ("#f4f1e9", "#fffcf6", "#253a31", "#5d7063", "#397b61", "#cdd5c9"),
@@ -2174,10 +2173,90 @@ mobile = '@media(max-width:680px){body{font-size:16px}header{align-items:flex-st
 footer = '<footer><span>' + e(title) + '</span><span>' + e(secrets.choice(['留给日常与好奇心的地方', '从小事开始，保持观察', '记录过程，也享受过程'])) + '</span></footer>'
 print('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="' + e(theme["intro"]) + '"><title>' + e(title) + '</title><style>' + variables + base + extra + mobile + '</style></head><body class="' + kind + '" id="top">' + content + footer + '</body></html>')
 PY_SITE
-    then return 1; fi
+}
+self_site_write() (
+    local tmp
+    [[ -d "$SELF_DIR" && ! -L "$SELF_DIR" && -d "$SELF_DIR/work" && ! -L "$SELF_DIR/work" \
+        && -f "$SELF_DIR/files.sha256" && ! -L "$SELF_DIR/files.sha256" ]] || return 1
+    [[ ! -L "$SELF_WEB" && ( ! -e "$SELF_WEB" || -d "$SELF_WEB" ) ]] || return 1
+    if [[ -e "$SELF_WEB/index.html" || -L "$SELF_WEB/index.html" ]]; then
+        self_file_owned "$SELF_WEB/index.html" || { warn '网页已被修改或无法确认归属，未覆盖。' >&2; return 1; }
+        return 0
+    fi
+    tmp="$(mktemp "$SELF_DIR/work/site.XXXXXX")" || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    self_site_render > "$tmp" || return 1
     [[ -s "$tmp" ]] || return 1
     install -d -m 755 "$SELF_WEB" || return 1
     self_publish "$tmp" "$SELF_WEB/index.html" 644
+)
+# 使用原已纳入卸载范围的挑战目录暂存公开 HTML，确保与首页同文件系统原子替换。
+# 暂存文件无凭据，初始 600；目录/符号链接检查不依赖旧版宽松的挑战路径白名单。
+self_site_stage_dir() {
+    local path mode
+    for path in "$SELF_WEB" "$SELF_WEB/.well-known" "$SELF_WEB/.well-known/acme-challenge"; do
+        [[ ! -L "$path" ]] || return 1
+        if [[ ! -e "$path" && "$path" != "$SELF_WEB" ]]; then install -d -m 755 "$path" || return 1; fi
+        [[ -d "$path" && "$(stat -c %u "$path")" == 0 ]] || return 1
+        mode="$(stat -c %a "$path")" || return 1
+        (( (8#$mode & 0022) == 0 )) || return 1
+        [[ "$(stat -c %d "$path")" == "$(stat -c %d "$SELF_WEB")" ]] || return 1
+    done
+    printf '%s' "$SELF_WEB/.well-known/acme-challenge"
+}
+self_site_atomic_publish() (
+    local source="$1" directory tmp
+    [[ -f "$source" && ! -L "$source" && -s "$source" ]] || return 1
+    directory="$(self_site_stage_dir)" || return 1
+    tmp="$(mktemp "$directory/.page.XXXXXX")" || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    cp -- "$source" "$tmp" && self_publish "$tmp" "$SELF_WEB/index.html" 644
+)
+self_site_http_matches() (
+    local domain="$1" expected="$2" tmp result
+    tmp="$(mktemp "$SELF_DIR/work/site-response.XXXXXX")" || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    result="$(curl --noproxy '*' --http2 --tlsv1.3 --tls-max 1.3 -fsS --connect-timeout 5 --max-time 15 \
+        --resolve "$domain:8443:127.0.0.1" -o "$tmp" -w '%{http_version} %{http_code}' "https://$domain:8443/")" || return 1
+    [[ "$result" == '2 200' ]] && cmp -s -- "$expected" "$tmp"
+)
+website_random() (
+    need_root
+    [[ $# == 0 ]] || fail '用法：website-random（仅更换自有域名网页）'
+    self_operation_lock; load_metadata
+    [[ "$NODE_MODE" == self ]] || fail '随机网页仅适用于自有域名模式。'
+    if ! self_managed_paths_ok || ! self_cleanup_preflight || ! self_config_check; then fail '资源归属或节点配置异常，未更换网页。'; fi
+    [[ -f "$SELF_WEB/index.html" && ! -L "$SELF_WEB/index.html" ]] || fail '原网页缺失或路径异常，未修改。'
+    systemctl is-active --quiet nginx || fail 'Nginx 当前未运行，请先恢复原网站。'
+    self_site_http_matches "$SNI" "$SELF_WEB/index.html" || fail '原网站 HTTPS/H2/200 或内容基线未通过，未修改。'
+    self_site_stage_dir >/dev/null || fail '网站暂存目录权限、链接或文件系统异常，未修改。'
+    local backup committed=0 changed=0 rc
+    backup="$(mktemp -d "$SELF_DIR/work/site-backup.XXXXXX")" || exit 1
+    if ! cp -a "$SELF_WEB/index.html" "$backup/index.html" || ! cp -a "$SELF_DIR/files.sha256" "$backup/files.sha256"; then
+        rm -rf -- "$backup"; fail '网页备份失败，未修改。'
+    fi
+    trap 'rc=$?; trap - EXIT; trap "" HUP INT TERM
+        if (( ! committed && changed )); then
+            if ! self_site_atomic_publish "$backup/index.html" || ! cp -a "$backup/files.sha256" "$SELF_DIR/files.sha256"; then
+                warn "网页回滚失败，保留备份：$backup" >&2; exit 1
+            fi
+        fi
+        rm -rf -- "$backup" || exit 1
+        exit "$rc"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    self_site_render "$backup/index.html" > "$backup/new.html" || fail '随机网页生成失败，原网页保留。'
+    [[ -s "$backup/new.html" ]] || fail '随机网页为空，原网页保留。'
+    # shellcheck disable=SC2034 # EXIT trap 读取事务状态。
+    changed=1
+    self_site_atomic_publish "$backup/new.html" || fail '网页发布失败，正在恢复原网页。'
+    self_site_http_matches "$SNI" "$SELF_WEB/index.html" || fail '新网页 HTTPS/H2/200 或内容检查失败，正在恢复原网页。'
+    # shellcheck disable=SC2034 # EXIT trap 读取事务状态。
+    committed=1
+    rm -rf -- "$backup" || fail "网页已更换，但备份清理失败：$backup"
+    trap - EXIT HUP INT TERM
+    ok '随机网页已更换；节点信息、证书和链接不变，无需重新导入，也未重启服务。'
 )
 self_scrub_logs() {
     [[ -f "$SELF_DIR/cloudflare.ini" ]] || return 0
@@ -3293,8 +3372,9 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   check-self                   检查自有域名完整部署
   cert [status|renew-test]      证书和自动续期状态
   website                      查看本地网站状态
+  website-random               更换自有域名随机网页，保留节点信息且不重启服务
   security-check               检查自有域名认证、权限、DNS、TLS 和回落安全
-  security-apply               将自有域名网站更新到当前安全模板
+  security-apply               更新自有域名 Nginx 安全配置，不更换网页
   fallback-limit [status|on|off] 可选的回落限速（默认关闭）
   show                         显示 vless:// 导入链接
   addr [ip|domain [连接域名]]   切换客户端连接地址（不修改 REALITY SNI）
@@ -3370,11 +3450,12 @@ show_menu() {
     say ' 21. 一键检查自有域名配置'
     say ' 22. 自有域名安全检查'
     say ' 23. 可选回落限速'
-    say ' 24. 更新自有域名安全模板'
+    say ' 24. 更新 Nginx 安全配置（原安全模板）'
     say '----------------------------------'
     say '【其他】'
     say ' 25. 查看运行日志'
     say ' 26. 卸载节点'
+    say ' 27. 更换自有域名随机网页（节点信息不变）'
     say ' 00. 退出'
     say '=================================='
     menu_status
@@ -3391,7 +3472,7 @@ menu_action() {
         14) change_sni ;; 15) show_fastest_sni ;; 16) tfo_node ;; 17) vlessenc_node ;;
         18) website_status ;; 19) cert_command status ;; 20) cert_command renew-test ;;
         21) check_self ;; 22) security_check ;; 23) fallback_command ;; 24) security_apply ;;
-        25) log_node ;; 26) uninstall_node ;; *) return 2 ;;
+        25) log_node ;; 26) uninstall_node ;; 27) website_random ;; *) return 2 ;;
     esac
 }
 # 命令行历史数字参数保留原语义，避免旧自动化把卸载误解为安装等操作。
@@ -3417,8 +3498,8 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-26，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-9]|2[0-6]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-27，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-9]|2[0-7]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
@@ -3446,6 +3527,7 @@ main() {
         fallback-limit) shift; fallback_command "$@" ;;
         __fallback-apply) shift; fallback_apply "$@" ;;
         website) website_status ;;
+        website-random) shift; website_random "$@" ;;
         cert) shift; cert_command "$@" ;;
         __self-domain) shift; self_domain_apply "$@" ;;
         __cert-renew) self_cert_renew ;;

@@ -125,6 +125,7 @@ cp() {
     command cp "$@"
 }
 self_client_probe() { [[ "$STAGE" != nat-auth ]]; }
+self_site_http_matches() { return 0; } # 实际 H2 与逐字节内容比较由协议测试执行。
 self_public_probe() {
     case "$STAGE" in nat-pending|nat-auth) return 3 ;; public-http) return 1 ;; *) return 0 ;; esac
 }
@@ -193,6 +194,12 @@ address_node domain >/dev/null; load_metadata
 mv "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" "$SELF_DIR/work/hook-backup"
 if self_renew_ready >/dev/null 2>&1; then echo '缺失 hook 不应通过检查'; exit 1; fi
 mv "$SELF_DIR/work/hook-backup" "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx"
+before_page_change="$(sha256sum "$CONFIG" "$MARKER" "$LINK_FILE" "$SELF_SITE" "$SELF_DIR/state.json")"
+website_random >/dev/null
+[[ "$(sha256sum "$CONFIG" "$MARKER" "$LINK_FILE" "$SELF_SITE" "$SELF_DIR/state.json")" == "$before_page_change" ]]
+[[ "$(sha256sum "$SELF_WEB/index.html")" != "$old_page" ]]; self_file_owned "$SELF_WEB/index.html"
+mkdir "$SELF_DIR/work/site-backup.orphan"; cp "$SELF_WEB/index.html" "$SELF_DIR/work/site-backup.orphan/index.html"
+printf 'interrupted page\n' > "$SELF_WEB/.well-known/acme-challenge/.page.orphan"
 # 安全检查记录应随项目目录一起清理。
 printf '{"external":"unverified"}\n' > "$SELF_DIR/security-last.json"
 # 中断的包安装保护文件也应随卸载清理。
