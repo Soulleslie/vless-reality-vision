@@ -6,6 +6,8 @@ source <(sed '$d' "$ROOT/install.sh")
 TEST_DIR="$(mktemp -d)"; trap 'rm -rf "$TEST_DIR"' EXIT
 CONFIG_DIR="$TEST_DIR/config"; CONFIG="$CONFIG_DIR/config.json"; MARKER="$CONFIG_DIR/.vless-reality-owned"; XRAY_BIN="$TEST_DIR/xray"
 SELF_DIR="$TEST_DIR/no-self-state"; mkdir -p "$CONFIG_DIR"
+SELF_WEB="$TEST_DIR/web"; mkdir "$SELF_WEB"; printf 'existing website\n' > "$SELF_WEB/index.html"
+old_page="$(sha256sum "$SELF_WEB/index.html")"
 PORT=443; SNI=node.example.com; NODE_NAME=Self; SERVER_IP=203.0.113.1; PUBLIC_KEY=pub; SHORT_ID=0123456789abcdef; NODE_MODE=self; ADDR_MODE=ip
 chown() { :; }; need_root() { :; }; ensure_dependencies() { :; }; systemctl() { return 1; }
 write_marker
@@ -26,6 +28,7 @@ old="$(sha256sum "$CONFIG" "$MARKER")"
 [[ "$(sha256sum "$CONFIG" "$MARKER")" == "$old" ]]
 load_metadata
 [[ "$NODE_MODE" == self && "$ADDR_MODE" == ip && "$(client_address)" == "$SERVER_IP" ]]
+[[ "$(sha256sum "$SELF_WEB/index.html")" == "$old_page" ]]
 # 旧版本六行安装记录在升级时也不应被重写。
 sed -i '7,$d' "$MARKER"
 old="$(sha256sum "$CONFIG" "$MARKER")"

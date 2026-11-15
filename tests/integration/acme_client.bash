@@ -10,6 +10,7 @@ mkdir -p "$SELF_DIR/"{acme,logs,work}
 : > "$SELF_DIR/files.sha256"
 rm /etc/nginx/sites-enabled/default
 self_site_write; self_nginx_write "$SNI" no
+page_digest="$(sha256sum "$SELF_WEB/index.html")"
 nginx -t; nginx
 self_http_challenge_check "$SNI" "$(hostname -I | awk '{print $1}')"
 trap 'nginx -s quit 2>/dev/null || true' EXIT
@@ -38,5 +39,6 @@ chmod 755 /usr/local/bin/systemctl
 if ! self_renew_test "$SNI"; then cat "$SELF_DIR/logs/renew-test.log"; exit 1; fi
 self_tls_check "$SNI" 127.0.0.1:8443
 self_http_check "$SNI" 127.0.0.1 8443
+[[ "$(sha256sum "$SELF_WEB/index.html")" == "$page_digest" ]]
 jq -e '.result=="passed"' "$SELF_DIR/renew-test.json" >/dev/null
 printf '真实 Certbot HTTP-01 签发、renew --dry-run 和 Nginx deploy hook 均通过（Pebble 测试 CA）\n'
