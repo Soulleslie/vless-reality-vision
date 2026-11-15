@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.2.2'
+SCRIPT_VERSION='2.3.0'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -2048,14 +2048,137 @@ EOF
     self_publish "$tmp" "$SELF_SITE" 644
 }
 self_nginx_apply() { nginx -t && { if systemctl is-active --quiet nginx; then systemctl reload nginx; else systemctl start nginx; fi; }; }
-self_site_write() {
-    install -d -m 755 "$SELF_WEB"
-    cat > "$SELF_WEB/index.html" <<'HTML'
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>小径 · 留白</title><style>*{box-sizing:border-box}body{margin:0;background:#f3f0e9;color:#23382e;font:18px/1.8 system-ui,sans-serif}main{max-width:1050px;margin:auto;padding:12vh 7vw}small{letter-spacing:.2em}h1{font-size:clamp(48px,8vw,100px);line-height:1.15;font-weight:500;letter-spacing:-.06em}p{max-width:550px;color:#55665b}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:28px;margin-top:70px;border-top:1px solid #ccd2c8;padding-top:30px}article{font-size:15px}footer{margin-top:90px;font-size:13px;color:#778577}</style><main><small>FIELD NOTES / 日常观察</small><h1>走慢一点，<br>看见更多。</h1><p>这里记录微小而值得留意的事：清晨的光、窗边的植物，以及一段安静的阅读时间。</p><section class="grid"><article><b>01 / 自然</b><p>在四季之间，收集新的颜色。</p></article><article><b>02 / 阅读</b><p>给好奇心留下一页空白。</p></article><article><b>03 / 生活</b><p>把日常过成喜欢的样子。</p></article></section><footer>小径 · 留白 — 一个关于观察与生活的静态空间</footer></main></html>
-HTML
-    chmod 644 "$SELF_WEB/index.html"
-    self_track "$SELF_WEB/index.html"
-}
+self_site_write() (
+    local tmp
+    [[ -d "$SELF_DIR" && ! -L "$SELF_DIR" && -d "$SELF_DIR/work" && ! -L "$SELF_DIR/work" \
+        && -f "$SELF_DIR/files.sha256" && ! -L "$SELF_DIR/files.sha256" ]] || return 1
+    [[ ! -L "$SELF_WEB" && ( ! -e "$SELF_WEB" || -d "$SELF_WEB" ) ]] || return 1
+    if [[ -e "$SELF_WEB/index.html" || -L "$SELF_WEB/index.html" ]]; then
+        self_file_owned "$SELF_WEB/index.html" || { warn '网页已被修改或无法确认归属，未覆盖。' >&2; return 1; }
+        return 0
+    fi
+    tmp="$(mktemp "$SELF_DIR/work/site.XXXXXX")" || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    # 只在新安装时运行一次；全部图形、样式和内容内嵌，无网络请求、额外素材或模板元数据。
+    if ! python3 - > "$tmp" <<'PY_SITE'
+import html
+import secrets
+from random import SystemRandom
+
+themes = [
+    dict(kind="profile", titles=["山间手记", "平日档案", "片刻札记", "慢声记录"], label="PERSONAL NOTES",
+         headline=["把平常的日子，认真收藏。", "在日常里，留一点空白。", "慢一点，也有新的发现。"],
+         intro="留意生活里的细节，整理想法，也记录那些值得停下来看的瞬间。这里是一处安静的个人空间。",
+         about="不急着给每件事下结论，让观察、阅读和实践慢慢留下自己的形状。",
+         entries=[("清晨的光", "窗边的光线每天都有细微的变化。给一杯热茶的时间，也给今天一个从容的开始。"),
+                  ("手边的植物", "新叶舒展的速度很慢，却总能提醒人保持耐心。照顾小事，也是照顾生活。"),
+                  ("散步的路线", "偶尔走一条不同的路，看看街角的树、旧店招，以及傍晚还没散去的颜色。"),
+                  ("一页随想", "把还没有成形的念头写下来，过些时候再读，也许会找到新的联系。")]),
+    dict(kind="journal", titles=["纸上实验室", "简明笔记", "格物小记", "思考草稿"], label="IDEAS & PRACTICE",
+         headline=["让问题，带来下一次探索。", "从一个小问题开始。", "想清楚，再做一点。"],
+         intro="整理学习与实践中的片段：一个清晰的问题、一份可重复的方法，以及一次认真复盘。",
+         about="笔记的价值不在于一次写得完整，而在于能被重新理解、验证和改进。",
+         entries=[("记录的方法", "先写观察，再写推测。把前提、过程和结论分开，后来的人也能沿着同一条线索继续思考。"),
+                  ("从简开始", "让最小的想法先运行起来，再决定哪些细节值得增加。清楚的边界往往比复杂的结构更有帮助。"),
+                  ("整理工作台", "给资料一个明确的位置，为重要的内容留下索引。减少寻找，也就多出了一点专注的时间。"),
+                  ("回看与修正", "记录做过的选择和当时的理由。复盘不必急着评判，先理解变化发生在哪里。")]),
+    dict(kind="studio", titles=["原点工作室", "微光造物", "小型实践", "折线计划"], label="SMALL PROJECTS",
+         headline=["让想法，慢慢成为作品。", "从草图走向日常。", "为简单的事，做细致的设计。"],
+         intro="关注小而具体的创作：从需求到草图，从尝试到打磨，把注意力放在有用、清晰与长久。",
+         about="好的作品来自持续的小步调整。保留过程，也为下一次尝试留下空间。",
+         entries=[("纸面与结构", "从线条和比例开始，探索信息怎样排列才更容易被理解。让结构先回答问题，再加入装饰。"),
+                  ("一件日常物", "观察一件常用物品的边缘、手感与使用方式，寻找不引人注意却让体验更顺畅的细节。"),
+                  ("小工具的想法", "把重复的步骤整理成清楚的流程，为一个具体的小问题寻找轻巧的解法。"),
+                  ("迭代中的片段", "收集草稿和试验留下的痕迹。没有采用的方向，也可能成为另一件作品的起点。")]),
+    dict(kind="gallery", titles=["形色之间", "视觉散记", "构成练习", "一隅画室"], label="VISUAL STUDIES",
+         headline=["在形与色之间，看见秩序。", "用简单的形状，记录感受。", "给视线，一点新的方向。"],
+         intro="关于线条、色块、材质与留白的视觉练习。减少不必要的元素，让每一次观看都更轻松。",
+         about="观察是创作的起点。把熟悉的事物重新排列，也会产生新的节奏。",
+         entries=[("线的节奏", "平行、交错与轻微的偏移，可以为同一个平面带来不同的方向感。"),
+                  ("留白的比例", "画面不必被填满。安静的区域也参与表达，给重要的信息留出呼吸的空间。"),
+                  ("柔和的边界", "尝试让色彩靠近自然光下的变化，在对比与协调之间寻找平衡。"),
+                  ("重复与变化", "在稳定的结构中加入一点差异，让相近的形状保持联系，也保留各自的个性。")]),
+    dict(kind="library", titles=["页间时光", "案头阅读", "书页旁边", "阅读余白"], label="READING JOURNAL",
+         headline=["读一段文字，也读一会儿自己。", "在书页之间，遇见新的问题。", "把阅读，留在日常里。"],
+         intro="记录阅读带来的思考、联想与问题。不追求数量，愿意把一段值得回味的文字读得更慢。",
+         about="每次重读都会带来不同的理解。让笔记保持开放，也让自己的观点有机会改变。",
+         entries=[("阅读的节奏", "有时连续读上几页，有时只停留在一个段落。找到适合当下的速度，比赶往结尾更重要。"),
+                  ("页边的问题", "把不确定的地方留下来，不急着寻找唯一答案。一个好问题常常会带来另一段阅读。"),
+                  ("文字之外", "试着把书中的观察放回日常，看看它怎样与眼前的事情发生联系。"),
+                  ("重新翻开", "隔一段时间回到旧笔记，看看哪些想法仍然清晰，哪些已经有了新的解释。")]),
+    dict(kind="trail", titles=["沿路拾光", "远近之间", "漫步地图", "行走随笔"], label="WALK & WONDER",
+         headline=["不必走远，也能遇见风景。", "让脚步，跟着好奇心。", "沿着小路，看看这个世界。"],
+         intro="留意沿途的光线、建筑与季节。用短短的文字，收集那些容易从记忆里溜走的片刻。",
+         about="保持开放的目光。熟悉的地方也会变化，一次普通的散步同样值得记录。",
+         entries=[("雨后的街道", "路面映出另一层天空，树叶的颜色也更清晰。换一种天气，熟悉的街道就有了新的表情。"),
+                  ("城市的边缘", "从热闹走向安静，观察建筑与空地之间的过渡，也感受一座城市不同的呼吸。"),
+                  ("傍晚的方向", "跟着逐渐变长的影子慢慢走，留意一天结束之前，街边的声音和颜色。"),
+                  ("季节的片段", "风的温度、树梢的新芽和渐晚的日落，常常比日历更早提醒季节正在变化。")]),
+]
+theme = themes[secrets.randbelow(len(themes))]
+paper, panel, ink, muted, accent, line = secrets.choice([
+    ("#f4f1e9", "#fffcf6", "#253a31", "#5d7063", "#397b61", "#cdd5c9"),
+    ("#f2f4f7", "#ffffff", "#24394b", "#5d7183", "#336f9e", "#ced8e1"),
+    ("#faf0e8", "#fffaf5", "#49352d", "#80675a", "#a14e35", "#e0cfc2"),
+    ("#f4f0f7", "#fffaff", "#393047", "#74657f", "#815399", "#d9cde1"),
+    ("#f6f3e4", "#fffdf2", "#424125", "#77734e", "#7c7835", "#ded9b9"),
+    ("#192323", "#22302f", "#f0f0e5", "#b3c3b8", "#a3d8b1", "#3d514a"),
+    ("#20232d", "#2a2e3c", "#f2ecdf", "#bcc2d0", "#dbb282", "#465066"),
+    ("#faf5f0", "#ffffff", "#3c3936", "#77716a", "#9a6044", "#ddd3c9"),
+])
+font = secrets.choice(["system-ui,sans-serif", "Georgia,'Noto Serif CJK SC',serif", "'Trebuchet MS',system-ui,sans-serif"])
+width = secrets.choice([960, 1040, 1120, 1200])
+radius = secrets.choice([4, 12, 22])
+title = secrets.choice(theme["titles"])
+headline = secrets.choice(theme["headline"])
+entries = SystemRandom().sample(theme["entries"], 3)
+marks = [
+    '<path d="M25 95C18 48 45 24 96 22c1 48-20 79-71 73Zm1-1 46-48"/>',
+    '<circle cx="60" cy="60" r="38"/><path d="M22 60h76M60 22v76"/>',
+    '<path d="m20 88 28-53 20 30 14-22 20 45Z"/><circle cx="83" cy="25" r="7"/>',
+    '<rect x="24" y="24" width="30" height="30"/><rect x="66" y="24" width="30" height="30"/><rect x="24" y="66" width="30" height="30"/><circle cx="81" cy="81" r="15"/>',
+    '<path d="M23 29c16-7 26-4 37 4 11-8 21-11 37-4v65c-16-7-26-4-37 4-11-8-21-11-37-4Zm37 4v65"/>',
+    '<path d="M17 87c21-52 38 29 58-23s25-21 28-37M18 106h85"/>',
+]
+mark = secrets.choice(marks)
+svg = '<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">' + mark + '</svg>'
+e = lambda value: html.escape(str(value), quote=True)
+nav = '<nav aria-label="页面导航"><a href="#collection">浏览记录</a><a href="#about">关于这里</a></nav>'
+brand = '<a class="brand" href="#top">' + svg + '<span>' + e(title) + '</span></a>'
+lead = '<p class="eyebrow">' + e(theme["label"]) + '</p><h1>' + e(headline) + '</h1><p class="lead">' + e(theme["intro"]) + '</p>'
+about = '<section class="about" id="about"><h2>关于这里</h2><p>' + e(theme["about"]) + '</p></section>'
+cards = ''.join('<article><span class="number">0' + str(i + 1) + '</span><h2>' + e(name) + '</h2><p>' + e(text) + '</p></article>' for i, (name, text) in enumerate(entries))
+kind = theme["kind"]
+if kind == "profile":
+    content = '<header>' + brand + nav + '</header><main><section class="hero split"><div>' + lead + '</div><div class="emblem">' + svg + '</div></section><section class="cards" id="collection">' + cards + '</section>' + about + '</main>'
+    extra = '.split{display:grid;grid-template-columns:1.6fr 1fr;gap:7%;align-items:center}.emblem{border:1px solid var(--line);border-radius:50%;padding:18%;color:var(--accent)}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:32px}.cards article{border-top:2px solid var(--accent);padding-top:22px}'
+elif kind == "journal":
+    content = '<header class="masthead">' + brand + nav + '</header><main><section class="hero">' + lead + '</section><section class="entries" id="collection">' + cards + '</section>' + about + '</main>'
+    extra = '.masthead{border-bottom:3px double var(--line)}.hero{max-width:820px}.entries article{display:grid;grid-template-columns:60px 1fr;gap:0 24px;padding:30px 0;border-top:1px solid var(--line)}.entries .number{grid-row:span 2}.entries h2{margin:0}.entries p{grid-column:2;margin-bottom:0}'
+elif kind == "studio":
+    content = '<header>' + brand + nav + '</header><main><section class="hero statement">' + lead + '</section><section class="projects" id="collection">' + cards + '</section>' + about + '</main>'
+    extra = '.statement{padding:6%;background:var(--panel);border-left:6px solid var(--accent);border-radius:var(--radius)}.projects{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}.projects article{padding:28px;border:1px solid var(--line);border-radius:var(--radius)}.projects h2{margin-top:36px}'
+elif kind == "gallery":
+    tiles = ''.join('<article><div class="study" style="transform:rotate(' + str(i - 1) + 'deg)">' + svg + '</div><h2>' + e(name) + '</h2><p>' + e(text) + '</p></article>' for i, (name, text) in enumerate(entries))
+    content = '<header>' + brand + nav + '</header><main><section class="hero">' + lead + '</section><section class="gallery-grid" id="collection">' + tiles + '</section>' + about + '</main>'
+    extra = '.hero{text-align:center;max-width:850px;margin-inline:auto}.gallery-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:30px}.study{aspect-ratio:4/3;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18%;color:var(--accent)}.gallery-grid h2{font-size:1.2rem}'
+elif kind == "library":
+    content = '<header>' + brand + nav + '</header><main><section class="hero reading">' + lead + '</section><section class="shelf" id="collection">' + cards + '</section>' + about + '</main>'
+    extra = '.reading{padding-bottom:34px;border-bottom:1px solid var(--line)}.shelf{display:grid;grid-template-columns:repeat(3,1fr);gap:26px}.shelf article{background:var(--panel);padding:32px 26px;border-left:9px solid var(--accent);box-shadow:4px 5px 0 var(--line)}.shelf h2{margin-top:44px}.shelf p{font-size:.95rem}'
+else:
+    content = '<header>' + brand + nav + '</header><main><section class="hero horizon"><div>' + lead + '</div><div class="landmark">' + svg + '</div></section><section class="trail-list" id="collection">' + cards + '</section>' + about + '</main>'
+    extra = '.horizon{display:grid;grid-template-columns:1.7fr 1fr;gap:8%;align-items:center}.landmark{color:var(--accent);padding:10%}.trail-list{padding-left:30px;border-left:1px solid var(--line)}.trail-list article{position:relative;margin-bottom:38px}.trail-list article:before{content:"";position:absolute;left:-36px;top:8px;width:11px;height:11px;border-radius:50%;background:var(--accent)}.trail-list .number{font-size:.8rem}'
+variables = ':root{' + f'--paper:{paper};--panel:{panel};--ink:{ink};--muted:{muted};--accent:{accent};--line:{line};--radius:{radius}px;--width:{width}px;--font:{font};' + '}'
+base = '*{box-sizing:border-box}html{scroll-behavior:auto}body{margin:0;background:var(--paper);color:var(--ink);font:17px/1.8 var(--font)}a{color:inherit;text-decoration:none}a:focus-visible{outline:2px solid var(--accent);outline-offset:5px}header,main,footer{width:min(var(--width),88%);margin-inline:auto}header{display:flex;justify-content:space-between;align-items:center;gap:24px;padding-block:30px}.brand{display:flex;align-items:center;gap:12px;font-weight:650}.brand svg{width:36px;height:36px;color:var(--accent);flex-shrink:0}nav{display:flex;gap:24px;font-size:.85rem}nav a{border-bottom:1px solid var(--line)}.hero{padding-block:clamp(42px,7vw,100px);margin-bottom:40px}h1{font-size:clamp(2.4rem,6.5vw,5rem);line-height:1.2;font-weight:500;letter-spacing:-.035em;margin:20px 0 26px}h2{font-size:1.25rem;font-weight:600}p{color:var(--muted)}.lead{max-width:680px}.eyebrow,.number{color:var(--accent);font-size:.8rem;letter-spacing:.14em}.about{margin-top:70px;padding-top:30px;border-top:1px solid var(--line);max-width:740px}footer{display:flex;justify-content:space-between;gap:18px;margin-block:60px 28px;font-size:.78rem;color:var(--muted)}svg{display:block;width:100%;height:auto}'
+mobile = '@media(max-width:680px){body{font-size:16px}header{align-items:flex-start;flex-direction:column;gap:14px}nav{gap:22px}.split,.horizon,.cards,.projects,.gallery-grid,.shelf{grid-template-columns:1fr}.emblem,.landmark{display:none}.hero{padding-block:36px}.statement{padding:8%}.entries article{grid-template-columns:36px 1fr;gap:0 12px}.study{aspect-ratio:2/1;padding:10% 32%}.about{margin-top:45px}footer{flex-direction:column;margin-top:45px}}'
+footer = '<footer><span>' + e(title) + '</span><span>' + e(secrets.choice(['留给日常与好奇心的地方', '从小事开始，保持观察', '记录过程，也享受过程'])) + '</span></footer>'
+print('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="' + e(theme["intro"]) + '"><title>' + e(title) + '</title><style>' + variables + base + extra + mobile + '</style></head><body class="' + kind + '" id="top">' + content + footer + '</body></html>')
+PY_SITE
+    then return 1; fi
+    [[ -s "$tmp" ]] || return 1
+    install -d -m 755 "$SELF_WEB" || return 1
+    self_publish "$tmp" "$SELF_WEB/index.html" 644
+)
 self_scrub_logs() {
     [[ -f "$SELF_DIR/cloudflare.ini" ]] || return 0
     python3 - "$SELF_DIR" <<'PY_SCRUB'
@@ -2325,7 +2448,7 @@ self_prepare() {
         rm -- /etc/nginx/sites-enabled/default
     fi
     nginx -T 2>&1 | grep -F 'include /etc/nginx/conf.d/*.conf;' >/dev/null || fail 'Nginx 主配置未包含 conf.d/*.conf，未修改已有主配置。'
-    self_site_write
+    self_site_write || fail '本地静态网页生成失败；安装将回滚。'
     if [[ "$SELF_METHOD" == http ]]; then
         if ! { self_nginx_write "$SNI" no && self_nginx_apply; }; then fail 'HTTP-01 验证入口启动失败。'; fi
         self_http_challenge_check "$SNI" "$SERVER_IP" || fail 'HTTP-01 的公网地址回访失败；请检查 TCP 80 安全组、防火墙和路由。'

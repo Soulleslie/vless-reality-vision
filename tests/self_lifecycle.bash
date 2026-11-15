@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "${1:-}" != --child ]]; then
-    for stage in success dns dns-late provider credentials cert renewal renew-record timer nginx xray target nat-pending nat-auth public-http; do
+    for stage in success dns dns-late provider credentials site-render site-publish cert renewal renew-record timer nginx xray target nat-pending nat-auth public-http; do
         bash "${BASH_SOURCE[0]}" --child "$stage" cloudflare
     done
     bash "${BASH_SOURCE[0]}" --child success http
@@ -98,7 +98,12 @@ curl() {
 }
 mv() {
     [[ "$STAGE" != renew-record || "${@: -1}" != "$SELF_DIR/renew-test.json" ]] || return 1
+    [[ "$STAGE" != site-publish || "${@: -1}" != "$SELF_WEB/index.html" ]] || return 1
     command mv "$@"
+}
+python3() {
+    if [[ "$STAGE" == site-render ]]; then printf 'partial page\n'; return 1; fi
+    command python3 "$@"
 }
 self_certbot() {
     if [[ "$1" == certonly ]]; then
@@ -160,10 +165,12 @@ if (install_self node.example.com "$METHOD" admin@example.com Test >/dev/null 2>
 address_node ip >/dev/null; load_metadata
 [[ "$ADDR_MODE" == ip && "$(< "$LINK_FILE")" == *'@203.0.113.1:443?'* ]]
 old_config="$(sha256sum "$CONFIG")"; old_site="$(sha256sum "$SELF_SITE")"
+old_page="$(sha256sum "$SELF_WEB/index.html")"
 old_address="$(sha256sum "$MARKER" "$LINK_FILE")"
 STAGE=domain-renewal
 if (self_domain_apply other.example.com >/dev/null 2>&1); then echo '域名续期失败应回滚'; exit 1; fi
 [[ "$(sha256sum "$CONFIG")" == "$old_config" && "$(sha256sum "$SELF_SITE")" == "$old_site" ]]
+[[ "$(sha256sum "$SELF_WEB/index.html")" == "$old_page" ]]
 [[ "$(sha256sum "$MARKER" "$LINK_FILE")" == "$old_address" ]]
 [[ "$(self_state domain)" == node.example.com ]]
 STAGE=security-rule
@@ -179,6 +186,7 @@ cp -a "$rollback_dir/site.conf" "$SELF_SITE"; cp -a "$rollback_dir/files.sha256"
 self_domain_apply other.example.com > "$TEST_DIR/domain.log" 2>&1 || { cat "$TEST_DIR/domain.log"; exit 1; }
 load_metadata
 [[ "$SNI" == other.example.com && "$ADDR_MODE" == ip && "$(< "$LINK_FILE")" == *'@203.0.113.1:443?'* && "$(< "$LINK_FILE")" == *'&sni=other.example.com&'* ]]
+[[ "$(sha256sum "$SELF_WEB/index.html")" == "$old_page" ]]
 address_node domain >/dev/null; load_metadata
 [[ "$(< "$LINK_FILE")" == *'@other.example.com:443?'* ]]
 # hook 缺失不能仅凭旧的 dry-run 记录报续期正常。

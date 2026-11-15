@@ -30,6 +30,11 @@ self_http_check node.example.test 127.0.0.1 8443
 self_loaded_cert_matches node.example.test
 self_reject_check node.example.test
 self_authority_check node.example.test
+page_digest="$(sha256sum "$SELF_WEB/index.html")"
+for attempt in 1 2; do
+    curl --noproxy '*' --http2 -fsS --resolve node.example.test:8443:127.0.0.1 https://node.example.test:8443/ -o "$TEST_DIR/page.html"
+    cmp "$SELF_WEB/index.html" "$TEST_DIR/page.html"
+done
 printf 'vless-reality-self-v1\n' > "$SELF_DIR/.owned"
 printf '# external site references %s/acme\n' "$SELF_DIR" > /etc/nginx/conf.d/other-test.conf
 if self_cleanup_preflight >/dev/null 2>&1; then echo '共享证书引用未受保护'; exit 1; fi
@@ -119,7 +124,7 @@ for mode in off native xorpub random; do
     show_node >/dev/null
     security_permissions; security_link_check; self_key_pair_check; security_service_user
     # IP/域名两种 Address 均进行真实 REALITY/Vision 请求；地址操作不能触碰配置、网站、证书或运行进程。
-    address_before="$(sha256sum "$CONFIG" "$SELF_SITE" "$SELF_DIR/state.json" "$SELF_DIR/acme/live/$SNI/"*.pem)"
+    address_before="$(sha256sum "$CONFIG" "$SELF_SITE" "$SELF_WEB/index.html" "$SELF_DIR/state.json" "$SELF_DIR/acme/live/$SNI/"*.pem)"
     address_pid="$server_pid"
     switch_address ip; load_metadata
     [[ "$(< "$LINK_FILE")" == *"@$container_ip:443?"* && "$(< "$LINK_FILE")" == *"&sni=$SNI&"* ]]
@@ -138,7 +143,7 @@ for mode in off native xorpub random; do
         self_client_probe "$SNI" "$(client_address)"
         NODE_MODE=self; ADDR_MODE=domain; ADDR_DOMAIN=''; write_marker; show_node >/dev/null
     fi
-    [[ "$(sha256sum "$CONFIG" "$SELF_SITE" "$SELF_DIR/state.json" "$SELF_DIR/acme/live/$SNI/"*.pem)" == "$address_before" ]]
+    [[ "$(sha256sum "$CONFIG" "$SELF_SITE" "$SELF_WEB/index.html" "$SELF_DIR/state.json" "$SELF_DIR/acme/live/$SNI/"*.pem)" == "$address_before" ]]
     [[ "$server_pid" == "$address_pid" ]]; kill -0 "$address_pid"
     printf '真实 IP/域名 Address 切换、SNI/证书/配置保留及免重启 / %s 通过\n' "$mode"
     before="$(wc -l < "$TEST_DIR/origin.log")"
@@ -191,6 +196,7 @@ for mode in off native xorpub random; do
         [[ "$(stat -c %a "$SELF_DIR/network-check.json")" == 600 ]]
     fi
     stop_server
+    [[ "$(sha256sum "$SELF_WEB/index.html")" == "$page_digest" ]]
     printf '真实 HTTPS/Host/SNI、认证拒绝、权限及回落限速/Vision/%s 通过\n' "$mode"
 done
 # 实际删除容器内资源与账号，不触碰只读挂载的官方二进制或仓库。
@@ -200,6 +206,8 @@ cp "$ROOT/install.sh" "$MANAGER"; chmod 700 "$MANAGER"
 printf '%s\n' "$SHORTCUT_TAG" > "$SHORTCUT"; chmod 755 "$SHORTCUT"
 printf 'ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json\n' > "$SERVICE"
 mkdir -p "$SELF_DIR/logs"; printf 'private log\n' > "$SELF_DIR/logs/test.log"
+# 模拟 SIGKILL 留在私有工作目录的半成品，卸载应一并清理。
+printf 'interrupted page\n' > "$SELF_DIR/work/site.orphan"
 printf 'dns_cloudflare_api_token = cleanup-test-only\n' > "$SELF_DIR/cloudflare.ini"
 self_track "$SELF_DIR/cloudflare.ini"
 confirm() { return 0; }
