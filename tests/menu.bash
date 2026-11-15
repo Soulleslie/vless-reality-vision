@@ -15,34 +15,43 @@ case "${1:-}" in
         touch "$MANAGER"
         uninstall_node() { rm -- "$MANAGER"; say 'TEST: uninstall'; }
         interactive_menu; exit 0 ;;
+    --child-website)
+        website_random() { say 'TEST: website-random'; }
+        interactive_menu; exit 0 ;;
 esac
 
-# 回归用户截图中的跳号：显示必须严格为 1..26、00，不能重复或乱序。
+# 保持旧 1..26 的操作，新增 27；显示不能重复或乱序。
 numbers="$(show_menu | awk '/^[[:space:]]+[0-9]+\./ {number=$1; sub(/\.$/, "", number); print number}')"
-[[ "$numbers" == "$(printf '%s\n' {1..26} 00)" ]]
+[[ "$numbers" == "$(printf '%s\n' {1..27} 00)" ]]
 
 # 安装与卸载不允许因为重排而反向分派；命令行旧数字仍保持旧语义。
 install_self() { say install-self; }; uninstall_node() { say uninstall; }
 show_node() { say show; }; website_status() { say website; }; security_apply() { say security-apply; }
 address_node() { say addr; }; refresh_ip() { say refresh-ip; }
+website_random() { say website-random; }
 [[ "$(menu_action 2)" == install-self && "$(menu_action 26)" == uninstall ]]
 [[ "$(menu_action 18)" == website ]]
 [[ "$(menu_action 12)" == addr && "$(main addr ip)" == addr ]]
 [[ "$(main 12 2>/dev/null)" == refresh-ip ]]
 [[ "$(main 2 2>/dev/null)" == uninstall && "$(main 20 2>/dev/null)" == install-self ]]
 [[ "$(main 27 2>/dev/null)" == security-apply ]]
+[[ "$(menu_action 24)" == security-apply && "$(menu_action 27)" == website-random ]]
+[[ "$(main website-random)" == website-random ]]
 [[ "$(main install-self)" == install-self && "$(main show)" == show ]]
 rc=0; (main 18 >/dev/null 2>&1) || rc=$?; [[ "$rc" == 2 ]]
-rc=0; menu_action 27 || rc=$?; [[ "$rc" == 2 ]]
+rc=0; menu_action 28 || rc=$?; [[ "$rc" == 2 ]]
 
 # 真实终端输入：新 2 返回菜单，新 26 在成功删除管理入口后直接退出。
 printf -v child_command 'bash %q --child-install' "$ROOT/tests/menu.bash"
-output="$(printf '27\n2\n\n00\n' | TERM=xterm-256color script -q -e -c "$child_command" /dev/null)"
+output="$(printf '28\n2\n\n00\n' | TERM=xterm-256color script -q -e -c "$child_command" /dev/null)"
 [[ "$output" == *'请输入菜单中的数字。'* && "$output" == *'TEST: install-self'* ]]
 [[ "$output" == *'1. 安装普通 REALITY'*'1. 安装普通 REALITY'* ]]
-[[ "$output" == *'请输入数字 [1-26，00 退出]'* ]]
+[[ "$output" == *'请输入数字 [1-27，00 退出]'* ]]
 [[ "$output" != *$'\033[3J'* ]] # 保留滚动历史，不能清除刚才的安装错误。
 printf -v child_command 'bash %q --child-uninstall' "$ROOT/tests/menu.bash"
 output="$(printf '26\n' | script -q -e -c "$child_command" /dev/null)"
 [[ "$output" == *'TEST: uninstall'* && "$output" != *'按回车返回主菜单'* ]]
+printf -v child_command 'bash %q --child-website' "$ROOT/tests/menu.bash"
+output="$(printf '27\n\n00\n' | script -q -e -c "$child_command" /dev/null)"
+[[ "$output" == *'TEST: website-random'* && "$output" == *'按回车返回主菜单'* ]]
 printf '连续菜单、安装/卸载分派、终端输入与历史数字命令兼容通过\n'

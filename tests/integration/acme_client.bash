@@ -29,6 +29,11 @@ curl --noproxy '*' --cacert /pebble-ca.pem -fsS https://pebble:15000/roots/0 > /
 update-ca-certificates >/dev/null 2>&1
 self_nginx_write "$SNI"; nginx -t; nginx -s reload
 self_reload_hook_write
+[[ "$(sha256sum "$SELF_WEB/index.html")" == "$page_digest" ]]
+# 在真实 HTTP-01 签发之后更换网页，再测试同一 webroot 的续期。
+self_site_render "$SELF_WEB/index.html" > "$SELF_DIR/work/new-page.html"
+self_site_atomic_publish "$SELF_DIR/work/new-page.html"; rm "$SELF_DIR/work/new-page.html"
+[[ "$(sha256sum "$SELF_WEB/index.html")" != "$page_digest" ]]; page_digest="$(sha256sum "$SELF_WEB/index.html")"
 # 容器没有 systemd；仅将 reload 命令转换成真实 Nginx reload，仍执行生产 deploy hook。
 cat > /usr/local/bin/systemctl <<'EOF'
 #!/bin/sh
