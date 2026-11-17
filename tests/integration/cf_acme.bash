@@ -10,7 +10,7 @@ cleanup() { docker rm -f "$client" "$pebble" >/dev/null 2>&1 || true; docker net
 trap cleanup EXIT
 docker network create "$suffix" >/dev/null
 docker create --name "$pebble" --network "$suffix" --network-alias pebble \
-    -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_WFE_NONCEREJECT=0 -e PEBBLE_AUTHZREUSE=0 \
+    -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_WFE_NONCEREJECT=0 -e PEBBLE_AUTHZREUSE=100 \
     -v "$ROOT/tests/integration/pebble.json:/test/config.json:ro" "$PEBBLE_IMAGE" \
     -config /test/config.json -dnsserver "$client:8053" >/dev/null
 docker cp "$pebble:/test/certs/pebble.minica.pem" "$TEST_DIR/ca.pem"

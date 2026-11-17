@@ -103,7 +103,8 @@ import hashlib, json, sys
 data=json.load(open(sys.argv[1]))["result"]
 assert data["denied"]>=1 and data["records"]==[] and data["queries"]>0
 token=open(sys.argv[2]).read().split("=",1)[1].strip()
-assert data["created"][hashlib.sha256(token.encode()).hexdigest()]>=3
+count=data["created"].get(hashlib.sha256(token.encode()).hexdigest(),0)
+assert count>=3, f"New Token TXT creations: {count}; expected at least 3 independent DNS-01 cycles"
 PY_METRICS
 mkdir "$SELF_DIR/work/token-backup.orphan"; cp "$SELF_DIR/cloudflare.ini" "$SELF_DIR/work/token-backup.orphan/old.ini"
 kill "$server_pid"; wait "$server_pid" || true; server_pid=''

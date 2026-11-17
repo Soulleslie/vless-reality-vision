@@ -59,7 +59,9 @@ DNS TXT 添加/清理由官方插件负责，仅验证 `_acme-challenge`，不�
 | 节点连接 | 实际非 root Xray/VLESS/REALITY/Vision 在更换后和后续证书更新后均正常，服务 PID/节点资料保持；原四种 Encryption 强化协议回归通过 |
 | 清理 | 双环境实际清理 CF 账户/备份/诊断/凭据/网站；原节点实际卸载验证 Token orphan 目录也清除，来源文件和共享资源保护保持 |
 
-DNS-01 联合测试只重定向 Cloudflare API 传输到本地受限测试服务、CA 到隔离 Pebble。认证插件/凭据读取/TXT 增删/DNS 查询/ACME/证书/HTTPS/Xray 均实际执行；不启用绕过验证的开关。测试只将等待改为 0，并在测试 CA 强制进入到期续期路径，生产传播等待与到期策略没有改动。测试 CA 只在一次性容器信任；全部端口只在独立测试网络，未对宿主机或 VPS 发布。
+DNS-01 联合测试重定向 Cloudflare API 传输到本地受限测试服务、CA 到隔离 Pebble。认证插件/凭据读取/TXT 增删/DNS 查询/ACME/证书/HTTPS/Xray 均实际执行；不启用绕过验证的开关。测试将等待改为 0，并在测试 CA 强制进入到期续期路径，生产传播等待与到期策略没有改动。测试 CA 只在一次性容器信任；全部端口只在独立测试网络，未对宿主机或 VPS 发布。
+
+固定 Pebble 版本的授权复用判断使用 `rand.Intn(100) > percent`，即使设置 0 仍可能复用，曾导致远端验收少一次 TXT 创建。测试包装器在每次实际签发成功后，用标准 ACME 请求停用本次授权，要求响应为 deactivated；同时将测试 CA 复用比例设为 100，验证旧授权确实不能再次利用。证书不撤销，所有后续阶段都必须重新完成真实 DNS-01，保留至少三次新 Token TXT 创建的断言。此行为仅在隔离测试中执行，不修改生产账户或 Certbot 逻辑。
 
 ## 尚未实测
 
@@ -74,9 +76,11 @@ DNS-01 联合测试只重定向 Cloudflare API 传输到本地受限测试服务
 ```bash
 bash tests/cf_token.bash
 bash tests/cf_token_input.bash
+bash tests/cf_token_lock.bash
 # XRAY_TEST_BIN 为按官方 Release SHA-256 校验的二进制
 bash tests/integration/cf_acme.bash vless-self-test "$XRAY_TEST_BIN"
 ```
 
 - [Cloudflare 插件：权限、凭据文件及保存路径用于后续续期](https://certbot-dns-cloudflare.readthedocs.io/en/stable/)
 - [Certbot：dry-run/staging、独立目录和自动续期/hook](https://eff-certbot.readthedocs.io/en/stable/using.html)
+- [固定 Pebble 版本的授权复用判断](https://github.com/letsencrypt/pebble/blob/5caaab384f267491d407b1ecaf2286cb69078fc4/wfe/wfe.go#L1565)

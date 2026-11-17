@@ -1,8 +1,9 @@
 #!/usr/bin/python3
-"""Test-only transport redirects: real plugin/Certbot, local provider and Pebble."""
+"""Test-only transport/cache controls: real plugin/Certbot, local provider/CA."""
 import os
 import sys
 import CloudFlare
+from acme import client, messages
 from certbot.main import main
 
 original = CloudFlare.CloudFlare
@@ -15,6 +16,21 @@ class LocalCloudflare(original):
 
 
 CloudFlare.CloudFlare = LocalCloudflare
+original_finalize = client.ClientV2.finalize_order
+
+
+def finalize_without_cached_authorizations(self, *args, **kwargs):
+    order = original_finalize(self, *args, **kwargs)
+    # Test CA only: even PEBBLE_AUTHZREUSE=0 can reuse when rand.Intn(100)==0.
+    # Deactivate via real ACME after issuance so every subsequent run proves DNS rights.
+    for authorization in order.authorizations:
+        result = self.deactivate_authorization(authorization)
+        if result.body.status != messages.STATUS_DEACTIVATED:
+            raise RuntimeError("Test CA authorization was not deactivated")
+    return order
+
+
+client.ClientV2.finalize_order = finalize_without_cached_authorizations
 args, skip = [], False
 for arg in sys.argv[1:]:
     if skip:
