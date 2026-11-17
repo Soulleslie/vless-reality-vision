@@ -20,6 +20,7 @@
 - 可选开启 TCP Fast Open，并在菜单或命令行切换
 - 可选开启 VLESS Encryption；生成成对参数并更新客户端导入链接
 - 自有域名模式：Nginx 本机 HTTPS 网站、Let’s Encrypt 证书与隔离自动续期
+- 安全更换 Cloudflare API Token：隐藏输入、全新 DNS-01 验证、原续期测试和失败回滚
 - 自有域名新安装随机生成六种布局之一的静态网页，配色、文案和图形组合后保存，后续访问保持稳定
 - 已有自有域名节点可单独更换随机网页，保留节点信息、链接和证书，不重启服务
 - 自有域名安全检查：SNI/Host 严格匹配、实际认证拒绝测试、DNS 变化与 CAA 检查
@@ -95,7 +96,7 @@ GitHub 更新不会自动修改 VPS 上已运行的节点。原来通过本项�
 
 普通模式不会在更新脚本时自动变成自有域名模式。只有决定切换时，先准备 DNS、保存需要的节点信息，再卸载原节点并选择菜单 2 重新部署；新安装会生成新的认证参数，需要重新导入链接。已有节点会阻止直接覆盖安装。
 
-交互菜单编号连续为 **1–27**，`00` 退出；原 **1–26** 操作保持，卸载仍为 **26**，新增 **27「更换自有域名随机网页」**。第 **24** 项为「更新 Nginx 安全配置（原安全模板）」，不换网页。RealityChecker 仍已移除，第 18 项为网站状态。`install-self`、`show`、`uninstall` 等命名命令保持兼容。历史的命令行数字参数沿用旧映射并显示提示，因此不要用它们代替新交互菜单编号；自动化请使用命名命令。
+交互菜单编号连续为 **1–28**，`00` 退出；原 **1–27** 操作保持，卸载仍为 **26**，**27** 更换随机网页，新增 **28「更换 Cloudflare API Token」**。第 **24** 项为「更新 Nginx 安全配置（原安全模板）」，不换网页。RealityChecker 仍已移除，第 18 项为网站状态。`install-self`、`show`、`uninstall` 等命名命令保持兼容。历史的命令行数字参数沿用旧映射并显示提示，因此不要用它们代替新交互菜单编号；自动化请使用命名命令。
 
 如果旧版脚本在菜单选择 `1` 后直接返回主菜单，请重新执行上面的下载命令获取最新版。v1.0.1 已修正安装前检查在正常机器上错误退出的问题。
 
@@ -161,6 +162,8 @@ v2.3.0 将自有域名新安装的固定网页改为一次性随机静态网页�
 
 v2.3.1 增加已有自有域名节点的 `website-random` 与菜单 27，旧固定网页可直接迁移，后续更换随机选择其他布局。只替换 HTML 和对应归属记录，保留节点全部信息与证书，不重启或 reload Xray/Nginx。前后本机 HTTPS/H2/200 与正文比对，失败恢复网页和归属清单；临时备份和发布文件随退出/卸载清理。修复归属清单写入失败时临时 receipt 未立即删除的问题。第 24 项标签明确为 Nginx 安全配置。见 [网页更换测试报告](docs/SITE_REPLACEMENT_REPORT.md)。
 
+v2.4.0 增加 `cert token` 和菜单 28：安全更换 Cloudflare DNS-01 凭据，先用独立临时 ACME 账户验证新 Token，再更新原凭据路径和 SHA-256、检查原续期 dry-run 与 Nginx hook。现有证书/节点/链接/续期配置保持，失败恢复原凭据与测试记录；旧/新令牌同时脱敏，不继承同名变量的 export 属性。临时账户/凭据备份随退出与卸载清理，修复续期测试记录发布失败的暂存文件清理。详见 [Token 更换测试报告](docs/CLOUDFLARE_TOKEN_REPORT.md)。
+
 ## 执行速度优化
 
 v2.2.2 的优化只调整内部调度。普通模式、自有域名、IP/域名切换、TFO、VLESS Encryption、证书续期和安全检查的功能保持不变：
@@ -174,6 +177,8 @@ TLS/证书校验、官方 SHA-256、实际 VLESS 握手、`renew --dry-run`、Cl
 v2.3.0 保留上述优化。网页只在自有域名首次安装时调用一次本地 Python 标准库生成，后续由 Nginx 直接返回文件；没有每次请求的生成开销，不调用在线 AI、图片接口或外部字体/CDN，也不新增依赖包。本地 14 个布局/配色样本的首次创建中位数约 47 ms、大小约 4–5 KB，仅代表本次开发环境，不能代表 VPS 整次安装耗时。
 
 v2.3.1 的手动网页更换也只生成一次，前后各做一次本机 HTTPS 检查；不查公网 IP/DNS、不测速第三方站点、不重新申请证书或运行续期测试、不安装依赖、不重启服务。日常访问仍直接返回静态文件，原普通模式及安装调度保持。
+
+Token 更换是单独的验证操作，保留 DNS 传播等待（60 秒）及两阶段证书测试，通常需要至少一分钟，可能更长；不会给日常管理、安装调度或节点转发增加后台任务。HTTP-01 没有 Cloudflare 凭据时仍跳过相应日志处理进程。
 
 ## 非交互安装
 
@@ -226,6 +231,30 @@ VLESS_CF_CREDENTIALS=/root/cloudflare.ini /root/vless-reality-setup.sh install-s
 
 脚本复制凭据而不删除用户提供的源文件；源文件由用户自己管理。不要把它上传到仓库。
 
+#### 后期更换 Cloudflare Token
+
+只适用于已用 **Cloudflare DNS-01** 安装的自有域名节点。先在 Cloudflare 创建对应 Zone 的新 Token，保留原 Token；按「已有节点如何更新」更新管理脚本，然后选择菜单 **28**，或执行：
+
+```bash
+vless-reality cert token
+```
+
+按提示粘贴新 Token，输入不回显；不要将 Token 作为命令参数、环境变量值或聊天内容发送。无人值守时，用 root:600 的新凭据源文件指定路径：
+
+```bash
+VLESS_CF_CREDENTIALS=/root/new-cloudflare.ini vless-reality cert token
+```
+
+文件内容格式仍为 `dns_cloudflare_api_token = <新 Token>`。脚本只复制需要的值，不改写或删除用户源文件；安装时旧的 `/root/cloudflare.ini` 不会自动同步，需要由用户自行管理。
+
+脚本先检查原凭据/配置归属、续期路径、当前证书网站和 timer。使用全新的临时测试账户完成实际 DNS-01，避免旧授权缓存让错误 Token 误通过；随后原子更新 `/etc/vless-reality-self/cloudflare.ini` 与 SHA-256，验证保存的原续期流程和 reload hook。Token 不变会直接拒绝更换，不会提示可以撤销旧 Token。
+
+**显示更换成功后，再到 Cloudflare 撤销旧 Token。** 定时续期仍读取相同的项目凭据路径，今后会使用新值；现有 SSL 证书不会因撤销旧 Token 而失效。更换过程不重新签发生产证书，不改变 UUID、密钥、Address/SNI、TFO、Encryption、网页或节点链接，不重启 Xray；续期测试会按既有 hook 平滑 reload Nginx。
+
+失败时恢复本机旧凭据、归属清单、续期配置和此前测试记录；回滚本身失败会保留 root 专用备份并明确报错。测试诊断仅保留脱敏的 root 私有日志；成功清理临时账户、备份和探测日志，相关目录仍随节点卸载。自动续期的历史记录不被伪装为成功，下次实际定时任务会独立更新它。
+
+旧 Token 已被撤销时，恢复本机文件不能让它在 Cloudflare 重新生效；新 Token 仍需具备有效的对应 Zone 权限。当前证书/网站、凭据归属、续期配置或 timer 异常时会先拒绝更换。此功能不覆盖用户手改/共享资源，也不代替过期证书或损坏配置的修复。
+
 ### HTTP-01
 
 不由 Cloudflare 托管的域名可选择 `http`：
@@ -275,6 +304,7 @@ vless-reality website-random
 ```bash
 vless-reality cert status
 vless-reality cert renew-test
+vless-reality cert token           # 隐藏输入并安全更换 Cloudflare API Token
 journalctl -u vless-reality-cert -u vless-reality-cert-alert --no-pager
 systemctl list-timers vless-reality-cert.timer
 ```
