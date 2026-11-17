@@ -42,3 +42,5 @@ jobs:
           docker run --rm --cap-add SYS_PTRACE -e LC_ALL=C.UTF-8 -v "$PWD:/src:ro" -v "$XRAY_TEST_BIN:/xray:ro" vless-self-test bash tests/integration/self_tls.bash /xray
       - name: Real Certbot HTTP-01 and renewal against isolated Pebble
         run: bash tests/integration/acme.bash
+      - name: Real DNS-01, Cloudflare token rotation and post-revocation renewal
+        run: bash tests/integration/cf_acme.bash vless-self-test "$XRAY_TEST_BIN"

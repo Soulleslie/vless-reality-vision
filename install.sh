@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.3.1'
+SCRIPT_VERSION='2.4.0'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -2259,18 +2259,25 @@ website_random() (
     ok '随机网页已更换；节点信息、证书和链接不变，无需重新导入，也未重启服务。'
 )
 self_scrub_logs() {
-    [[ -f "$SELF_DIR/cloudflare.ini" ]] || return 0
-    python3 - "$SELF_DIR" <<'PY_SCRUB'
+    # 轮换时同时脱敏旧/新 Token，按长度排序，避免短 Token 是长 Token 前缀时漏出尾部。
+    [[ -f "$SELF_DIR/cloudflare.ini" || $# -gt 0 ]] || return 0
+    python3 - "$SELF_DIR/logs" "$SELF_DIR/cloudflare.ini" "$@" <<'PY_SCRUB'
 import pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
-m = re.search(r"^dns_cloudflare_api_token\s*=\s*(\S+)", (root / "cloudflare.ini").read_text(), re.M)
-if m:
-    token = m.group(1).encode()
-    for p in (root / "logs").rglob("*"):
+tokens = set()
+for name in sys.argv[2:]:
+    source = pathlib.Path(name)
+    if source.is_file() and not source.is_symlink():
+        tokens.update(re.findall(rb"^dns_cloudflare_api_token\s*=\s*(\S+)", source.read_bytes(), re.M))
+if tokens:
+    for p in root.rglob("*"):
         if p.is_file() and not p.is_symlink():
             data = p.read_bytes()
-            if token in data:
-                p.write_bytes(data.replace(token, b"[REDACTED]"))
+            clean = data
+            for token in sorted(tokens, key=len, reverse=True):
+                clean = clean.replace(token, b"[REDACTED]")
+            if clean != data:
+                p.write_bytes(clean)
 PY_SCRUB
 }
 self_http_challenge_check() {
@@ -2441,10 +2448,151 @@ self_renew_test() {
         && "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" >> "$SELF_DIR/logs/renew-test.log" 2>&1 \
         && self_wait_tls "$domain" && result=passed
     tmp="$(mktemp "$SELF_DIR/.renew.XXXXXX")" || return 1
-    jq -n --arg domain "$domain" --arg result "$result" --arg date "$(date -u +%FT%TZ)" \
-        '{domain:$domain,result:$result,time:$date}' > "$tmp" && mv -f "$tmp" "$SELF_DIR/renew-test.json" || return 1
+    if ! jq -n --arg domain "$domain" --arg result "$result" --arg date "$(date -u +%FT%TZ)" \
+        '{domain:$domain,result:$result,time:$date}' > "$tmp" || ! mv -f "$tmp" "$SELF_DIR/renew-test.json"; then
+        rm -f -- "$tmp"; return 1
+    fi
     [[ "$result" == passed ]]
 }
+self_read_cf_token() {
+    local source="${1:-}" token
+    export -n token # 不继承调用者同名变量的 export 属性。
+    if [[ -n "$source" ]]; then
+        if [[ ! -f "$source" || -L "$source" || "$(stat -c %u "$source")" != 0 || "$(stat -c %a "$source")" != 600 ]]; then
+            warn '新凭据源文件必须为 root 所有、权限 600 的普通文件。' >&2; return 1
+        fi
+        token="$(sed -n 's/^dns_cloudflare_api_token *= *\([A-Za-z0-9_-]*\) *$/\1/p' "$source")" || return 1
+    else
+        [[ -t 0 ]] || { warn '非交互更换请设置 VLESS_CF_CREDENTIALS 为新凭据文件路径；不要将 Token 放入命令参数。' >&2; return 1; }
+        read -r -s -p '新的 Cloudflare API Token（对应 Zone 的 DNS Edit + Zone Read，不回显）：' token || { printf '\n' >&2; return 1; }
+        printf '\n' >&2
+    fi
+    [[ "$token" =~ ^[A-Za-z0-9_-]{20,200}$ ]] || { warn '新 Token 格式无效，未修改。' >&2; return 1; }
+    printf '%s' "$token"
+}
+self_cf_renewal_binding() {
+    local directory="$SELF_DIR/acme/renewal" path="$SELF_DIR/acme/renewal/$SNI.conf"
+    [[ -d "$directory" && ! -L "$directory" && -f "$path" && ! -L "$path" && "$(stat -c %u "$path")" == 0 ]] || return 1
+    python3 - "$path" "$SELF_DIR/cloudflare.ini" <<'PY_CF_BINDING'
+import configparser, pathlib, sys
+try:
+    conf = configparser.RawConfigParser()
+    conf.read_string("[lineage]\n" + pathlib.Path(sys.argv[1]).read_text())
+    params = conf["renewalparams"]
+    assert params.get("authenticator") == "dns-cloudflare"
+    assert params.get("dns_cloudflare_credentials") == sys.argv[2]
+except Exception:
+    sys.exit(1)
+PY_CF_BINDING
+}
+self_cf_token_probe() {
+    local domain="$1" email="$2" credentials="$3" directory="$4" logs="$5"
+    # 全新账户和目录，避免复用旧 ACME 授权而让无权限的新 Token 误通过。
+    install -d -m 700 "$directory/acme" "$directory/work" || return 1
+    certbot certonly --dry-run --non-interactive --agree-tos --email "$email" \
+        --server https://acme-staging-v02.api.letsencrypt.org/directory \
+        --dns-cloudflare --dns-cloudflare-credentials "$credentials" --dns-cloudflare-propagation-seconds 60 \
+        --preferred-challenges dns-01 --cert-name "$domain" -d "$domain" --key-type ecdsa --no-directory-hooks \
+        --config /dev/null --config-dir "$directory/acme" --work-dir "$directory/work" --logs-dir "$logs"
+}
+self_cf_token_rotate() (
+    need_root
+    [[ $- != *x* ]] || fail '凭据更换禁止使用 bash -x。'
+    [[ $# == 0 ]] || fail '用法：cert token（隐藏输入，或用 VLESS_CF_CREDENTIALS 指定凭据源文件）'
+    local token current_token email backup expected_domain expected_self probe_logs='' log_file='' changed=0 committed=0 rc rollback_ok=1
+    export -n token current_token
+    # 只读预检后收集输入，不让停留在提示符上的会话占用自动续期锁。
+    load_metadata
+    if [[ "$NODE_MODE" != self ]] || ! self_exists; then fail 'Token 更换仅用于自有域名模式。'; fi
+    [[ -f "$SELF_DIR/state.json" && ! -L "$SELF_DIR/state.json" && "$(self_state method)" == cloudflare ]] || fail '此节点不是 Cloudflare DNS-01 模式。'
+    expected_domain="$SNI"
+    expected_self="$(stat -c '%d:%i' "$SELF_DIR")" || fail '安装目录发生变化，请重新执行。'
+    say "当前证书域名：$expected_domain"
+    token="$(self_read_cf_token "${VLESS_CF_CREDENTIALS:-}")" || fail '未取得有效的新 Token，未修改。'
+    say '新 Token 已读取；如有正在执行的节点或续期任务，将等待它完成。'
+    self_operation_lock; load_metadata
+    [[ "$NODE_MODE" == self ]] || fail 'Token 更换仅用于自有域名模式。'
+    [[ "$SNI" == "$expected_domain" && "$expected_self" == "$(stat -c '%d:%i' "$SELF_DIR" 2>/dev/null)" ]] || fail '等待输入期间域名或安装目录已改变，请重新执行；未修改。'
+    if ! self_managed_paths_ok || ! self_cleanup_preflight; then fail '资源或凭据归属异常，未修改。'; fi
+    [[ "$(self_state method)" == cloudflare && "$(self_state domain)" == "$SNI" ]] || fail '此节点不是使用 Cloudflare DNS-01 的当前自有域名。'
+    [[ -f "$SELF_DIR/cloudflare.ini" && ! -L "$SELF_DIR/cloudflare.ini" && "$(stat -c %u "$SELF_DIR/cloudflare.ini")" == 0 ]] || fail '原凭据缺失或归属异常，未修改。'
+    self_cf_renewal_binding || fail '保存的续期配置未指向本项目 Cloudflare 凭据，未修改。'
+    [[ "$(stat -c %d "$SELF_DIR/work")" == "$(stat -c %d "$SELF_DIR")" ]] || fail '私有工作目录跨文件系统，无法安全更换凭据。'
+    local path target
+    for path in "$SELF_DIR/renew-test.json" "$SELF_DIR/logs/renew-test.log"; do
+        if [[ -e "$path" || -L "$path" ]]; then
+            [[ -f "$path" && ! -L "$path" && "$(stat -c %u "$path")" == 0 ]] || fail '续期记录路径异常，未修改。'
+        fi
+    done
+    if [[ ! -x "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx" ]] || ! self_file_owned "$SELF_DIR/acme/renewal-hooks/deploy/reload-nginx"; then fail '续期 reload hook 异常，未修改。'; fi
+    if ! systemctl is-enabled --quiet vless-reality-cert.timer || ! systemctl is-active --quiet vless-reality-cert.timer; then fail '自动续期 timer 未就绪，请先恢复续期任务。'; fi
+    say '检查当前证书、网站和自动续期配置…'
+    self_wait_tls "$SNI" || fail '当前网站或证书基线异常，未更换 Token。'
+    email="$(self_state email)" || fail '缺少原证书通知邮箱。'
+    current_token="$(self_read_cf_token "$SELF_DIR/cloudflare.ini" 2>/dev/null)" || fail '原凭据格式异常，未修改。'
+    if [[ "$token" == "$current_token" ]]; then
+        unset token current_token; fail '新 Token 与当前相同，未执行更换；请提供不同的新 Token。'
+    fi
+    backup="$(mktemp -d "$SELF_DIR/work/token-backup.XXXXXX")" || return 1
+    if ! cp -a "$SELF_DIR/cloudflare.ini" "$backup/old.ini" || ! cp -a "$SELF_DIR/files.sha256" "$backup/files.sha256" \
+        || ! cp -a "$SELF_DIR/acme/renewal/$SNI.conf" "$backup/renewal.conf"; then
+        rm -rf -- "$backup"; fail '凭据备份失败，未修改。'
+    fi
+    for path in "$SELF_DIR/renew-test.json" "$SELF_DIR/logs/renew-test.log"; do
+        if [[ -f "$path" ]] && ! cp -a "$path" "$backup/${path##*/}"; then
+            rm -rf -- "$backup"; fail '续期记录备份失败，未修改。'
+        fi
+    done
+    trap 'rc=$?; trap - EXIT; trap "" HUP INT TERM
+        if (( ! committed && changed )); then
+            if ! cp -a "$backup/old.ini" "$backup/restore.ini" || ! mv -f -- "$backup/restore.ini" "$SELF_DIR/cloudflare.ini" \
+                || ! cp -a "$backup/files.sha256" "$SELF_DIR/files.sha256"; then rollback_ok=0; fi
+            cp -a "$backup/renewal.conf" "$SELF_DIR/acme/renewal/$SNI.conf" || rollback_ok=0
+            for path in renew-test.json renew-test.log; do
+                target="$SELF_DIR/$path"; [[ "$path" != renew-test.log ]] || target="$SELF_DIR/logs/$path"
+                if [[ -f "$backup/$path" ]]; then cp -a "$backup/$path" "$target" || rollback_ok=0
+                else rm -f -- "$target" || rollback_ok=0; fi
+            done
+        fi
+        if ! self_scrub_logs "$backup/old.ini" "$backup/new.ini"; then
+            warn "日志脱敏失败，保留 root 专用备份：$backup" >&2; exit 1
+        fi
+        if (( ! rollback_ok )); then warn "Token 回滚失败，保留备份：$backup" >&2; exit 1; fi
+        [[ -z "$probe_logs" ]] || rm -rf -- "$probe_logs" || exit 1
+        rm -rf -- "$backup" || exit 1
+        exit "$rc"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf 'dns_cloudflare_api_token = %s\n' "$token" > "$backup/new.ini" || fail '新凭据暂存失败，未修改。'
+    unset token current_token
+    chmod 600 "$backup/new.ini" || fail '新凭据权限设置失败。'
+    probe_logs="$(mktemp -d "$SELF_DIR/logs/token-probe.XXXXXX")" || fail '测试日志目录创建失败。'
+    log_file="$(mktemp "$SELF_DIR/logs/token-change.XXXXXX")" || fail '测试日志创建失败。'
+    say '验证新 Token 的实际 DNS-01 权限（等待 DNS 传播，通常至少 60 秒）…'
+    self_cf_token_probe "$SNI" "$email" "$backup/new.ini" "$backup/probe" "$probe_logs" > "$log_file" 2>&1 \
+        || fail "新 Token 的 DNS-01 验证失败，原凭据保留；脱敏日志：$log_file"
+    cp -a "$backup/new.ini" "$backup/publish.ini" || fail '新凭据发布暂存失败。'
+    # shellcheck disable=SC2034 # EXIT trap 读取提交状态。
+    changed=1
+    self_publish "$backup/publish.ini" "$SELF_DIR/cloudflare.ini" 600 || fail '凭据或归属记录发布失败，正在回滚。'
+    say '新 Token 的 DNS-01 已通过，正在验证原自动续期流程（可能再次等待 DNS 传播）…'
+    if ! self_renew_test "$SNI"; then
+        [[ ! -f "$SELF_DIR/logs/renew-test.log" ]] || cat "$SELF_DIR/logs/renew-test.log" >> "$log_file"
+        fail "原续期流程或 Nginx reload hook 验证失败，正在回滚；脱敏日志：$log_file"
+    fi
+    if ! cmp -s "$backup/renewal.conf" "$SELF_DIR/acme/renewal/$SNI.conf" || ! self_cf_renewal_binding \
+        || ! systemctl is-enabled --quiet vless-reality-cert.timer || ! systemctl is-active --quiet vless-reality-cert.timer; then
+        fail '续期配置或 timer 复核失败，正在回滚。'
+    fi
+    self_scrub_logs "$backup/old.ini" "$backup/new.ini" || fail '日志脱敏失败，正在回滚。'
+    # shellcheck disable=SC2034 # EXIT trap 读取提交状态。
+    committed=1
+    if ! rm -rf -- "$probe_logs" "$backup" || ! rm -f -- "$log_file"; then fail '新 Token 已验证并应用，但临时文件清理失败。'; fi
+    trap - EXIT HUP INT TERM
+    ok 'Cloudflare Token 已更换；新 DNS-01、原续期 dry-run 和 Nginx reload hook 均通过。'
+    say '自动续期将使用新 Token；现有证书和节点信息不变，Xray 未重启。确认成功后再到 Cloudflare 撤销旧 Token。'
+)
 cert_status() {
     self_exists || { warn '未发现本脚本的自有域名证书。'; return 1; }
     local domain
@@ -2462,13 +2610,14 @@ cert_status() {
 }
 cert_command() {
     need_root
-    [[ $# -le 1 ]] || fail '用法：cert [status|renew-test]'
+    [[ $# -le 1 ]] || fail '用法：cert [status|renew-test|token]；不要把 Token 放入命令参数'
     self_exists || fail '仅自有域名模式有本脚本管理的证书。'
     case "${1:-status}" in
         status) cert_status ;;
+        token) shift; self_cf_token_rotate "$@" ;;
         renew-test) if ( exec 8> "$SELF_DIR/operation.lock"; flock -x 8; self_renew_test "$(self_state domain)" ); then ok '证书续期 dry-run 和 Nginx reload hook 均通过。';
             else fail "续期验证失败；详见 $SELF_DIR/logs/renew-test.log（root 专用）。"; fi ;;
-        *) fail '用法：cert [status|renew-test]' ;;
+        *) fail '用法：cert [status|renew-test|token]' ;;
     esac
 }
 website_status() {
@@ -3370,7 +3519,7 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   install-self [域名] [cloudflare|http] [邮箱] [名称] [TFO] [加密] [模式]
                                安装自有域名 REALITY（固定 443）
   check-self                   检查自有域名完整部署
-  cert [status|renew-test]      证书和自动续期状态
+  cert [status|renew-test|token] 证书状态、续期测试或安全更换 Cloudflare Token
   website                      查看本地网站状态
   website-random               更换自有域名随机网页，保留节点信息且不重启服务
   security-check               检查自有域名认证、权限、DNS、TLS 和回落安全
@@ -3456,6 +3605,7 @@ show_menu() {
     say ' 25. 查看运行日志'
     say ' 26. 卸载节点'
     say ' 27. 更换自有域名随机网页（节点信息不变）'
+    say ' 28. 更换 Cloudflare API Token（验证证书续期）'
     say ' 00. 退出'
     say '=================================='
     menu_status
@@ -3472,7 +3622,7 @@ menu_action() {
         14) change_sni ;; 15) show_fastest_sni ;; 16) tfo_node ;; 17) vlessenc_node ;;
         18) website_status ;; 19) cert_command status ;; 20) cert_command renew-test ;;
         21) check_self ;; 22) security_check ;; 23) fallback_command ;; 24) security_apply ;;
-        25) log_node ;; 26) uninstall_node ;; 27) website_random ;; *) return 2 ;;
+        25) log_node ;; 26) uninstall_node ;; 27) website_random ;; 28) cert_command token ;; *) return 2 ;;
     esac
 }
 # 命令行历史数字参数保留原语义，避免旧自动化把卸载误解为安装等操作。
@@ -3498,8 +3648,8 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-27，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-9]|2[0-7]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-28，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-9]|2[0-8]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
