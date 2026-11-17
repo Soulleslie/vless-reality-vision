@@ -2499,10 +2499,20 @@ self_cf_token_rotate() (
     need_root
     [[ $- != *x* ]] || fail '凭据更换禁止使用 bash -x。'
     [[ $# == 0 ]] || fail '用法：cert token（隐藏输入，或用 VLESS_CF_CREDENTIALS 指定凭据源文件）'
-    local token current_token email backup probe_logs='' log_file='' changed=0 committed=0 rc rollback_ok=1
+    local token current_token email backup expected_domain expected_self probe_logs='' log_file='' changed=0 committed=0 rc rollback_ok=1
     export -n token current_token
+    # 只读预检后收集输入，不让停留在提示符上的会话占用自动续期锁。
+    load_metadata
+    if [[ "$NODE_MODE" != self ]] || ! self_exists; then fail 'Token 更换仅用于自有域名模式。'; fi
+    [[ -f "$SELF_DIR/state.json" && ! -L "$SELF_DIR/state.json" && "$(self_state method)" == cloudflare ]] || fail '此节点不是 Cloudflare DNS-01 模式。'
+    expected_domain="$SNI"
+    expected_self="$(stat -c '%d:%i' "$SELF_DIR")" || fail '安装目录发生变化，请重新执行。'
+    say "当前证书域名：$expected_domain"
+    token="$(self_read_cf_token "${VLESS_CF_CREDENTIALS:-}")" || fail '未取得有效的新 Token，未修改。'
+    say '新 Token 已读取；如有正在执行的节点或续期任务，将等待它完成。'
     self_operation_lock; load_metadata
     [[ "$NODE_MODE" == self ]] || fail 'Token 更换仅用于自有域名模式。'
+    [[ "$SNI" == "$expected_domain" && "$expected_self" == "$(stat -c '%d:%i' "$SELF_DIR" 2>/dev/null)" ]] || fail '等待输入期间域名或安装目录已改变，请重新执行；未修改。'
     if ! self_managed_paths_ok || ! self_cleanup_preflight; then fail '资源或凭据归属异常，未修改。'; fi
     [[ "$(self_state method)" == cloudflare && "$(self_state domain)" == "$SNI" ]] || fail '此节点不是使用 Cloudflare DNS-01 的当前自有域名。'
     [[ -f "$SELF_DIR/cloudflare.ini" && ! -L "$SELF_DIR/cloudflare.ini" && "$(stat -c %u "$SELF_DIR/cloudflare.ini")" == 0 ]] || fail '原凭据缺失或归属异常，未修改。'
@@ -2520,7 +2530,6 @@ self_cf_token_rotate() (
     self_wait_tls "$SNI" || fail '当前网站或证书基线异常，未更换 Token。'
     email="$(self_state email)" || fail '缺少原证书通知邮箱。'
     current_token="$(self_read_cf_token "$SELF_DIR/cloudflare.ini" 2>/dev/null)" || fail '原凭据格式异常，未修改。'
-    token="$(self_read_cf_token "${VLESS_CF_CREDENTIALS:-}")" || fail '未取得有效的新 Token，未修改。'
     if [[ "$token" == "$current_token" ]]; then
         unset token current_token; fail '新 Token 与当前相同，未执行更换；请提供不同的新 Token。'
     fi

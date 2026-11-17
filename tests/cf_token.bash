@@ -25,7 +25,7 @@ self_wait_tls() {
     [[ "$STAGE" != baseline ]] && { [[ "$STAGE" != tls-late ]] || [[ "$(wc -l < "$CASE_DIR/tls.calls")" == 1 ]]; }
 }
 assert_token_environment() {
-    python3 - "$SELF_DIR/cloudflare.ini" "$VLESS_CF_CREDENTIALS" <<'PY_ENV'
+    python3 - "$SELF_DIR/cloudflare.ini" "${VLESS_CF_CREDENTIALS:-$CASE_DIR/new.ini}" <<'PY_ENV'
 import os, pathlib, re, sys
 for name in sys.argv[1:]:
     path=pathlib.Path(name)
@@ -123,6 +123,21 @@ immutable() {
     sha256sum "$CONFIG" "$MARKER" "$LINK_FILE" "$SELF_SITE" "$SELF_WEB/index.html" "$SELF_DIR/state.json" \
         "$SELF_RENEW_SERVICE" "$SELF_RENEW_TIMER" "$SELF_DIR/acme/live/node.example.com/cert.pem" "$SELF_DIR/renew-status.json" "$SELF_DIR/acme/renewal/node.example.com.conf"
 }
+if [[ "${1:-}" == --interactive-lock ]]; then
+    fixture interactive-lock
+    export VLESS_TOKEN_TEST_STAGE=success
+    unset VLESS_CF_CREDENTIALS
+    printf 'TEST_SELF_DIR=%s\n' "$SELF_DIR"
+    original_credential="$(sha256sum "$SELF_DIR/cloudflare.ini")"
+    if self_cf_token_rotate; then
+        [[ "${2:-ok}" == ok ]]; self_file_owned "$SELF_DIR/cloudflare.ini"
+        printf 'INTERACTIVE_TOKEN_OK\n'
+    else
+        [[ "${2:-ok}" != ok && "$(sha256sum "$SELF_DIR/cloudflare.ini")" == "$original_credential" && ! -e "$CASE_DIR/certbot.calls" ]]
+        printf 'CONTEXT_CHANGED\n'
+    fi
+    exit 0
+fi
 for stage in success absent-record same format source-mode source-owner source-link missing-input extra-arg trace modified missing-old http external binding binding-late backup record publish probe renewal renew-record hook baseline tls-late timer timer-late signal-probe signal-renew rollback scrub cleanup; do
     fixture "$stage"
     case "$stage" in
@@ -186,7 +201,7 @@ printf 'dns_cloudflare_api_token = %s_extra\n' "$OLD_TOKEN" > "$CASE_DIR/long.in
 printf '%s_extra %s\n' "$OLD_TOKEN" "$OLD_TOKEN" > "$SELF_DIR/logs/prefix.log"
 self_scrub_logs "$CASE_DIR/long.ini"
 [[ "$(< "$SELF_DIR/logs/prefix.log")" == '[REDACTED] [REDACTED]' ]]
-# 与自动续期共用 operation.lock，不能在定时任务未完成时读写 Token。
+# 提交后与自动续期串行，不能提前发布凭据或发起验证。
 fixture concurrent; export VLESS_TOKEN_TEST_STAGE=success
 exec 8> "$SELF_DIR/operation.lock"; flock -x 8
 (exec 8>&-; self_cf_token_rotate > "$CASE_DIR/result.log" 2>&1) & change_pid=$!

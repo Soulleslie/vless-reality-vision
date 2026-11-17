@@ -12,7 +12,7 @@
 
 ## 验证与事务
 
-1. 共用节点目录和自有域名 operation.lock，与自动续期/证书测试/节点管理串行；锁内读取当前记录。检查归属、Cloudflare 方法、证书域名、保存的 authenticator/凭据路径、可用网站证书、hook 与启用中的 timer。
+1. 只读预检后在不持锁的状态下收集输入，避免提示符长时间停留阻塞自动续期；提交后共用节点目录和自有域名 operation.lock，与自动续期/证书测试/节点管理串行，并在锁内重读记录。域名或安装目录在输入期间改变则拒绝应用。检查归属、Cloudflare 方法、证书域名、保存的 authenticator/凭据路径、可用网站证书、hook 与启用中的 timer。
 2. 私有 `work/token-backup.*` 以 700 保存旧/新 600 凭据、原归属清单、续期配置与原测试记录/日志。新凭据先不替换正式文件。
 3. 全新临时配置、账户和工作目录执行 `certbot certonly --dry-run`，显式使用 Let’s Encrypt staging、DNS-01、候选文件和 60 秒传播等待，禁用目录 hook，不读取全局 CLI 配置。新账户避免复用旧账户授权而把无效新 Token 误判成功。
 4. 通过后原子替换原凭据及 SHA-256，运行原 `renew --dry-run`、既有 Nginx deploy hook 与实际本地 TLS。验证续期配置字节未变化、依然绑定原路径，timer 仍就绪。
@@ -39,6 +39,7 @@ DNS TXT 添加/清理由官方插件负责，仅验证 `_acme-challenge`，不�
 | `README.md`、本报告、`SELF_DOMAIN_SECURITY_REPORT.md` | 操作、续期影响、安全边界、卸载与验证 |
 | `tests/cf_token.bash` | 权限/来源/绑定、发布/续期/记录/信号/回滚故障、环境/参数保护、双令牌脱敏与锁 |
 | `tests/cf_token_input.bash` | 真实 PTY 隐藏输入、格式失败、EOF 取消、终端属性恢复 |
+| `tests/cf_token_lock.bash` | 输入等待不占自动续期锁，提交后串行，域名/安装目录变化时拒绝应用 |
 | `tests/menu.bash` | 连续 1–28、旧操作/数字语义、菜单 28 与 cert token 分派 |
 | `tests/integration/cf_*` | 实际 Cloudflare 插件、Certbot、DNS-01、受限测试 API、Pebble、Nginx/Xray 与撤销旧 Token 后续期 |
 | `tests/integration/self_tls.bash` | 原协议/节点实际卸载补充 Token 半成品与私有日志清理 |
@@ -52,7 +53,7 @@ DNS TXT 添加/清理由官方插件负责，仅验证 `_acme-challenge`，不�
 | 原单元/故障套件与性能 | 通过普通/自有模式、菜单、TFO/Encryption、地址/网页、SNI 并发、apt 复用、回滚与卸载 |
 | Token 故障套件 | 通过无效格式、来源模式/归属/链接、相同值、禁用 xtrace、缺失/修改旧凭据、方法/绑定错误、备份/receipt/发布/续期/记录/hook/TLS/timer/信号及回滚失败保护 |
 | 秘密保护 | 真实 PTY 无回显/恢复；命令参数和子进程环境没有旧/新 Token，即使调用者导出同名变量；正常输出/日志无 Token，前缀令牌同时脱敏，来源文件不变 |
-| 操作互斥 | 共用自动续期文件锁，持锁时不提前读取/更换 Token 或发起挑战 |
+| 操作互斥 | 真实 PTY 等待输入时自动续期文件锁仍可获取；提交后持锁串行，不提前更换 Token 或发起挑战；输入期间更换域名/安装目录会拒绝应用 |
 | Debian 12/13 DNS-01 联合测试 | 两环境通过真实 CF 插件与 DNS 协议、Certbot 和 Pebble；只读 Token 拒绝且原凭据/清单/测试记录不变；有效候选成功后证书/节点/配置/链接哈希不变 |
 | 撤销旧 Token 后的续期 | 模拟提供商撤销旧值，原 `self_cert_renew` 用新值完成实际测试 CA 续期、更新证书并让 Nginx 加载；新令牌至少用于独立探测、原 dry-run 和后续续期三次 TXT 创建，均清理 |
 | 节点连接 | 实际非 root Xray/VLESS/REALITY/Vision 在更换后和后续证书更新后均正常，服务 PID/节点资料保持；原四种 Encryption 强化协议回归通过 |

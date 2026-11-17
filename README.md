@@ -247,7 +247,9 @@ VLESS_CF_CREDENTIALS=/root/new-cloudflare.ini vless-reality cert token
 
 文件内容格式仍为 `dns_cloudflare_api_token = <新 Token>`。脚本只复制需要的值，不改写或删除用户源文件；安装时旧的 `/root/cloudflare.ini` 不会自动同步，需要由用户自行管理。
 
-脚本先检查原凭据/配置归属、续期路径、当前证书网站和 timer。使用全新的临时测试账户完成实际 DNS-01，避免旧授权缓存让错误 Token 误通过；随后原子更新 `/etc/vless-reality-self/cloudflare.ini` 与 SHA-256，验证保存的原续期流程和 reload hook。Token 不变会直接拒绝更换，不会提示可以撤销旧 Token。
+提交新 Token 后，脚本在锁内检查原凭据/配置归属、续期路径、当前证书网站和 timer。使用全新的临时测试账户完成实际 DNS-01，避免旧授权缓存让错误 Token 误通过；随后原子更新 `/etc/vless-reality-self/cloudflare.ini` 与 SHA-256，验证保存的原续期流程和 reload hook。Token 不变会直接拒绝更换，不会提示可以撤销旧 Token。
+
+停留在输入提示时不占用自动续期锁。提交新 Token 后才获取维护锁并重新核对配置；等待输入期间若更换了域名或重新安装，命令会拒绝应用，要求重新执行。
 
 **显示更换成功后，再到 Cloudflare 撤销旧 Token。** 定时续期仍读取相同的项目凭据路径，今后会使用新值；现有 SSL 证书不会因撤销旧 Token 而失效。更换过程不重新签发生产证书，不改变 UUID、密钥、Address/SNI、TFO、Encryption、网页或节点链接，不重启 Xray；续期测试会按既有 hook 平滑 reload Nginx。
 
