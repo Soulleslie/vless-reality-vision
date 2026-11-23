@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.4.0'
+SCRIPT_VERSION='2.5.0'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -561,8 +561,36 @@ client_address_status() {
     say "客户端连接地址：$kind $(client_address):$PORT"
 }
 
+TRANSPORT_JQ='
+    def xhttp_settings:
+        .path as $path | ($path|type=="string" and length==25 and test("^/[0-9a-f]{24}$"))
+        and .=={path:$path,mode:"auto"};
+    def managed_transport:
+        .streamSettings as $stream |
+        $stream.security=="reality" and (.settings.clients|length)>0 and
+        (if $stream.network=="tcp" then
+            ($stream|has("xhttpSettings") or has("splithttpSettings")|not) and
+            all(.settings.clients[]; .flow=="xtls-rprx-vision")
+         elif $stream.network=="xhttp" then
+            ($stream.xhttpSettings|xhttp_settings) and ($stream|has("splithttpSettings")|not) and
+            all(.settings.clients[]; (.flow // "")=="")
+         else false end);
+'
+
+config_transport() {
+    jq -er '[.inbounds[] | select(.protocol=="vless") | (.streamSettings.network // "tcp")][0] |
+        select(.=="tcp" or .=="xhttp")' "$CONFIG"
+}
+
+config_xhttp_path() {
+    jq -er "$TRANSPORT_JQ"' [.inbounds[] | select(.protocol=="vless") | .streamSettings.xhttpSettings][0] |
+        select(xhttp_settings) | .path' "$CONFIG"
+}
+
 config_uuid() {
-    jq -er '[.inbounds[] | select(.protocol == "vless") | .settings.clients[] | select(.flow == "xtls-rprx-vision") | .id][0]' "$CONFIG"
+    jq -er '[.inbounds[] | select(.protocol=="vless") |
+        (if .streamSettings.network=="xhttp" then "" else "xtls-rprx-vision" end) as $flow |
+        .settings.clients[] | select((.flow // "")==$flow) | .id][0]' "$CONFIG"
 }
 
 # 不把 UUID、REALITY 私钥或 VLESS 解密密钥放进外部进程的命令行。
@@ -594,13 +622,14 @@ edit_config() {
 }
 
 config_ok() {
+    local file="${1:-$CONFIG}"
     if [[ "$NODE_MODE" == self ]]; then
-        self_config_policy "$CONFIG" "$SNI" || return 1
-        if jq -e '.. | objects | select(has("limitFallbackUpload") or has("limitFallbackDownload"))' "$CONFIG" >/dev/null; then
-            fallback_capability "$CONFIG" "$XRAY_BIN" || return 1
+        self_config_policy "$file" "$SNI" || return 1
+        if jq -e '.. | objects | select(has("limitFallbackUpload") or has("limitFallbackDownload"))' "$file" >/dev/null; then
+            fallback_capability "$file" "$XRAY_BIN" || return 1
         fi
     fi
-    "$XRAY_BIN" run -test -config "$CONFIG" >/dev/null 2>&1
+    "$XRAY_BIN" run -test -config "$file" >/dev/null 2>&1
 }
 service_ok() {
     systemctl is-active --quiet xray && [[ -n "$(ss -H -ltn "sport = :$PORT" 2>/dev/null)" ]]
@@ -689,11 +718,11 @@ clean_config_residue() (
         unknown=0
         for entry in "$backup"/*; do
             case "${entry##*/}" in
-                config.json|.vless-reality-owned|tfo.sysctl|link.txt|link-output.txt) ;;
+                config.json|transport.json|.vless-reality-owned|tfo.sysctl|link.txt|link-output.txt) ;;
                 *) unknown=1 ;;
             esac
         done
-        rm -f -- "$backup/config.json" "$backup/.vless-reality-owned" "$backup/tfo.sysctl" "$backup/link.txt" "$backup/link-output.txt" || return 1
+        rm -f -- "$backup/config.json" "$backup/transport.json" "$backup/.vless-reality-owned" "$backup/tfo.sysctl" "$backup/link.txt" "$backup/link-output.txt" || return 1
         if (( unknown )); then
             warn "保留含有其他文件的备份目录：$backup" >&2
         else
@@ -1054,7 +1083,7 @@ show_node() (
     need_root
     self_operation_lock
     load_metadata
-    local uuid label link tmp address enc_param tfo_param=''
+    local uuid label link tmp address enc_param transport path transport_params flow_param='' tfo_param=''
     address="$(client_address)" || return 1
     uuid="$(config_uuid)" || fail '无法从配置读取 UUID。'
     if [[ "$NODE_MODE" == self ]]; then
@@ -1063,9 +1092,18 @@ show_node() (
     fi
     label="$(jq -rn --arg v "$NODE_NAME" '$v | @uri')" || return 1
     enc_param="$(jq -rn --arg v "$CLIENT_ENCRYPTION" '$v | @uri')" || return 1
+    transport="$(config_transport)" || fail '无法识别节点传输。'
+    if [[ "$transport" == xhttp ]]; then
+        path="$(config_xhttp_path)" || fail '无法读取 XHTTP 路径。'
+        path="$(jq -rn --arg v "$path" '$v | @uri')" || return 1
+        transport_params="&type=xhttp&path=$path&mode=auto"
+    else
+        transport_params='&type=tcp&headerType=none'
+        flow_param='&flow=xtls-rprx-vision'
+    fi
     # tfo 是部分客户端识别的扩展参数；服务端开关仍以 Xray 配置为准。
     if config_tfo_enabled; then tfo_param='&tfo=1'; fi
-    link="vless://${uuid}@${address}:${PORT}?encryption=${enc_param}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none${tfo_param}#${label}"
+    link="vless://${uuid}@${address}:${PORT}?encryption=${enc_param}${flow_param}&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}${transport_params}${tfo_param}#${label}"
     tmp="$(mktemp "${LINK_FILE}.XXXXXX")" || return 1
     if ! printf '%s\n' "$link" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$LINK_FILE"; then
         rm -f -- "$tmp"
@@ -1082,7 +1120,7 @@ show_node() (
 status_node() {
     need_root
     load_metadata
-    local state current_ip version flow server_enc enc_mode
+    local state current_ip version flow server_enc enc_mode transport
     state="$(systemctl is-active xray 2>/dev/null || true)"
     version="$(installed_version)"
     say "服务状态：$state"
@@ -1092,7 +1130,12 @@ status_node() {
     client_address_status
     say "REALITY SNI：${SNI}:443"
     flow="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.clients[0].flow][0] // empty' "$CONFIG" 2>/dev/null || true)"
-    if [[ "$flow" == xtls-rprx-vision ]]; then
+    transport="$(config_transport || true)"
+    if [[ "$transport" == xhttp ]]; then
+        say '节点传输：XHTTP + REALITY（mode=auto）'
+        if [[ -n "$flow" ]]; then warn "XHTTP flow 配置异常：$flow"; fi
+    elif [[ "$transport" == tcp && "$flow" == xtls-rprx-vision ]]; then
+        say '节点传输：TCP + REALITY + Vision'
         ok 'Vision flow：xtls-rprx-vision'
     else
         warn "Vision flow：${flow:-未配置}"
@@ -1170,6 +1213,106 @@ commit_change() {
     fi
     rm -rf -- "$backup"
     fail '修改后的配置启动或链接保存失败，已恢复原配置。'
+}
+
+transport_apply() (
+    need_root; self_operation_lock; load_metadata
+    [[ $# == 1 ]] || fail '用法：transport [status|tcp|xhttp]'
+    local target="$1" current path='' backup='' candidate='' was_active=0 changed=0 committed=0 rc
+    case "$target" in tcp|xhttp) ;; *) fail '传输只能选择 tcp 或 xhttp。' ;; esac
+    jq -e "$TRANSPORT_JQ"' (.inbounds|length)==1 and (.inbounds[0] |
+        .protocol=="vless" and managed_transport)' "$CONFIG" >/dev/null || fail '当前配置不是本脚本支持的 TCP + Vision 或 XHTTP 节点。'
+    current="$(config_transport)" || fail '无法识别当前传输。'
+    if [[ "$target" == "$current" ]]; then ok "当前传输已是 $current。"; return 0; fi
+    if [[ -e "$LINK_FILE" || -L "$LINK_FILE" ]]; then
+        [[ -f "$LINK_FILE" && ! -L "$LINK_FILE" && "$(stat -c '%u:%a' "$LINK_FILE")" == 0:600 ]] || fail '节点链接文件的归属或权限异常。'
+    fi
+    if systemctl is-active --quiet xray; then was_active=1; fi
+    if [[ "$target" == xhttp ]]; then
+        path="$(openssl rand -hex 12)" || fail '无法生成 XHTTP 路径。'
+        [[ "$path" =~ ^[0-9a-f]{24}$ ]] || fail '随机路径生成失败。'
+        path="/$path"
+    fi
+
+    trap 'rc=$?; trap - EXIT; trap "" HUP INT TERM
+        if (( changed && ! committed )); then
+            if ! restore_state "$backup" "$was_active"; then
+                warn "节点回滚失败，备份保留在 $backup。" >&2; exit 1
+            fi
+            if [[ -f "$backup/link.txt" ]]; then
+                cp -a -- "$backup/link.txt" "$LINK_FILE" || { warn "链接回滚失败，备份保留在 $backup。" >&2; exit 1; }
+            else rm -f -- "$LINK_FILE" || { warn "链接清理失败，备份保留在 $backup。" >&2; exit 1; }; fi
+            warn "已恢复原传输、配置和链接。" >&2
+        fi
+        if [[ -n "$backup" ]] && ! rm -rf -- "$backup"; then
+            warn "无法清理传输切换备份：$backup。请用 transport status 确认当前传输。" >&2; exit 1
+        fi
+        exit "$rc"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")" || fail '无法备份节点配置。'
+    backup_state "$backup" || fail '无法备份节点配置。'
+    if [[ -f "$LINK_FILE" ]]; then cp -a -- "$LINK_FILE" "$backup/link.txt" || fail '无法备份节点链接。'; fi
+    # Xray 根据后缀识别配置类型，暂存文件也必须使用 .json。
+    candidate="$backup/transport.json"
+    if ! jq --arg network "$target" --arg path "$path" '.inbounds[0] |= (
+        .streamSettings.network=$network |
+        if $network=="xhttp" then
+            .streamSettings.xhttpSettings={path:$path,mode:"auto"} | del(.settings.clients[].flow)
+        else
+            del(.streamSettings.xhttpSettings) | .settings.clients[].flow="xtls-rprx-vision"
+        end)' "$CONFIG" > "$candidate" \
+        || ! config_ok "$candidate" || ! chown root:xray "$candidate" || ! chmod 640 "$candidate"; then
+        fail '当前 Xray 未接受目标传输配置。请检查核心版本和配置权限。'
+    fi
+    # shellcheck disable=SC2034 # EXIT trap 读取事务状态。
+    changed=1
+    mv -f -- "$candidate" "$CONFIG" || fail '无法发布节点配置。'
+    if (( was_active )); then
+        if ! systemctl restart xray || ! wait_service 10; then fail '切换后 Xray 未正常监听。'; fi
+        if [[ "$NODE_MODE" == self ]]; then
+            self_http_check "$SNI" 127.0.0.1 "$PORT" || fail '切换后 HTTPS 回落未通过。'
+        fi
+        self_client_probe "$SNI" 127.0.0.1 "$PORT" || fail '切换后的实际代理请求未通过。'
+    fi
+    show_node >/dev/null || fail '无法更新导入链接。'
+    if [[ "$NODE_MODE" == self ]] && self_exists; then
+        rm -f -- "$SELF_DIR/network-check.json" || fail '无法清除旧传输的网络检查记录。'
+    fi
+    # shellcheck disable=SC2034 # EXIT trap 读取事务状态。
+    committed=1
+    ok "已切换为 $target，导入链接已更新。"
+    if (( ! was_active )); then warn 'Xray 原为停止状态。配置已验证，实际连接需在启动后检查。'; fi
+)
+
+transport_command() {
+    need_root; load_metadata
+    [[ $# -le 1 ]] || fail '用法：transport [status|tcp|xhttp]'
+    local action="${1:-}" current script_path unit=vless-reality-transport
+    current="$(config_transport)" || fail '无法识别当前传输。'
+    if [[ -z "$action" || "$action" == status ]]; then
+        if [[ "$current" == tcp ]]; then say '当前传输：TCP + REALITY + Vision';
+        else
+            local path
+            path="$(config_xhttp_path)" || fail '无法读取 XHTTP 路径。'
+            say "当前传输：XHTTP + REALITY（auto，路径 $path）"
+        fi
+        if [[ "$action" == status || ! -t 0 ]]; then return 0; fi
+        read -r -p '切换传输 [tcp / xhttp / 回车取消]：' action || return 0
+        [[ -n "$action" ]] || return 0
+    fi
+    case "$action" in tcp|xhttp) ;; *) fail '用法：transport [status|tcp|xhttp]' ;; esac
+    need_command systemd-run
+    script_path="$(readlink -f -- "$SCRIPT_PATH")" || fail '无法找到当前管理脚本。'
+    [[ -f "$script_path" && -r "$script_path" ]] || fail '当前管理脚本不可读。'
+    warn '切换运行中的节点会重启 Xray，旧客户端连接会中断。请使用 VPS 直连 SSH 或控制台。'
+    say "重连后可用 $(cmd_name) transport status 查看结果，或用 journalctl -u $unit 查看后台任务日志。"
+    systemd-run --quiet --wait --collect --unit="$unit" --property="SyslogIdentifier=$unit" \
+        /bin/bash "$script_path" __transport-apply "$action" || fail "传输切换失败，请查看 journalctl -u $unit。"
+    [[ "$(config_transport)" == "$action" ]] || fail '任务已结束，但当前传输已改变，请查看状态。'
+    show_node
 }
 
 tfo_apply() {
@@ -1457,13 +1600,14 @@ change_uuid() {
     need_root
     self_operation_lock
     load_metadata
-    local new old_port="$PORT" backup was_active=0
+    local new old old_port="$PORT" backup was_active=0
+    old="$(config_uuid)" || fail '无法从配置读取旧 UUID。'
     new="$($XRAY_BIN uuid)"
     if systemctl is-active --quiet xray; then was_active=1; fi
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
     backup_state "$backup"
     edit_config_private \
-        '($credentials | split("\n")) as $secret | (.inbounds[] | select(.protocol == "vless") | .settings.clients[] | select(.flow == "xtls-rprx-vision") | .id) = $secret[0]' "$new" \
+        '($credentials | split("\n")) as $secret | (.inbounds[] | select(.protocol == "vless") | .settings.clients[] | select(.id == $secret[1]) | .id) = $secret[0]' "$new" "$old" \
         || { restore_state "$backup" "$was_active" || fail "恢复失败，备份保留在 $backup。"; fail '写入配置失败。'; }
     commit_change "$backup" "$old_port" 'UUID 已重新生成，旧链接立即失效。' "$was_active"
 }
@@ -2840,6 +2984,12 @@ stop_client_residue() {
 }
 self_client_probe() (
     local domain="$1" address="$2" server_port="${3:-443}" kind="${4:-valid}" test_dir pid='' socks_port uuid sid="$SHORT_ID" pub="$PUBLIC_KEY" tries=5 seconds=20 ready=0
+    local network path='' flow='xtls-rprx-vision'
+    network="$(config_transport)" || return 2
+    if [[ "$network" == xhttp ]]; then
+        path="$(config_xhttp_path)" || return 2
+        flow=''
+    fi
     test_dir="$(mktemp -d /tmp/vless-reality-client.XXXXXX)" || return 2
     trap 'rc=$?; trap - EXIT
         if [[ -n "$pid" ]]; then
@@ -2848,7 +2998,12 @@ self_client_probe() (
         fi
         rm -rf -- "$test_dir"; exit "$rc"' EXIT
     printf 'vless-reality-setup\n' > "$test_dir/.vless-reality-owned"
-    socks_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" || return 2
+    if command -v python3 >/dev/null; then
+        socks_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" || return 2
+    else
+        # 普通模式没有 Python 依赖；下方仍核对临时监听确由本次客户端创建。
+        socks_port="$(shuf -i 32768-60999 -n 1)" || return 2
+    fi
     uuid="$(config_uuid)" || return 2
     case "$kind" in
         valid) ;;
@@ -2867,10 +3022,12 @@ self_client_probe() (
     esac
     printf '%s\n' "$uuid" "$sid" "$CLIENT_ENCRYPTION" > "$test_dir/credentials" || return 2
     jq -n --rawfile credentials "$test_dir/credentials" --arg host "$address" --argjson port "$server_port" --argjson socks "$socks_port" \
-        --arg sni "$domain" --arg pub "$pub" '($credentials | split("\n")) as $secret | {
+        --arg sni "$domain" --arg pub "$pub" --arg network "$network" --arg flow "$flow" --arg path "$path" \
+        '($credentials | split("\n")) as $secret | {
         log:{loglevel:"warning"}, inbounds:[{listen:"127.0.0.1",port:$socks,protocol:"socks",settings:{auth:"noauth"}}],
-        outbounds:[{protocol:"vless",settings:{vnext:[{address:$host,port:$port,users:[{id:$secret[0],flow:"xtls-rprx-vision",encryption:$secret[2]}]}]},
-          streamSettings:{network:"tcp",security:"reality",realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$secret[1]}}}]
+        outbounds:[{protocol:"vless",settings:{vnext:[{address:$host,port:$port,users:[{id:$secret[0],flow:$flow,encryption:$secret[2]}]}]},
+          streamSettings:({network:$network,security:"reality",realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$secret[1]}}
+            + if $network=="xhttp" then {xhttpSettings:{path:$path,mode:"auto"}} else {} end)}]
         }' > "$test_dir/client.json" || return 2
     rm -f -- "$test_dir/credentials" || return 2
     "$XRAY_BIN" run -test -config "$test_dir/client.json" > "$test_dir/test.log" 2>&1 || return 2
@@ -2911,13 +3068,12 @@ self_report() {
 self_config_policy() {
     local file="$1" domain="$2"
     valid_host "$domain" || return 1
-    jq -e --arg sni "$domain" '
+    jq -e --arg sni "$domain" "$TRANSPORT_JQ"'
       def uuid: type=="string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$") and .!="00000000-0000-0000-0000-000000000000";
       def limit: type=="object" and all([.afterBytes,.bytesPerSec,.burstBytesPerSec][]; type=="number" and .>=0 and .<=1073741824 and floor==.);
       (.inbounds|length)==1 and all(.inbounds[];
         .protocol=="vless" and .listen=="0.0.0.0" and .port==443 and
-        .streamSettings.network=="tcp" and .streamSettings.security=="reality" and
-        (.settings.clients|length)>0 and all(.settings.clients[]; (.id|uuid) and .flow=="xtls-rprx-vision") and
+        managed_transport and all(.settings.clients[]; .id|uuid) and
         ([.settings.clients[].id|ascii_downcase]|length)==([.settings.clients[].id|ascii_downcase]|unique|length) and
         (.streamSettings.realitySettings as $r |
           $r.target=="127.0.0.1:8443" and $r.xver==0 and $r.show==false and $r.serverNames==[$sni] and
@@ -3011,7 +3167,7 @@ check_self() {
     self_report 'DNS A 直连当前 VPS、无 CNAME/CDN、无 AAAA（两个解析器）' self_dns_check "$SNI"
     self_report 'Xray TCP 443 服务和监听' service_ok
     self_report 'Nginx 8443 仅 IPv4 回环监听' self_listener_check
-    self_report 'REALITY 本机 target、域名和 Vision 配置' self_config_check
+    self_report 'REALITY 本机 target、域名和传输配置' self_config_check
     self_report 'Nginx TLS 1.3 / X25519 / ALPN h2 / 证书链与域名' self_tls_check "$SNI" 127.0.0.1:8443
     self_report 'Nginx 已加载磁盘上的当前证书' self_loaded_cert_matches "$SNI"
     self_report '本机网站 HTTP/2 200，无跳转' self_http_check "$SNI" 127.0.0.1 8443
@@ -3032,7 +3188,7 @@ check_self() {
         fi
     fi
     self_report '证书 timer、最近续期 dry-run 与 deploy hook 记录' self_renew_ready
-    self_report '实际 Xray 客户端 REALITY + Vision 握手和 HTTPS 代理请求（本机源）' self_client_probe "$SNI" 127.0.0.1
+    self_report '实际 Xray 客户端 REALITY 握手和 HTTPS 代理请求（本机源）' self_client_probe "$SNI" 127.0.0.1
     if [[ -n "$external" ]]; then
         if [[ -x "$external" && -f "$external" && ! -L "$external" && "$(stat -c %u "$external")" == 0 \
             && "$(stat -c %a "$external")" =~ ^[57]00$ ]]; then
@@ -3327,13 +3483,20 @@ security_permissions() {
     [[ -f "$path" && ! -L "$path" && "$mode" == 600 && "$(stat -c %u "$path")" == 0 ]]
 }
 security_link_check() {
-    local private link uuid sid address
+    local private link uuid sid address network path
     address="$(client_address)" || return 1
     private="$(jq -er '.inbounds[0].streamSettings.realitySettings.privateKey' "$CONFIG")" || return 1
     link="$(< "$LINK_FILE")"; uuid="$(config_uuid)" || return 1
     sid="$(jq -er '.inbounds[0].streamSettings.realitySettings.shortIds | if length==1 then .[0] else empty end' "$CONFIG")" || return 1
     [[ "$sid" == "$SHORT_ID" && "$link" != *"$private"* && "$link" == "vless://$uuid@$address:$PORT?"* && "$link" == *"&sni=$SNI&"* \
-        && "$link" == *"&pbk=$PUBLIC_KEY&"* && "$link" == *"&sid=$SHORT_ID&"* ]]
+        && "$link" == *"&pbk=$PUBLIC_KEY&"* && "$link" == *"&sid=$SHORT_ID&"* ]] || return 1
+    network="$(config_transport)" || return 1
+    if [[ "$network" == xhttp ]]; then
+        path="$(config_xhttp_path)" || return 1
+        [[ "$link" == *"&type=xhttp&path=%2F${path#/}&mode=auto"* && "$link" != *'&flow='* ]]
+    else
+        [[ "$link" == *'&type=tcp&headerType=none'* && "$link" == *'&flow=xtls-rprx-vision&'* ]]
+    fi
 }
 security_xray_listener() {
     local pid
@@ -3474,7 +3637,7 @@ security_check() {
     self_report 'Nginx 服务运行' systemctl is-active --quiet nginx
     self_report 'Xray 实际以非 root xray 用户运行' security_service_user
     self_report 'Nginx 8443 仅监听本机回环' self_listener_check
-    self_report 'REALITY target/SNI/Vision/UUID/非空 Short ID 安全约束' self_config_check
+    self_report 'REALITY target/SNI/传输/UUID/非空 Short ID 安全约束' self_config_check
     self_report '配置、目录、安装记录和链接权限' security_permissions
     self_report 'REALITY 私钥与客户端公钥配对' self_key_pair_check
     self_report '客户端链接地址符合当前模式且不含私钥' security_link_check
@@ -3489,7 +3652,7 @@ security_check() {
     self_report 'SNI 与 Host/:authority 不匹配返回 421' self_authority_check "$SNI"
     self_report '证书续期 timer、dry-run 和 hook' self_renew_ready
     self_report '证书剩余有效期至少 14 天' openssl x509 -in "$SELF_DIR/acme/live/$SNI/cert.pem" -checkend 1209600 -noout
-    if self_client_probe "$SNI" 127.0.0.1; then baseline=1; ok '通过：合法 REALITY/Vision 实际代理请求（本机源）';
+    if self_client_probe "$SNI" 127.0.0.1; then baseline=1; ok '通过：合法 REALITY 实际代理请求（本机源）';
     else warn '失败：合法节点基线未通过'; SELF_CHECK_FAILURES=$((SELF_CHECK_FAILURES+1)); fi
     if (( baseline )); then
         security_item '错误 UUID 未获得代理访问（本机负向测试）' security_unauthorized bad-uuid
@@ -3528,6 +3691,7 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   show                         显示 vless:// 导入链接
   addr [ip|domain [连接域名]]   切换客户端连接地址（不修改 REALITY SNI）
   status                       查看服务、配置、端口和伪装站点状态
+  transport [status|tcp|xhttp]  查看或切换 TCP + Vision / XHTTP 传输
   port [新端口]                修改端口
   sni [新域名|auto]            修改或自动优选 REALITY 伪装域名
   sni-best                     查看当前测速延迟最低的域名，不修改节点
@@ -3606,6 +3770,7 @@ show_menu() {
     say ' 26. 卸载节点'
     say ' 27. 更换自有域名随机网页（节点信息不变）'
     say ' 28. 更换 Cloudflare API Token（验证证书续期）'
+    say ' 29. 切换节点传输（TCP + Vision / XHTTP）'
     say ' 00. 退出'
     say '=================================='
     menu_status
@@ -3622,7 +3787,8 @@ menu_action() {
         14) change_sni ;; 15) show_fastest_sni ;; 16) tfo_node ;; 17) vlessenc_node ;;
         18) website_status ;; 19) cert_command status ;; 20) cert_command renew-test ;;
         21) check_self ;; 22) security_check ;; 23) fallback_command ;; 24) security_apply ;;
-        25) log_node ;; 26) uninstall_node ;; 27) website_random ;; 28) cert_command token ;; *) return 2 ;;
+        25) log_node ;; 26) uninstall_node ;; 27) website_random ;; 28) cert_command token ;;
+        29) transport_command ;; *) return 2 ;;
     esac
 }
 # 命令行历史数字参数保留原语义，避免旧自动化把卸载误解为安装等操作。
@@ -3648,8 +3814,8 @@ interactive_menu() {
     local choice rc
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-28，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|1[0-9]|2[0-8]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-29，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|[12][0-9]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
         set +e
         ( set -e; menu_action "$choice" )
@@ -3685,6 +3851,8 @@ main() {
         show) show_node ;;
         addr) shift; address_node "$@" ;;
         status) status_node ;;
+        transport) shift; transport_command "$@" ;;
+        __transport-apply) shift; transport_apply "$@" ;;
         port) shift; change_port "$@" ;;
         sni) shift; change_sni "$@" ;;
         sni-best) show_fastest_sni ;;

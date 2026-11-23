@@ -55,9 +55,19 @@ self_track "$SELF_DIR/state.json"
 if command curl --noproxy '*' --connect-timeout 2 --max-time 3 --resolve "$SNI:8443:$container_ip" -fsS "https://$SNI:8443/" -o /dev/null 2>/dev/null; then echo '非回环接口不应能访问 8443'; exit 1; fi
 start_server() {
     setpriv --reuid=xray --regid=xray --init-groups "$XRAY_BIN" run -config "$CONFIG" 7>&- 8>&- 9>&- > "$TEST_DIR/server.log" 2>&1 & server_pid=$!
+    printf '%s\n' "$server_pid" > "$TEST_DIR/server.pid"
     sleep 0.3
 }
-stop_server() { kill "$server_pid"; wait "$server_pid" || true; server_pid=''; }
+stop_server() {
+    local attempt
+    kill "$server_pid"
+    wait "$server_pid" 2>/dev/null || true
+    for attempt in {1..30}; do
+        if [[ -z "$(ss -H -ltn 'sport = :443')" ]]; then server_pid=''; return 0; fi
+        sleep 0.1
+    done
+    return 1
+}
 systemctl() {
     local attempt
     case "$1" in
@@ -97,6 +107,13 @@ switch_address() (
     self_dns_check() { return 0; }
     address_node "$@" > "$TEST_DIR/address.log"
 )
+switch_transport() {
+    local result=0
+    transport_apply "$1" > "$TEST_DIR/transport.log" 2>&1 || result=$?
+    # transport_apply 模拟后台任务，子进程重启的 Xray 仍须由测试主进程清理。
+    server_pid="$(< "$TEST_DIR/server.pid")"
+    if (( result )); then cat "$TEST_DIR/transport.log" "$TEST_DIR/server.log"; return "$result"; fi
+}
 for mode in off native xorpub random; do
     CLIENT_ENCRYPTION=none; VLESS_DECRYPTION=none
     if [[ "$mode" != off ]]; then mapfile -t pair < <(generate_vless_encryption_pair "$mode"); VLESS_DECRYPTION="${pair[0]}"; CLIENT_ENCRYPTION="${pair[1]}"; fi
@@ -209,6 +226,25 @@ for mode in off native xorpub random; do
         jq -e '.result=="pending" and .external=="unverified" and .public_probe=="unverified"' "$SELF_DIR/network-check.json" >/dev/null
         [[ "$(stat -c %a "$SELF_DIR/network-check.json")" == 600 ]]
     fi
+    transport_invariants="$(sha256sum "$MARKER" "$SELF_SITE" "$SELF_WEB/index.html" "$SELF_DIR/acme/live/$SNI/"*.pem)"
+    tcp_config="$(jq -S . "$CONFIG" | sha256sum)"; tcp_link="$(sha256sum "$LINK_FILE")"
+    switch_transport xhttp
+    [[ "$(config_transport)" == xhttp && "$(config_uuid)" == "$uuid" && ! -e "$SELF_DIR/network-check.json" ]]
+    path="$(config_xhttp_path)"
+    [[ "$(< "$LINK_FILE")" == *"&type=xhttp&path=%2F${path#/}&mode=auto"* && "$(< "$LINK_FILE")" != *'&flow='* ]]
+    security_link_check
+    self_http_check "$SNI" "$container_ip" 443
+    self_client_probe "$SNI" "$container_ip"
+    if [[ "$mode" == off ]]; then
+        before="$(wc -l < "$TEST_DIR/origin.log")"
+        result=0; self_client_probe "$SNI" "$container_ip" 443 bad-uuid || result=$?
+        [[ "$result" == 1 && "$(wc -l < "$TEST_DIR/origin.log")" == "$before" ]]
+        self_authority_check "$SNI" 443 "$container_ip"
+    fi
+    switch_transport tcp
+    [[ "$(jq -S . "$CONFIG" | sha256sum)" == "$tcp_config" && "$(sha256sum "$LINK_FILE")" == "$tcp_link" ]]
+    [[ "$(sha256sum "$MARKER" "$SELF_SITE" "$SELF_WEB/index.html" "$SELF_DIR/acme/live/$SNI/"*.pem)" == "$transport_invariants" ]]
+    printf '真实 TCP + Vision / XHTTP 双向切换、导入链接与 HTTPS 回落 / %s 通过\n' "$mode"
     stop_server
     [[ "$(sha256sum "$SELF_WEB/index.html")" == "$page_digest" ]]
     printf '真实 HTTPS/Host/SNI、认证拒绝、权限及回落限速/Vision/%s 通过\n' "$mode"

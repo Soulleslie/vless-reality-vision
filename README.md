@@ -19,6 +19,7 @@
 - 两种模式均可切换客户端连接地址为 IP / 自己的域名，保留 SNI 和认证参数，无需重启服务
 - 可选开启 TCP Fast Open，并在菜单或命令行切换
 - 可选开启 VLESS Encryption；生成成对参数并更新客户端导入链接
+- 已有节点可在 TCP + Vision 和 XHTTP 之间切换，两种传输均使用 VLESS + REALITY
 - 自有域名模式：Nginx 本机 HTTPS 网站、Let’s Encrypt 证书与隔离自动续期
 - 安全更换 Cloudflare API Token：隐藏输入、全新 DNS-01 验证、原续期测试和失败回滚
 - 自有域名新安装随机生成六种布局之一的静态网页，配色、文案和图形组合后保存，后续访问保持稳定
@@ -96,7 +97,7 @@ GitHub 更新不会自动修改 VPS 上已运行的节点。原来通过本项�
 
 普通模式不会在更新脚本时自动变成自有域名模式。只有决定切换时，先准备 DNS、保存需要的节点信息，再卸载原节点并选择菜单 2 重新部署；新安装会生成新的认证参数，需要重新导入链接。已有节点会阻止直接覆盖安装。
 
-交互菜单编号连续为 **1–28**，`00` 退出；原 **1–27** 操作保持，卸载仍为 **26**，**27** 更换随机网页，新增 **28「更换 Cloudflare API Token」**。第 **24** 项为「更新 Nginx 安全配置（原安全模板）」，不换网页。RealityChecker 仍已移除，第 18 项为网站状态。`install-self`、`show`、`uninstall` 等命名命令保持兼容。历史的命令行数字参数沿用旧映射并显示提示，因此不要用它们代替新交互菜单编号；自动化请使用命名命令。
+交互菜单编号连续为 **1–29**，`00` 退出。**26** 卸载，**27** 更换随机网页，**28** 更换 Cloudflare API Token，**29** 切换节点传输。第 **24** 项为「更新 Nginx 安全配置（原安全模板）」，第 18 项为网站状态。历史的命令行数字参数沿用旧映射，自动化请使用 `install-self`、`show`、`transport`、`uninstall` 等命名命令。
 
 如果旧版脚本在菜单选择 `1` 后直接返回主菜单，请重新执行上面的下载命令获取最新版。v1.0.1 已修正安装前检查在正常机器上错误退出的问题。
 
@@ -163,6 +164,8 @@ v2.3.0 将自有域名新安装的固定网页改为一次性随机静态网页�
 v2.3.1 增加已有自有域名节点的 `website-random` 与菜单 27，旧固定网页可直接迁移，后续更换随机选择其他布局。只替换 HTML 和对应归属记录，保留节点全部信息与证书，不重启或 reload Xray/Nginx。前后本机 HTTPS/H2/200 与正文比对，失败恢复网页和归属清单；临时备份和发布文件随退出/卸载清理。修复归属清单写入失败时临时 receipt 未立即删除的问题。第 24 项标签明确为 Nginx 安全配置。见 [网页更换测试报告](docs/SITE_REPLACEMENT_REPORT.md)。
 
 v2.4.0 增加 `cert token` 和菜单 28：安全更换 Cloudflare DNS-01 凭据，先用独立临时 ACME 账户验证新 Token，再更新原凭据路径和 SHA-256、检查原续期 dry-run 与 Nginx hook。现有证书/节点/链接/续期配置保持，失败恢复原凭据与测试记录；旧/新令牌同时脱敏，不继承同名变量的 export 属性。临时账户/凭据备份随退出与卸载清理，修复续期测试记录发布失败的暂存文件清理。详见 [Token 更换测试报告](docs/CLOUDFLARE_TOKEN_REPORT.md)。
+
+v2.5.0 新增菜单 29 和 `transport` 命令，支持已有节点在 TCP + Vision 与 XHTTP 之间切换。
 
 ## 执行速度优化
 
@@ -405,6 +408,9 @@ UUID 必须有效且非全零，Short ID 使用安全随机的非零 8 字节值
 ```text
 vless-reality show                 显示 vless:// 导入链接
 vless-reality status               检查服务、配置、端口和伪装站点
+vless-reality transport status     查看当前节点传输
+vless-reality transport xhttp      切换到 XHTTP + REALITY
+vless-reality transport tcp        切回 TCP + REALITY + Vision
 vless-reality port 8443            修改监听端口
 vless-reality sni www.apple.com    修改 REALITY 伪装域名
 vless-reality sni auto             重新测量并优选伪装域名
@@ -430,6 +436,14 @@ vless-reality uninstall            卸载并清理
 ```
 
 安装前也可以运行 `/root/vless-reality-setup.sh sni-best` 查看测速结果；该命令只显示候选域名，不会安装或修改节点。
+
+## TCP + Vision 与 XHTTP 双向切换
+
+已有普通或自有域名节点更新管理脚本后，可选择菜单 **29「切换节点传输」**，也可直接运行 `vless-reality transport xhttp` 或 `vless-reality transport tcp`。新安装默认使用 TCP + Vision，同一节点端口一次使用一种传输。
+
+切到 XHTTP 时脚本生成一个随机 Path，使用 `mode=auto` 并移除 Vision flow。切回 TCP 时恢复 `xtls-rprx-vision`。节点 Address、端口、SNI、UUID、公钥、Short ID、VLESS Encryption 和 TFO 设置都沿用原值，自有域名模式继续使用现有 Nginx 网站和证书。XHTTP 客户端要匹配导入链接的 Path，并支持当前 VLESS Encryption 设置。[Xray XHTTP 文档](https://xtls.github.io/en/config/transports/xhttp.html)
+
+切换在 systemd 后台执行。对于正在运行的节点，脚本先验证候选配置，重启 Xray 后验证实际代理请求，自有域名模式还会检查 HTTPS 回落。失败时恢复旧配置及链接。原来停止的节点会保留停止状态，连接需要启动后验证。建议使用 VPS 直连 SSH 或控制台，切换会中断旧连接。成功后在客户端重新导入链接。重连后可用 `vless-reality transport status` 查看传输、用 `vless-reality show` 取链接，或用 `journalctl -u vless-reality-transport -n 30 --no-pager` 排查失败。自有域名切换后可用 `check-self` 重做网络检测。
 
 ## 服务器连接地址：IP / 域名切换
 
@@ -491,7 +505,7 @@ TFO 只影响新建 TCP 连接。服务端开启 TFO 时，新生成的 `vless:/
 
 ## 客户端要求
 
-客户端需要支持 VLESS、REALITY、`xtls-rprx-vision` 和 uTLS 指纹。导入后应确认这些关键参数：
+客户端需要支持 VLESS、REALITY 和 uTLS 指纹。默认 TCP 节点还需要支持 `xtls-rprx-vision`。导入后应确认这些关键参数：
 
 ```text
 network: tcp
@@ -501,6 +515,8 @@ fingerprint: chrome
 SNI: 安装时选择的伪装域名
 public key / short id: 使用脚本输出值
 ```
+
+XHTTP 节点改为 `network: xhttp`，Flow 留空，Path 使用导入链接的值，Mode 为 `auto`。如果开启 VLESS Encryption，还需要客户端支持链接中的 Encryption 参数。
 
 ## 文件位置
 
