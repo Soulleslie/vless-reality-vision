@@ -114,12 +114,13 @@ transport_apply xhttp > "$TEST_DIR/result"
 curl() {
     printf '%s\n' "$*" >> "$TEST_DIR/curls"
     if [[ "$*" == *'--proxy '* ]]; then
-        [[ "$PROBE_CASE" == first || ( "$PROBE_CASE" == backup && "$*" == *www.cloudflare.com* ) ]]
+        if [[ "$PROBE_CASE" == first || ( "$PROBE_CASE" == backup && "$*" == *www.cloudflare.com* ) ]]; then return 0; fi
+        return 28
     else [[ "$PROBE_CASE" == direct ]]; fi
 }
 for PROBE_CASE in first backup direct unreachable; do
     : > "$TEST_DIR/curls"
-    rc=0; transport_probe_https 23456 || rc=$?
+    rc=0; transport_probe_https 23456 2> "$TEST_DIR/curl-diagnostics" || rc=$?
     count="$(wc -l < "$TEST_DIR/curls")"
     case "$PROBE_CASE" in
         first) [[ "$rc/$count" == 0/1 ]] ;;
@@ -128,5 +129,10 @@ for PROBE_CASE in first backup direct unreachable; do
         unreachable) [[ "$rc/$count" == 3/4 ]] ;;
     esac
     if rg -qv -- '--max-time (2|8) ' "$TEST_DIR/curls"; then echo '探测请求缺少时间上限'; exit 1; fi
+    if rg -- '--proxy ' "$TEST_DIR/curls" | rg -qv -- '--connect-timeout 8 --max-time 8 '; then
+        echo '代理探测的 TLS 握手必须能使用完整请求预算'; exit 1
+    fi
+    if [[ "$PROBE_CASE" == first ]]; then [[ ! -s "$TEST_DIR/curl-diagnostics" ]]
+    else [[ "$(< "$TEST_DIR/curl-diagnostics")" == *www.debian.org*'curl 退出码 28'* ]]; fi
 done
 printf '旧记录兼容、Path 复用、故障分级、停止状态、正常回滚与两种 SIGKILL 恢复通过\n'

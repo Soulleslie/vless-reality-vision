@@ -5,8 +5,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=/dev/null
 source <(sed '$d' "$ROOT/install.sh")
 XRAY_BIN="${1:?请指定官方 Xray 二进制}"
-TEST_DIR="$(mktemp -d)"; server_pid=''; http_pid=''
-trap '[[ -z "$server_pid" ]] || kill "$server_pid" 2>/dev/null || true; [[ -z "$http_pid" ]] || kill "$http_pid" 2>/dev/null || true; nginx -s quit 2>/dev/null || true; rm -rf "$TEST_DIR"' EXIT
+TEST_DIR="$(mktemp -d)"; server_pid=''; http_pid=''; https_pid=''
+trap 'for pid in "$server_pid" "$http_pid" "$https_pid"; do [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true; done; nginx -s quit 2>/dev/null || true; rm -rf "$TEST_DIR"' EXIT
 [[ $EUID == 0 && -f /.dockerenv ]] || { echo '仅限一次性容器'; exit 1; }
 rm -f /etc/nginx/sites-enabled/default
 SELF_DIR=/etc/vless-reality-self; SELF_WEB=/var/www/vless-reality-self
@@ -90,7 +90,13 @@ fallback_limits_json() { printf '%s\n' '{"upload":{"afterBytes":4096,"bytesPerSe
 mkdir -p "$TEST_DIR/origin"; chmod 755 "$TEST_DIR" "$TEST_DIR/origin"
 printf 'proxy transport reached\n' > "$TEST_DIR/origin/index.html"
 python3 -m http.server 18080 --bind 0.0.0.0 --directory "$TEST_DIR/origin" > "$TEST_DIR/origin.log" 2>&1 & http_pid=$!
-# 替换测试 URL，保留真实 SOCKS/Xray 流量，避免测试依赖公网网站。
+openssl s_server -quiet -www -accept 18443 -cert "$SELF_DIR/acme/live/$SNI/cert.pem" \
+    -cert_chain "$TEST_DIR/ca.crt" -key "$SELF_DIR/acme/live/$SNI/privkey.pem" > "$TEST_DIR/https-origin.log" 2>&1 & https_pid=$!
+for attempt in {1..20}; do
+    if [[ -n "$(ss -H -ltn 'sport = :18443')" ]]; then break; fi
+    sleep 0.1
+done
+# 切换验证通过真实 SOCKS/Xray 连接本地 HTTPS 源，包含目标 TLS 握手。
 curl() {
     local args=() arg
     for arg in "$@"; do
@@ -98,7 +104,9 @@ curl() {
             printf '0 000 0.000000 0.000000'; return 28
         fi
         case "$arg" in
-            https://www.debian.org/|https://www.cloudflare.com/cdn-cgi/trace) arg="http://$container_ip:18080/" ;;
+            https://www.debian.org/|https://www.cloudflare.com/cdn-cgi/trace)
+                if [[ "$*" == *'--max-time 8 '* ]]; then arg="https://$SNI:18443/";
+                else arg="http://$container_ip:18080/"; fi ;;
         esac
         args+=("$arg")
     done
@@ -132,7 +140,7 @@ for mode in off native xorpub random; do
     if [[ "$mode" != off ]]; then mapfile -t pair < <(generate_vless_encryption_pair "$mode"); VLESS_DECRYPTION="${pair[0]}"; CLIENT_ENCRYPTION="${pair[1]}"; fi
     write_config "$uuid" "${keys[0]}"
     # 测试源为私网地址；仅在隔离容器的配置中显式放行该地址和端口。
-    jq --arg ip "$container_ip/32" '(.outbounds[] | select(.protocol=="freedom") | .settings.finalRules)=[{action:"allow",network:"tcp",ip:[$ip],port:"18080"}]' "$CONFIG" > "$TEST_DIR/scoped.json"
+    jq --arg ip "$container_ip/32" '(.outbounds[] | select(.protocol=="freedom") | .settings.finalRules)=[{action:"allow",network:"tcp",ip:[$ip],port:"18080,18443"}]' "$CONFIG" > "$TEST_DIR/scoped.json"
     cat "$TEST_DIR/scoped.json" > "$CONFIG"
     config_ok
     write_marker
