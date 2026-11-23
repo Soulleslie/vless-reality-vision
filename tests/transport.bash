@@ -11,10 +11,6 @@ SELF_DIR="$TEST_DIR/self"; LINK_FILE="$TEST_DIR/link.txt"
 mkdir -p "$CONFIG_DIR"
 need_root() { :; }
 chown() { :; }
-stat() {
-    if [[ "$*" == "-c %u:%a $LINK_FILE" ]]; then printf '0:%s\n' "$(command stat -c %a "$LINK_FILE")";
-    else command stat "$@"; fi
-}
 XRAY_BIN="$TEST_DIR/xray-bin"
 cat > "$XRAY_BIN" <<'XRAY'
 #!/bin/sh
@@ -44,21 +40,48 @@ systemctl() {
 }
 wait_service() { [[ "$FAIL_STAGE" != listen || "$(config_transport)" != xhttp ]]; }
 self_client_probe() {
-    [[ "$2:$3" == '127.0.0.1:24443' ]] || return 2
+    [[ "$2:$3" == '127.0.0.1:24443' && "$4" == switch ]] || return 2
     printf '%s\n' "$(config_transport)" >> "$TEST_DIR/probes"
     if [[ "$FAIL_STAGE" == signal ]]; then kill -TERM "$BASHPID"; fi
+    if [[ "$FAIL_STAGE" == kill-after-config ]]; then kill -KILL "$BASHPID"; fi
+    if [[ "$FAIL_STAGE" == targets ]]; then return 3; fi
     [[ "$FAIL_STAGE" != proxy ]]
+}
+sync() {
+    if [[ "$FAIL_STAGE" == kill-after-link && "$*" == "-- $CONFIG $MARKER" ]]; then kill -KILL "$BASHPID"; fi
+    command sync "$@"
 }
 mv() {
     if [[ "$FAIL_STAGE" == link && "${@: -1}" == "$LINK_FILE" ]]; then return 1; fi
     command mv "$@"
 }
-for FAIL_STAGE in config restart listen proxy link signal; do
+for FAIL_STAGE in config restart listen proxy targets link signal; do
     rc=0; transport_apply xhttp > "$TEST_DIR/result" 2>&1 || rc=$?
     [[ "$rc" != 0 && "$(sha256sum "$CONFIG" "$MARKER" "$LINK_FILE")" == "$hash_before" ]]
     [[ -z "$(find "$CONFIG_DIR" -mindepth 1 -name '.change-backup.*' -o -name '.config.json.*')" ]]
     if [[ "$FAIL_STAGE" == config ]]; then [[ ! -f "$TEST_DIR/restarts" ]];
     else [[ "$(tail -1 "$TEST_DIR/restarts")" == tcp ]]; fi
+    if [[ "$FAIL_STAGE" == targets ]]; then [[ "$(< "$TEST_DIR/result")" == *'代理与本机直连都无法访问测试站点'* ]]; fi
+done
+for FAIL_STAGE in kill-after-config kill-after-link; do
+    rc=0; transport_apply xhttp > "$TEST_DIR/result" 2>&1 || rc=$?
+    [[ "$rc" == 137 && "$(config_transport)" == xhttp ]]
+    transport_pending
+    if [[ "$FAIL_STAGE" == kill-after-config ]]; then [[ "$(< "$LINK_FILE")" == "$link_before" ]];
+    else [[ "$(< "$LINK_FILE")" == *'&type=xhttp&'* ]]; fi
+    rc=0; transport_command status >/dev/null 2>&1 || rc=$?; [[ "$rc" == 3 ]]
+    rc=0; show_node >/dev/null 2>&1 || rc=$?; [[ "$rc" == 3 ]]
+    rc=0; (change_uuid >/dev/null 2>&1) || rc=$?; [[ "$rc" == 3 ]]
+    # 不覆盖中断后管理员手工写入的配置。
+    cp "$CONFIG" "$TEST_DIR/interrupted.json"
+    printf '\n' >> "$CONFIG"
+    if transport_recover >/dev/null 2>&1; then echo '不应覆盖手改配置'; exit 1; fi
+    transport_pending
+    cp "$TEST_DIR/interrupted.json" "$CONFIG"
+    FAIL_STAGE=none
+    transport_recover >/dev/null
+    [[ "$(sha256sum "$CONFIG" "$MARKER" "$LINK_FILE")" == "$hash_before" ]]
+    if transport_pending; then echo '恢复后不应还有挂起记录'; exit 1; fi
 done
 FAIL_STAGE=none
 transport_apply xhttp > "$TEST_DIR/result"
@@ -70,15 +93,40 @@ path="$(config_xhttp_path)"
 restarts="$(wc -l < "$TEST_DIR/restarts")"
 transport_apply xhttp >/dev/null
 [[ "$(config_xhttp_path)" == "$path" && "$(wc -l < "$TEST_DIR/restarts")" == "$restarts" ]]
+first_xhttp_link="$(< "$LINK_FILE")"
+# v2.5.0 已运行 XHTTP 但记录里尚无 Path，升级后应接管正在用的 Path。
+sed -i '11,$d' "$MARKER"
+show_node >/dev/null; [[ "$(< "$LINK_FILE")" == "$first_xhttp_link" ]]
 transport_apply tcp >/dev/null
 [[ "$(jq -S . "$CONFIG" | sha256sum)" == "$snapshot" && "$(< "$LINK_FILE")" == "$link_before" ]]
+[[ "$(sed -n '11p' "$MARKER")" == "$path" ]]
 
 # 关闭状态只检查配置并保存链接，UUID 管理仍能读取 XHTTP 用户。
 ACTIVE=0
 restarts="$(wc -l < "$TEST_DIR/restarts")"; probes="$(wc -l < "$TEST_DIR/probes")"
 transport_apply xhttp > "$TEST_DIR/result"
 [[ "$(< "$TEST_DIR/result")" == *'实际连接需在启动后检查'* ]]
+[[ "$(config_xhttp_path)" == "$path" && "$(< "$LINK_FILE")" == "$first_xhttp_link" ]]
 (change_uuid >/dev/null)
 [[ "$(config_uuid)" == 11111111-1111-4111-8111-111111111111 && "$(< "$LINK_FILE")" == *'&type=xhttp&'* ]]
 [[ "$(wc -l < "$TEST_DIR/restarts")" == "$restarts" && "$(wc -l < "$TEST_DIR/probes")" == "$probes" ]]
-printf '旧记录兼容、双向切换、UUID 管理、停止状态以及启动/代理/链接/信号故障回滚通过\n'
+
+curl() {
+    printf '%s\n' "$*" >> "$TEST_DIR/curls"
+    if [[ "$*" == *'--proxy '* ]]; then
+        [[ "$PROBE_CASE" == first || ( "$PROBE_CASE" == backup && "$*" == *www.cloudflare.com* ) ]]
+    else [[ "$PROBE_CASE" == direct ]]; fi
+}
+for PROBE_CASE in first backup direct unreachable; do
+    : > "$TEST_DIR/curls"
+    rc=0; transport_probe_https 23456 || rc=$?
+    count="$(wc -l < "$TEST_DIR/curls")"
+    case "$PROBE_CASE" in
+        first) [[ "$rc/$count" == 0/1 ]] ;;
+        backup) [[ "$rc/$count" == 0/2 ]] ;;
+        direct) [[ "$rc/$count" == 1/3 ]] ;;
+        unreachable) [[ "$rc/$count" == 3/4 ]] ;;
+    esac
+    if rg -qv -- '--max-time (2|8) ' "$TEST_DIR/curls"; then echo '探测请求缺少时间上限'; exit 1; fi
+done
+printf '旧记录兼容、Path 复用、故障分级、停止状态、正常回滚与两种 SIGKILL 恢复通过\n'
