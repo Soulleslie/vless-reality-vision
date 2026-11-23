@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.5.1'
+SCRIPT_VERSION='2.5.2'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -3128,12 +3128,18 @@ stop_client_residue() {
     return 1
 }
 transport_probe_https() {
-    local socks_port="$1" url
+    local socks_port="$1" url curl_status
     local targets=(https://www.debian.org/ https://www.cloudflare.com/cdn-cgi/trace)
-    # 代理响应可能需超过 5 秒。两个站各 8 秒，均失败再做各 2 秒的直连诊断。
+    # curl 的连接超时还包含代理链路与目标站的 TLS 握手。允许该阶段用满单次预算。
+    # 两个代理请求各 8 秒，均失败再做各 2 秒的直连诊断。
     for url in "${targets[@]}"; do
-        if curl --noproxy '' --proxy "socks5h://127.0.0.1:$socks_port" -fsS --connect-timeout 3 --max-time 8 \
-            "$url" -o /dev/null 2>/dev/null; then return 0; fi
+        if curl --noproxy '' --proxy "socks5h://127.0.0.1:$socks_port" -fsS --connect-timeout 8 --max-time 8 \
+            "$url" -o /dev/null 2>/dev/null; then
+            return 0
+        else
+            curl_status=$?
+            warn "代理验证 $url 失败（curl 退出码 $curl_status）。" >&2
+        fi
     done
     for url in "${targets[@]}"; do
         if curl --noproxy '*' -fsS --connect-timeout 2 --max-time 2 "$url" -o /dev/null 2>/dev/null; then return 1; fi
