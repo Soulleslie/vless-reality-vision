@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.5.0'
+SCRIPT_VERSION='2.5.1'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -43,6 +43,7 @@ CLIENT_ENCRYPTION='none'
 NODE_MODE='external'
 ADDR_MODE='auto'
 ADDR_DOMAIN=''
+XHTTP_PATH=''
 SELF_DIR='/etc/vless-reality-self'
 SELF_SITE='/etc/nginx/conf.d/vless-reality-self.conf'
 SELF_WEB='/var/www/vless-reality-self'
@@ -504,12 +505,13 @@ generate_vless_encryption_pair() {
 }
 
 write_marker() {
-    local tmp
+    local tmp destination="${1:-$MARKER}" fields
+    fields=("$PORT" "$SNI" "$NODE_NAME" "$SERVER_IP" "$PUBLIC_KEY" "$SHORT_ID" "$CLIENT_ENCRYPTION" "$NODE_MODE" "$ADDR_MODE" "$ADDR_DOMAIN")
+    # 第 11 行保存 XHTTP Path，旧节点没有该行仍可管理。
+    if [[ -n "$XHTTP_PATH" ]]; then fields+=("$XHTTP_PATH"); fi
     tmp="$(mktemp "$CONFIG_DIR/.marker.XXXXXX")" || return 1
-    # 第 9/10 行保存客户端地址选择；auto 保留旧版默认：普通模式用 IP，自有模式用 SNI 域名。
-    if printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-        "$PORT" "$SNI" "$NODE_NAME" "$SERVER_IP" "$PUBLIC_KEY" "$SHORT_ID" "$CLIENT_ENCRYPTION" "$NODE_MODE" "$ADDR_MODE" "$ADDR_DOMAIN" > "$tmp" \
-        && chown root:xray "$tmp" && chmod 640 "$tmp" && mv -f -- "$tmp" "$MARKER"; then
+    if printf '%s\n' "${fields[@]}" > "$tmp" \
+        && chown root:xray "$tmp" && chmod 640 "$tmp" && mv -fT -- "$tmp" "$destination"; then
         return 0
     fi
     rm -f -- "$tmp"
@@ -530,6 +532,8 @@ load_metadata() {
     NODE_MODE="${lines[7]:-external}"
     ADDR_MODE="${lines[8]:-auto}"
     ADDR_DOMAIN="${lines[9]:-}"
+    XHTTP_PATH="${lines[10]:-}"
+    [[ -z "$XHTTP_PATH" || "$XHTTP_PATH" =~ ^/[0-9a-f]{24}$ ]] || fail '保存的 XHTTP Path 无效。'
     case "$NODE_MODE" in external|self) ;; *) fail '安装模式记录无效。' ;; esac
     [[ "$NODE_MODE" != self || "$PORT" == 443 ]] || fail '自有域名安装记录的端口必须为 443。'
     valid_port "$PORT" || fail '安装记录中的端口无效。'
@@ -713,16 +717,20 @@ purge_node_files() {
 clean_config_residue() (
     local backup entry unknown
     shopt -s nullglob dotglob
+    if transport_pending; then
+        transport_snapshot_owned "$CONFIG_DIR/.transport-pending" || return 1
+        transport_discard_snapshot || return 1
+    fi
     for backup in "$CONFIG_DIR"/.change-backup.??????; do
         [[ -d "$backup" && ! -L "$backup" ]] || continue
         unknown=0
         for entry in "$backup"/*; do
             case "${entry##*/}" in
-                config.json|transport.json|.vless-reality-owned|tfo.sysctl|link.txt|link-output.txt) ;;
+                config.json|transport.json|transport-state.json|marker.next|.vless-reality-owned|tfo.sysctl|link.txt|link-output.txt) ;;
                 *) unknown=1 ;;
             esac
         done
-        rm -f -- "$backup/config.json" "$backup/transport.json" "$backup/.vless-reality-owned" "$backup/tfo.sysctl" "$backup/link.txt" "$backup/link-output.txt" || return 1
+        rm -f -- "$backup/"{config.json,transport.json,transport-state.json,marker.next,.vless-reality-owned,tfo.sysctl,link.txt,link-output.txt} || return 1
         if (( unknown )); then
             warn "保留含有其他文件的备份目录：$backup" >&2
         else
@@ -1119,6 +1127,7 @@ show_node() (
 
 status_node() {
     need_root
+    if transport_pending; then transport_pending_message; return 3; fi
     load_metadata
     local state current_ip version flow server_enc enc_mode transport
     state="$(systemctl is-active xray 2>/dev/null || true)"
@@ -1215,33 +1224,132 @@ commit_change() {
     fail '修改后的配置启动或链接保存失败，已恢复原配置。'
 }
 
+transport_pending() { [[ -e "$CONFIG_DIR/.transport-pending" || -L "$CONFIG_DIR/.transport-pending" ]]; }
+
+transport_pending_message() {
+    warn "传输切换正在执行或上次未完成；待任务结束后可运行 $(cmd_name) transport recover 恢复。" >&2
+}
+
+transport_snapshot_owned() (
+    local dir="$1" file
+    [[ -d "$dir" && ! -L "$dir" && "$(stat -c '%u:%a' -- "$dir")" == "$EUID:700" ]] || return 1
+    shopt -s nullglob dotglob
+    for file in "$dir"/*; do
+        case "${file##*/}" in config.json|.vless-reality-owned|link.txt|transport.json|marker.next|transport-state.json) ;; *) return 1 ;; esac
+        [[ -f "$file" && ! -L "$file" && "$(stat -c %u -- "$file")" == "$EUID" ]] || return 1
+    done
+    [[ -f "$dir/config.json" && -f "$dir/.vless-reality-owned" && -f "$dir/transport-state.json" ]] || return 1
+    jq -e '.schema=="vless-reality-transport-1"' "$dir/transport-state.json" >/dev/null 2>&1
+)
+
+transport_digest() {
+    local sum
+    [[ -f "$1" && ! -L "$1" ]] || return 1
+    sum="$(sha256sum -- "$1")" || return 1
+    printf '%s' "${sum%% *}"
+}
+
+transport_record() {
+    local dir="$1" active="$2" next_marker="$3" old_cfg new_cfg old_marker new_marker
+    old_cfg="$(transport_digest "$dir/config.json")" && new_cfg="$(transport_digest "$dir/transport.json")" \
+        && old_marker="$(transport_digest "$dir/.vless-reality-owned")" && new_marker="$(transport_digest "$next_marker")" || return 1
+    jq -n --arg old_cfg "$old_cfg" --arg new_cfg "$new_cfg" --arg old_marker "$old_marker" --arg new_marker "$new_marker" --argjson active "$active" \
+        '{schema:"vless-reality-transport-1",old_cfg:$old_cfg,new_cfg:$new_cfg,old_marker:$old_marker,new_marker:$new_marker,active:$active}' \
+        > "$dir/transport-state.json"
+}
+
+transport_link_safe() {
+    if [[ -e "$LINK_FILE" || -L "$LINK_FILE" ]]; then
+        [[ -f "$LINK_FILE" && ! -L "$LINK_FILE" && "$(stat -c '%u:%a' "$LINK_FILE")" == "$EUID:600" ]] || return 1
+    fi
+}
+
+transport_restore_file() (
+    local source="$1" destination="$2" prefix="$3" tmp
+    if cmp -s -- "$source" "$destination"; then return 0; fi
+    tmp="$(mktemp "$prefix.XXXXXX")" || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    cp -aT -- "$source" "$tmp" && mv -fT -- "$tmp" "$destination"
+)
+
+transport_discard_snapshot() {
+    local pending="$CONFIG_DIR/.transport-pending" retired
+    retired="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")" || return 1
+    if ! mv -fT -- "$pending" "$retired"; then rmdir -- "$retired"; return 1; fi
+    if ! sync -- "$CONFIG_DIR" || ! rm -rf -- "$retired"; then
+        warn "传输记录清理未完成；可检查私有备份 $retired。" >&2
+        return 1
+    fi
+}
+
+transport_retire_snapshot() {
+    # 配置、记录和链接可能分属不同文件系统。持久化最终结果后才移走恢复指针。
+    sync -- "$CONFIG" "$MARKER" || return 1
+    if [[ -f "$LINK_FILE" ]]; then sync -- "$LINK_FILE" || return 1; fi
+    sync -- "$CONFIG_DIR" "${LINK_FILE%/*}" || return 1
+    transport_discard_snapshot
+}
+
+transport_rollback() {
+    local dir="$CONFIG_DIR/.transport-pending" record old_cfg new_cfg old_marker new_marker active actual_cfg actual_marker
+    transport_snapshot_owned "$dir" && transport_link_safe || return 1
+    record="$(jq -er 'def digest: type=="string" and length==64 and test("^[0-9a-f]{64}$");
+        select(all([.old_cfg,.new_cfg,.old_marker,.new_marker][]; digest) and (.active==0 or .active==1)) |
+        [.old_cfg,.new_cfg,.old_marker,.new_marker,.active] | @tsv' "$dir/transport-state.json")" || return 1
+    read -r old_cfg new_cfg old_marker new_marker active <<< "$record"
+    actual_cfg="$(transport_digest "$CONFIG")" && actual_marker="$(transport_digest "$MARKER")" || return 1
+    if [[ "$actual_cfg" != "$old_cfg" && "$actual_cfg" != "$new_cfg" ]] || [[ "$actual_marker" != "$old_marker" && "$actual_marker" != "$new_marker" ]]; then
+        warn '当前配置或安装记录在切换之外被修改，已保留备份供人工检查。' >&2
+        return 1
+    fi
+    [[ "$(transport_digest "$dir/config.json")" == "$old_cfg" && "$(transport_digest "$dir/.vless-reality-owned")" == "$old_marker" ]] || return 1
+    transport_restore_file "$dir/config.json" "$CONFIG" "$CONFIG_DIR/.config.json" || return 1
+    transport_restore_file "$dir/.vless-reality-owned" "$MARKER" "$CONFIG_DIR/.marker" || return 1
+    if [[ -f "$dir/link.txt" ]]; then
+        transport_restore_file "$dir/link.txt" "$LINK_FILE" "$LINK_FILE" || return 1
+    else
+        rm -f -- "$LINK_FILE" || return 1
+    fi
+    if (( active )) || systemctl is-active --quiet xray; then
+        if ! systemctl restart xray || ! wait_service 10; then return 1; fi
+    fi
+    transport_retire_snapshot
+}
+
+transport_recover() (
+    need_root; self_operation_lock allow-transport-pending
+    if ! transport_pending; then say '没有待恢复的传输切换。'; return 0; fi
+    load_metadata
+    transport_rollback || fail '未能完成恢复。请查看后台任务日志并保留尚未清理的备份。'
+    ok '已恢复切换前的传输、配置和链接。'
+)
+
 transport_apply() (
     need_root; self_operation_lock; load_metadata
     [[ $# == 1 ]] || fail '用法：transport [status|tcp|xhttp]'
-    local target="$1" current path='' backup='' candidate='' was_active=0 changed=0 committed=0 rc
+    local target="$1" current path previous_path="$XHTTP_PATH" backup='' candidate marker_next pending="$CONFIG_DIR/.transport-pending"
+    local was_active=0 armed=0 rc probe_rc=0
     case "$target" in tcp|xhttp) ;; *) fail '传输只能选择 tcp 或 xhttp。' ;; esac
     jq -e "$TRANSPORT_JQ"' (.inbounds|length)==1 and (.inbounds[0] |
         .protocol=="vless" and managed_transport)' "$CONFIG" >/dev/null || fail '当前配置不是本脚本支持的 TCP + Vision 或 XHTTP 节点。'
     current="$(config_transport)" || fail '无法识别当前传输。'
     if [[ "$target" == "$current" ]]; then ok "当前传输已是 $current。"; return 0; fi
-    if [[ -e "$LINK_FILE" || -L "$LINK_FILE" ]]; then
-        [[ -f "$LINK_FILE" && ! -L "$LINK_FILE" && "$(stat -c '%u:%a' "$LINK_FILE")" == 0:600 ]] || fail '节点链接文件的归属或权限异常。'
-    fi
+    transport_link_safe || fail '节点链接文件的归属或权限异常。'
     if systemctl is-active --quiet xray; then was_active=1; fi
-    if [[ "$target" == xhttp ]]; then
+    path="$XHTTP_PATH"
+    if [[ "$current" == xhttp ]]; then
+        path="$(config_xhttp_path)" || fail '无法保留当前 XHTTP Path。'
+    elif [[ -z "$path" ]]; then
         path="$(openssl rand -hex 12)" || fail '无法生成 XHTTP 路径。'
         [[ "$path" =~ ^[0-9a-f]{24}$ ]] || fail '随机路径生成失败。'
         path="/$path"
     fi
 
     trap 'rc=$?; trap - EXIT; trap "" HUP INT TERM
-        if (( changed && ! committed )); then
-            if ! restore_state "$backup" "$was_active"; then
-                warn "节点回滚失败，备份保留在 $backup。" >&2; exit 1
+        if (( armed )) && transport_pending; then
+            if ! transport_rollback; then
+                warn "自动恢复未完成，请运行 $(cmd_name) transport recover 检查。" >&2; exit 1
             fi
-            if [[ -f "$backup/link.txt" ]]; then
-                cp -a -- "$backup/link.txt" "$LINK_FILE" || { warn "链接回滚失败，备份保留在 $backup。" >&2; exit 1; }
-            else rm -f -- "$LINK_FILE" || { warn "链接清理失败，备份保留在 $backup。" >&2; exit 1; }; fi
             warn "已恢复原传输、配置和链接。" >&2
         fi
         if [[ -n "$backup" ]] && ! rm -rf -- "$backup"; then
@@ -1253,7 +1361,7 @@ transport_apply() (
     trap 'exit 143' TERM
 
     backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")" || fail '无法备份节点配置。'
-    backup_state "$backup" || fail '无法备份节点配置。'
+    if [[ -L "$CONFIG" ]] || ! backup_state "$backup"; then fail '无法备份节点配置。'; fi
     if [[ -f "$LINK_FILE" ]]; then cp -a -- "$LINK_FILE" "$backup/link.txt" || fail '无法备份节点链接。'; fi
     # Xray 根据后缀识别配置类型，暂存文件也必须使用 .json。
     candidate="$backup/transport.json"
@@ -1267,32 +1375,57 @@ transport_apply() (
         || ! config_ok "$candidate" || ! chown root:xray "$candidate" || ! chmod 640 "$candidate"; then
         fail '当前 Xray 未接受目标传输配置。请检查核心版本和配置权限。'
     fi
-    # shellcheck disable=SC2034 # EXIT trap 读取事务状态。
-    changed=1
-    mv -f -- "$candidate" "$CONFIG" || fail '无法发布节点配置。'
+    marker_next="$backup/.vless-reality-owned"
+    if [[ "$path" != "$previous_path" ]]; then
+        XHTTP_PATH="$path"
+        marker_next="$backup/marker.next"
+        write_marker "$marker_next" || fail '无法暂存 XHTTP Path。'
+    fi
+    transport_record "$backup" "$was_active" "$marker_next" || fail '无法记录传输切换进度。'
+    sync -- "$backup"/* "$backup/.vless-reality-owned" "$backup" || fail '无法持久化恢复备份。'
+    # shellcheck disable=SC2034 # EXIT trap 检查是否已发布恢复记录。
+    armed=1
+    if ! mv -T -- "$backup" "$pending" || ! sync -- "$CONFIG_DIR"; then fail '无法发布恢复记录。'; fi
+    mv -fT -- "$pending/transport.json" "$CONFIG" || fail '无法发布节点配置。'
+    if [[ -f "$pending/marker.next" ]]; then
+        mv -fT -- "$pending/marker.next" "$MARKER" || fail '无法保存 XHTTP Path。'
+    fi
     if (( was_active )); then
-        if ! systemctl restart xray || ! wait_service 10; then fail '切换后 Xray 未正常监听。'; fi
+        systemctl restart xray || fail '切换后 Xray 启动失败。'
+        wait_service 10 || fail '切换后 Xray 未正常监听。'
         if [[ "$NODE_MODE" == self ]]; then
             self_http_check "$SNI" 127.0.0.1 "$PORT" || fail '切换后 HTTPS 回落未通过。'
         fi
-        self_client_probe "$SNI" 127.0.0.1 "$PORT" || fail '切换后的实际代理请求未通过。'
+        self_client_probe "$SNI" 127.0.0.1 "$PORT" switch || probe_rc=$?
+        case "$probe_rc" in
+            0) ;;
+            2) fail '切换后临时验证客户端未能正常启动或退出异常。' ;;
+            3) fail '代理与本机直连都无法访问测试站点，无法验证新传输。' ;;
+            *) fail '测试站点本机直连可达，但经新传输的实际代理请求未通过。' ;;
+        esac
     fi
     show_node >/dev/null || fail '无法更新导入链接。'
     if [[ "$NODE_MODE" == self ]] && self_exists; then
         rm -f -- "$SELF_DIR/network-check.json" || fail '无法清除旧传输的网络检查记录。'
     fi
-    # shellcheck disable=SC2034 # EXIT trap 读取事务状态。
-    committed=1
+    transport_retire_snapshot || fail '无法完成传输切换记录的收尾。'
     ok "已切换为 $target，导入链接已更新。"
     if (( ! was_active )); then warn 'Xray 原为停止状态。配置已验证，实际连接需在启动后检查。'; fi
 )
 
 transport_command() {
-    need_root; load_metadata
-    [[ $# -le 1 ]] || fail '用法：transport [status|tcp|xhttp]'
-    local action="${1:-}" current script_path unit=vless-reality-transport
-    current="$(config_transport)" || fail '无法识别当前传输。'
+    need_root
+    [[ $# -le 1 ]] || fail '用法：transport [status|tcp|xhttp|recover]'
+    local action="${1:-}" current='' script_path unit=vless-reality-transport job=()
+    if transport_pending && [[ "$action" != recover ]]; then
+        transport_pending_message
+        if [[ -n "$action" || ! -t 0 ]]; then return 3; fi
+        read -r -p '请输入 recover 恢复切换前的配置，或回车返回：' action || return 0
+        [[ "$action" == recover ]] || return 0
+    fi
     if [[ -z "$action" || "$action" == status ]]; then
+        load_metadata
+        current="$(config_transport)" || fail '无法识别当前传输。'
         if [[ "$current" == tcp ]]; then say '当前传输：TCP + REALITY + Vision';
         else
             local path
@@ -1303,14 +1436,19 @@ transport_command() {
         read -r -p '切换传输 [tcp / xhttp / 回车取消]：' action || return 0
         [[ -n "$action" ]] || return 0
     fi
-    case "$action" in tcp|xhttp) ;; *) fail '用法：transport [status|tcp|xhttp]' ;; esac
+    case "$action" in
+        tcp|xhttp) job=(__transport-apply "$action") ;;
+        recover) job=(__transport-recover) ;;
+        *) fail '用法：transport [status|tcp|xhttp|recover]' ;;
+    esac
     need_command systemd-run
     script_path="$(readlink -f -- "$SCRIPT_PATH")" || fail '无法找到当前管理脚本。'
     [[ -f "$script_path" && -r "$script_path" ]] || fail '当前管理脚本不可读。'
-    warn '切换运行中的节点会重启 Xray，旧客户端连接会中断。请使用 VPS 直连 SSH 或控制台。'
+    warn '切换或恢复运行中的节点可能重启 Xray。请使用 VPS 直连 SSH 或控制台。'
     say "重连后可用 $(cmd_name) transport status 查看结果，或用 journalctl -u $unit 查看后台任务日志。"
     systemd-run --quiet --wait --collect --unit="$unit" --property="SyslogIdentifier=$unit" \
-        /bin/bash "$script_path" __transport-apply "$action" || fail "传输切换失败，请查看 journalctl -u $unit。"
+        /bin/bash "$script_path" "${job[@]}" || fail "传输任务失败，请查看 journalctl -u $unit。"
+    if [[ "$action" == recover ]]; then ok '传输恢复任务已结束。'; return 0; fi
     [[ "$(config_transport)" == "$action" ]] || fail '任务已结束，但当前传输已改变，请查看状态。'
     show_node
 }
@@ -1841,7 +1979,10 @@ log_node() {
 
 uninstall_node() {
     need_root
-    self_operation_lock
+    self_operation_lock allow-transport-pending
+    if transport_pending; then
+        transport_snapshot_owned "$CONFIG_DIR/.transport-pending" || fail '传输恢复目录归属异常，未继续卸载。'
+    fi
     if [[ -e "$SELF_DIR" ]]; then self_cleanup_preflight || fail '自有域名资源已改变或被共享，卸载已停止以保护数据。'; fi
     if [[ ! -e "$MARKER" && ! -L "$MARKER" ]]; then
         [[ ! -e "$SERVICE" && ! -e "$XRAY_BIN" && ! -e "$CONFIG" && ! -e "$LINK_FILE" ]] \
@@ -1941,6 +2082,10 @@ self_operation_lock() {
             exec 7> "$SELF_DIR/operation.lock" || fail '无法锁定自有域名操作。'
             flock -x 7 || fail '无法取得自有域名操作锁。'
             locked=1
+        fi
+        if transport_pending && [[ "${1:-}" != allow-transport-pending ]]; then
+            transport_pending_message
+            exit 3
         fi
         SELF_OPERATION_LOCKED="$locked"
     fi
@@ -2982,6 +3127,20 @@ stop_client_residue() {
     done
     return 1
 }
+transport_probe_https() {
+    local socks_port="$1" url
+    local targets=(https://www.debian.org/ https://www.cloudflare.com/cdn-cgi/trace)
+    # 代理响应可能需超过 5 秒。两个站各 8 秒，均失败再做各 2 秒的直连诊断。
+    for url in "${targets[@]}"; do
+        if curl --noproxy '' --proxy "socks5h://127.0.0.1:$socks_port" -fsS --connect-timeout 3 --max-time 8 \
+            "$url" -o /dev/null 2>/dev/null; then return 0; fi
+    done
+    for url in "${targets[@]}"; do
+        if curl --noproxy '*' -fsS --connect-timeout 2 --max-time 2 "$url" -o /dev/null 2>/dev/null; then return 1; fi
+    done
+    return 3
+}
+
 self_client_probe() (
     local domain="$1" address="$2" server_port="${3:-443}" kind="${4:-valid}" test_dir pid='' socks_port uuid sid="$SHORT_ID" pub="$PUBLIC_KEY" tries=5 seconds=20 ready=0
     local network path='' flow='xtls-rprx-vision'
@@ -3006,7 +3165,7 @@ self_client_probe() (
     fi
     uuid="$(config_uuid)" || return 2
     case "$kind" in
-        valid) ;;
+        valid|switch) ;;
         bad-uuid)
             local wrong
             wrong="$("$XRAY_BIN" uuid)" || return 2
@@ -3042,6 +3201,12 @@ self_client_probe() (
         sleep 0.1
     done
     (( ready )) || return 2
+    if [[ "$kind" == switch ]]; then
+        local request_rc=0
+        transport_probe_https "$socks_port" || request_rc=$?
+        kill -0 "$pid" 2>/dev/null || return 2
+        return "$request_rc"
+    fi
     for (( attempt=1; attempt<=tries; attempt++ )); do
         if curl --noproxy '' --proxy "socks5h://127.0.0.1:$socks_port" -fsS --connect-timeout 3 --max-time "$seconds" \
             'https://www.debian.org/' -o /dev/null 2>/dev/null; then
@@ -3692,6 +3857,7 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   addr [ip|domain [连接域名]]   切换客户端连接地址（不修改 REALITY SNI）
   status                       查看服务、配置、端口和伪装站点状态
   transport [status|tcp|xhttp]  查看或切换 TCP + Vision / XHTTP 传输
+  transport recover             恢复中断的传输切换
   port [新端口]                修改端口
   sni [新域名|auto]            修改或自动优选 REALITY 伪装域名
   sni-best                     查看当前测速延迟最低的域名，不修改节点
@@ -3709,6 +3875,7 @@ EOF
 }
 
 menu_status() {
+    if transport_pending; then transport_pending_message; return 0; fi
     if [[ ! -f "$MARKER" ]]; then say " 当前状态：${RED}● 未安装${RESET}"; return 0; fi
     if [[ ! -f "$CONFIG" ]]; then
         warn ' 当前状态：● 节点文件不完整；可选择 26 重试卸载'
@@ -3853,6 +4020,7 @@ main() {
         status) status_node ;;
         transport) shift; transport_command "$@" ;;
         __transport-apply) shift; transport_apply "$@" ;;
+        __transport-recover) transport_recover ;;
         port) shift; change_port "$@" ;;
         sni) shift; change_sni "$@" ;;
         sni-best) show_fastest_sni ;;

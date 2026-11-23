@@ -167,6 +167,8 @@ v2.4.0 增加 `cert token` 和菜单 28：安全更换 Cloudflare DNS-01 凭据�
 
 v2.5.0 新增菜单 29 和 `transport` 命令，支持已有节点在 TCP + Vision 与 XHTTP 之间切换。
 
+v2.5.1 保存并复用 XHTTP Path，切换验证加入备用 HTTPS 站点和时间预算。新增 `transport recover`，用于恢复断电或进程被强制终止时中断的切换。
+
 ## 执行速度优化
 
 v2.2.2 的优化只调整内部调度。普通模式、自有域名、IP/域名切换、TFO、VLESS Encryption、证书续期和安全检查的功能保持不变：
@@ -411,6 +413,7 @@ vless-reality status               检查服务、配置、端口和伪装站点
 vless-reality transport status     查看当前节点传输
 vless-reality transport xhttp      切换到 XHTTP + REALITY
 vless-reality transport tcp        切回 TCP + REALITY + Vision
+vless-reality transport recover    恢复中断前的配置和节点链接
 vless-reality port 8443            修改监听端口
 vless-reality sni www.apple.com    修改 REALITY 伪装域名
 vless-reality sni auto             重新测量并优选伪装域名
@@ -441,9 +444,15 @@ vless-reality uninstall            卸载并清理
 
 已有普通或自有域名节点更新管理脚本后，可选择菜单 **29「切换节点传输」**，也可直接运行 `vless-reality transport xhttp` 或 `vless-reality transport tcp`。新安装默认使用 TCP + Vision，同一节点端口一次使用一种传输。
 
-切到 XHTTP 时脚本生成一个随机 Path，使用 `mode=auto` 并移除 Vision flow。切回 TCP 时恢复 `xtls-rprx-vision`。节点 Address、端口、SNI、UUID、公钥、Short ID、VLESS Encryption 和 TFO 设置都沿用原值，自有域名模式继续使用现有 Nginx 网站和证书。XHTTP 客户端要匹配导入链接的 Path，并支持当前 VLESS Encryption 设置。[Xray XHTTP 文档](https://xtls.github.io/en/config/transports/xhttp.html)
+首次切到 XHTTP 时脚本生成随机 Path，之后复用，使用 `mode=auto` 并移除 Vision flow。**已经在用 v2.5.0 XHTTP 的节点只需更新管理脚本。** 当前连接和链接可以继续用。下次切到 TCP 时会保存 Xray 正在使用的 Path，之后切回 XHTTP 时复用。已经在旧版切回 TCP 且旧 Path 已被移除的节点，会在新版首次开启 XHTTP 时生成并记住新 Path。
 
-切换在 systemd 后台执行。对于正在运行的节点，脚本先验证候选配置，重启 Xray 后验证实际代理请求，自有域名模式还会检查 HTTPS 回落。失败时恢复旧配置及链接。原来停止的节点会保留停止状态，连接需要启动后验证。建议使用 VPS 直连 SSH 或控制台，切换会中断旧连接。成功后在客户端重新导入链接。重连后可用 `vless-reality transport status` 查看传输、用 `vless-reality show` 取链接，或用 `journalctl -u vless-reality-transport -n 30 --no-pager` 排查失败。自有域名切换后可用 `check-self` 重做网络检测。
+切回 TCP 时恢复 `xtls-rprx-vision`。节点 Address、端口、SNI、UUID、公钥、Short ID、VLESS Encryption 和 TFO 设置都沿用原值，自有域名模式继续使用现有 Nginx 网站和证书。XHTTP 客户端要匹配导入链接的 Path，并支持当前 VLESS Encryption 设置。[Xray XHTTP 文档](https://xtls.github.io/en/config/transports/xhttp.html)
+
+切换在 systemd 后台执行。对于正在运行的节点，脚本先验证候选配置，重启 Xray 后检查实际代理和自有域名 HTTPS 回落。代理测试有主备两个站点，包含失败时的直连诊断在内，HTTPS 请求预算最多约 20 秒。配置检查、服务启动和回滚耗时另计。失败时恢复旧配置和链接。原来停止的节点会保留停止状态，连接需要启动后验证。
+
+切换会中断现有连接，使用 VPS 直连 SSH 或控制台操作。客户端可以分别保存两种配置，切换成功后选择对应节点。若地址、认证或加密等参数随后有变化，用 `vless-reality show` 获取当前链接。重连后用 `vless-reality transport status` 查看传输，或用 `journalctl -u vless-reality-transport -n 30 --no-pager` 排查失败。自有域名切换后可用 `check-self` 重做网络检测。
+
+断电或任务被强制终止时，管理菜单会提示有未完成的切换。待后台任务结束后，通过菜单 29 输入 `recover`，或运行 `vless-reality transport recover`，可以恢复切换前的配置和链接。如果中断后手工修改了配置或安装记录，恢复会停止并保留备份供检查。私有恢复记录和 Path 随原卸载流程清理。
 
 ## 服务器连接地址：IP / 域名切换
 

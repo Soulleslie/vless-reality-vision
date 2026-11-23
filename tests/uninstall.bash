@@ -88,6 +88,14 @@ make_checker_fixture() {
 
 make_fixture
 make_checker_fixture
+pending="$CONFIG_DIR/.transport-pending"
+mkdir -m 700 "$pending"
+cp "$CONFIG" "$MARKER" "$pending/"
+printf '{"schema":"vless-reality-transport-1"}\n' > "$pending/transport-state.json"
+touch "$pending/foreign-file"
+if (uninstall_node >/dev/null 2>&1); then echo '未知恢复目录内容应受保护'; exit 1; fi
+[[ -f "$CONFIG" && -f "$pending/foreign-file" ]]
+rm -- "$pending/foreign-file"
 stop_fails=1
 if (uninstall_node >/dev/null 2>&1); then
     printf '卸载应在停止服务失败时中止\n' >&2
@@ -107,6 +115,7 @@ uninstall_node >/dev/null
 [[ ! -e "$SNI_ORPHAN_DIR" && ! -e "$CLIENT_ORPHAN_DIR" ]]
 [[ ! -e "$TFO_SYSCTL" && "$(kernel_tfo_value)" == 0 ]]
 [[ ! -e "$CONFIG_DIR/.change-backup.abcdef" && -f "$CONFIG_DIR/foreign-file" ]]
+[[ ! -e "$pending" ]]
 [[ ! -e "$CONFIG_DIR/.private.abcdef" ]]
 (( account_present == 0 && group_present == 0 ))
 (( failed_state == 0 ))

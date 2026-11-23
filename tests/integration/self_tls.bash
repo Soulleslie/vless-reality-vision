@@ -54,7 +54,7 @@ jq -n --arg domain "$SNI" '{domain:$domain,method:"cloudflare",nginx_active:fals
 self_track "$SELF_DIR/state.json"
 if command curl --noproxy '*' --connect-timeout 2 --max-time 3 --resolve "$SNI:8443:$container_ip" -fsS "https://$SNI:8443/" -o /dev/null 2>/dev/null; then echo '非回环接口不应能访问 8443'; exit 1; fi
 start_server() {
-    setpriv --reuid=xray --regid=xray --init-groups "$XRAY_BIN" run -config "$CONFIG" 7>&- 8>&- 9>&- > "$TEST_DIR/server.log" 2>&1 & server_pid=$!
+    setpriv --reuid=xray --regid=xray --init-groups "$XRAY_BIN" run -config "$CONFIG" 7>&- 8>&- 9>&- >> "$TEST_DIR/server.log" 2>&1 & server_pid=$!
     printf '%s\n' "$server_pid" > "$TEST_DIR/server.pid"
     sleep 0.3
 }
@@ -97,9 +97,17 @@ curl() {
         if [[ "${NAT_TEST:-0}" == 1 && "$arg" == "$SNI:443:93.184.215.14" ]]; then
             printf '0 000 0.000000 0.000000'; return 28
         fi
-        [[ "$arg" != https://www.debian.org/ ]] || arg="http://$container_ip:18080/"
+        case "$arg" in
+            https://www.debian.org/|https://www.cloudflare.com/cdn-cgi/trace) arg="http://$container_ip:18080/" ;;
+        esac
         args+=("$arg")
     done
+    if [[ "$*" == *'--proxy '* && "$*" == *'--max-time 8 '* ]]; then
+        local result=0
+        command curl "${args[@]}" 2>> "$TEST_DIR/transport-curl.log" || result=$?
+        printf '请求退出码：%s\n' "$result" >> "$TEST_DIR/transport-curl.log"
+        return "$result"
+    fi
     command curl "${args[@]}"
 }
 switch_address() (
@@ -112,7 +120,12 @@ switch_transport() {
     transport_apply "$1" > "$TEST_DIR/transport.log" 2>&1 || result=$?
     # transport_apply 模拟后台任务，子进程重启的 Xray 仍须由测试主进程清理。
     server_pid="$(< "$TEST_DIR/server.pid")"
-    if (( result )); then cat "$TEST_DIR/transport.log" "$TEST_DIR/server.log"; return "$result"; fi
+    if (( result )); then
+        cat "$TEST_DIR/transport.log"
+        if [[ -f "$TEST_DIR/transport-curl.log" ]]; then cat "$TEST_DIR/transport-curl.log"; fi
+        tail -25 "$TEST_DIR/server.log"
+        return "$result"
+    fi
 }
 for mode in off native xorpub random; do
     CLIENT_ENCRYPTION=none; VLESS_DECRYPTION=none
@@ -226,7 +239,8 @@ for mode in off native xorpub random; do
         jq -e '.result=="pending" and .external=="unverified" and .public_probe=="unverified"' "$SELF_DIR/network-check.json" >/dev/null
         [[ "$(stat -c %a "$SELF_DIR/network-check.json")" == 600 ]]
     fi
-    transport_invariants="$(sha256sum "$MARKER" "$SELF_SITE" "$SELF_WEB/index.html" "$SELF_DIR/acme/live/$SNI/"*.pem)"
+    transport_invariants="$(sha256sum "$SELF_SITE" "$SELF_WEB/index.html" "$SELF_DIR/acme/live/$SNI/"*.pem)"
+    original_marker="$(head -10 "$MARKER")"
     tcp_config="$(jq -S . "$CONFIG" | sha256sum)"; tcp_link="$(sha256sum "$LINK_FILE")"
     switch_transport xhttp
     [[ "$(config_transport)" == xhttp && "$(config_uuid)" == "$uuid" && ! -e "$SELF_DIR/network-check.json" ]]
@@ -240,10 +254,36 @@ for mode in off native xorpub random; do
         result=0; self_client_probe "$SNI" "$container_ip" 443 bad-uuid || result=$?
         [[ "$result" == 1 && "$(wc -l < "$TEST_DIR/origin.log")" == "$before" ]]
         self_authority_check "$SNI" 443 "$container_ip"
+        # v2.5.0 已运行的 XHTTP 没有第 11 行，切回时接管实际正在用的 Path。
+        sed -i '11,$d' "$MARKER"
     fi
+    xhttp_link="$(sha256sum "$LINK_FILE")"
     switch_transport tcp
     [[ "$(jq -S . "$CONFIG" | sha256sum)" == "$tcp_config" && "$(sha256sum "$LINK_FILE")" == "$tcp_link" ]]
-    [[ "$(sha256sum "$MARKER" "$SELF_SITE" "$SELF_WEB/index.html" "$SELF_DIR/acme/live/$SNI/"*.pem)" == "$transport_invariants" ]]
+    [[ "$(head -10 "$MARKER")" == "$original_marker" && "$(sed -n '11p' "$MARKER")" == "$path" ]]
+    [[ "$(sha256sum "$SELF_SITE" "$SELF_WEB/index.html" "$SELF_DIR/acme/live/$SNI/"*.pem)" == "$transport_invariants" ]]
+    if [[ "$mode" == off ]]; then
+        switch_transport xhttp
+        [[ "$(config_xhttp_path)" == "$path" && "$(sha256sum "$LINK_FILE")" == "$xhttp_link" ]]
+        # 实际运行 TCP 配置但在事务收尾前强制结束后台任务，然后恢复原 XHTTP 节点。
+        rc=0
+        (
+            sync() {
+                if [[ "$*" == "-- $CONFIG $MARKER" ]]; then kill -KILL "$BASHPID"; fi
+                command sync "$@"
+            }
+            transport_apply tcp
+        ) > "$TEST_DIR/interrupted.log" 2>&1 || rc=$?
+        server_pid="$(< "$TEST_DIR/server.pid")"
+        [[ "$rc" == 137 && "$(config_transport)" == tcp ]] || { cat "$TEST_DIR/interrupted.log"; exit 1; }
+        transport_pending
+        transport_recover > "$TEST_DIR/recovered.log" 2>&1 || { cat "$TEST_DIR/recovered.log"; exit 1; }
+        server_pid="$(< "$TEST_DIR/server.pid")"
+        [[ "$(config_xhttp_path)" == "$path" && "$(sha256sum "$LINK_FILE")" == "$xhttp_link" ]]
+        self_client_probe "$SNI" "$container_ip"
+        self_http_check "$SNI" "$container_ip" 443
+        printf '真实 Xray 在后台任务被强制结束后恢复 XHTTP、原链接和 HTTPS 回落通过\n'
+    fi
     printf '真实 TCP + Vision / XHTTP 双向切换、导入链接与 HTTPS 回落 / %s 通过\n' "$mode"
     stop_server
     [[ "$(sha256sum "$SELF_WEB/index.html")" == "$page_digest" ]]
