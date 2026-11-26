@@ -1930,7 +1930,7 @@ manager_update() (
     tmp="$(mktemp "${MANAGER%/*}/.vless-reality-setup.XXXXXX")" || fail '无法创建临时文件。'
     trap 'rm -f -- "$tmp"' EXIT
     say '正在下载 main 分支的管理脚本…'
-    curl -fL --proto '=https' --tlsv1.2 --retry 2 --connect-timeout 10 --max-time 60 -o "$tmp" "$MANAGER_URL" \
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 2 --connect-timeout 10 --max-time 60 -o "$tmp" "$MANAGER_URL" \
         || fail '下载管理脚本失败；原脚本未修改。'
     bash -n "$tmp" 2>/dev/null || fail '下载内容未通过语法检查；原脚本未修改。'
     grep -qF -- "$MANAGER_TAG" "$tmp" || fail '下载内容不是本项目的管理脚本；原脚本未修改。'
