@@ -68,7 +68,17 @@ vless-reality
 
 ## 已有节点如何更新
 
-GitHub 更新不会自动修改 VPS 上已运行的节点。原来通过本项目旧命令安装的普通节点可继续使用，无需卸载或重新导入链接。要获得新版菜单和管理功能，以 root 身份更新管理脚本即可：
+GitHub 更新不会自动修改 VPS 上已运行的节点。原来通过本项目旧命令安装的普通节点可继续使用，无需卸载或重新导入链接。
+
+管理脚本为 v2.7.0 或更新版本时，直接运行（或选择菜单 **30**）：
+
+```bash
+vless-reality self-update
+```
+
+它从 `main` 分支下载脚本，检查语法、项目标识和版本号并确认新脚本能正常启动后，再原子替换；不会降级到更低版本，任何一步失败都保留原脚本。
+
+v2.6.0 及更早版本没有 `self-update`，以 root 身份用下面的命令更新一次即可：
 
 ```bash
 (
@@ -85,13 +95,13 @@ GitHub 更新不会自动修改 VPS 上已运行的节点。原来通过本项�
 
 先下载并检查语法，再原子替换；下载失败时保留旧管理脚本，临时文件在退出时清理。此操作只替换管理脚本并查询状态，不重启 Xray，不修改 UUID、REALITY 密钥、端口、SNI、TFO、Encryption 或现有链接，也不会自动安装 Nginx/Certbot。已有自有域名节点的网页同样保持原样，不会因更新脚本而自动换版。
 
-如需升级 Xray 核心，另行执行 `vless-reality update`；升级在 systemd 后台任务中验证、替换和重启，SSH 断开后仍会完成或恢复旧版本，建议仍使用直连 SSH。已有 v2.0 自有域名节点更新脚本后，继续执行下方的 `security-apply` 和 `security-check`。
+如需升级 Xray 核心，另行执行 `vless-reality update`；升级在 systemd 后台任务中验证、替换和重启，SSH 断开后仍会完成或恢复旧版本，建议仍使用直连 SSH。新版 Xray 有兼容问题时，可用 `vless-reality update v26.1.18` 这样的命令切换到指定的正式稳定版（可回退，[版本列表](https://github.com/XTLS/Xray-core/releases)）；替换前会先用目标版本校验当前配置，不兼容（例如该版本不支持 XHTTP 或 VLESS Encryption）时不会替换。菜单 **13** 回车仍升级到最新稳定版，也可输入版本号。已有 v2.0 自有域名节点更新脚本后，继续执行下方的 `security-apply` 和 `security-check`。
 
 要给已有自有域名节点换随机网页，更新管理脚本后选择菜单 **27**，或执行 `vless-reality website-random`。这是明确的单独操作，更新脚本本身不会换网页，不需要卸载、重新安装或重新导入节点。
 
 普通模式不会在更新脚本时自动变成自有域名模式。只有决定切换时，先准备 DNS、保存需要的节点信息，再卸载原节点并选择菜单 2 重新部署；新安装会生成新的认证参数，需要重新导入链接。已有节点会阻止直接覆盖安装。
 
-交互菜单编号连续为 **1–29**，`00` 退出。**26** 卸载，**27** 更换随机网页，**28** 更换 Cloudflare API Token，**29** 切换节点传输。第 **24** 项为「更新 Nginx 安全配置（原安全模板）」，第 18 项为网站状态。历史的命令行数字参数沿用旧映射，自动化请使用 `install-self`、`show`、`transport`、`uninstall` 等命名命令。
+交互菜单编号连续为 **1–30**，`00` 退出。**26** 卸载，**27** 更换随机网页，**28** 更换 Cloudflare API Token，**29** 切换节点传输，**30** 更新管理脚本。第 **24** 项为「更新 Nginx 安全配置（原安全模板）」，第 18 项为网站状态。历史的命令行数字参数沿用旧映射，自动化请使用 `install-self`、`show`、`transport`、`uninstall` 等命名命令。
 
 如果旧版脚本在菜单选择 `1` 后直接返回主菜单，请重新执行上面的下载命令获取最新版。v1.0.1 已修正安装前检查在正常机器上错误退出的问题。
 
@@ -166,6 +176,8 @@ v2.5.1 保存并复用 XHTTP Path，切换验证加入备用 HTTPS 站点和时�
 v2.5.2 让传输切换的代理连接和目标 TLS 握手用满单次 8 秒预算，避免原 3 秒连接超时过早回滚。总请求预算仍约 20 秒。后台日志记录测试站点和 curl 退出码，例如 `28` 表示超时。
 
 v2.6.0 修改端口、修改伪装域名、重新生成 UUID、轮换 REALITY 密钥和升级 Xray 改为 systemd 后台任务执行（任务名 `vless-reality-port`、`-sni`、`-uuid`、`-keys`、`-update`），与 TFO、VLESS Encryption、传输切换一致：即使 SSH 经过本节点并在 Xray 重启时断开，任务仍会完成验证或回滚；前台只负责输入与预检，结束后按实际配置核对结果。安装记录损坏时交互菜单不再直接退出，可继续选择 26 卸载。新安装的 Xray 服务增加 systemd 沙箱限制（`PrivateDevices`、内核/控制组保护、`RestrictAddressFamilies` 等），已有节点的服务文件不变。修改失败后不再遗留 UUID 修改的配置备份。
+
+v2.7.0 `update` 可指定 Xray 正式稳定版（如 `update v26.1.18`），用于回退有问题的新版；不带参数时行为不变（升级到最新稳定版，不降级），回退前在终端要求确认，并先用目标版本校验当前配置。新增 `self-update` 和菜单 30，一条命令更新管理脚本，不重启 Xray、不修改节点；从菜单更新后退出旧菜单进程，重新运行即进入新版。
 
 ## 执行速度优化
 
@@ -431,7 +443,9 @@ vless-reality addr ip              连接地址改用本机当前公网 IPv4
 vless-reality addr domain          改用当前自有域名，或普通模式已保存的连接域名
 vless-reality addr domain node.example.com  普通模式指定自己的连接域名
 vless-reality refresh-ip           刷新公网 IPv4 缓存和链接，保持 IP/域名选择
-vless-reality update               升级 Xray-core
+vless-reality update               升级 Xray-core 到最新稳定版
+vless-reality update v26.1.18      切换到指定稳定版（可回退）
+vless-reality self-update          更新管理脚本（不重启 Xray、不改节点）
 vless-reality log -f               实时查看日志
 vless-reality uninstall            卸载并清理
 ```
