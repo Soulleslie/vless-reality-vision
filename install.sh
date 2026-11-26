@@ -899,7 +899,7 @@ write_config() {
 # 新安装使用的 systemd 服务。ProtectSystem 保持 full，以兼容管理员在 /var 下另行配置的日志文件；
 # 其余限制只收紧 Xray 不需要的内核、设备和系统调用接口。卸载凭固定的 ExecStart 行确认归属，勿改其内容。
 write_xray_service() {
-    local destination="${1:-$SERVICE}"
+    local destination="$1"
     cat > "$destination" <<'EOF' || return 1
 [Unit]
 Description=Xray VLESS REALITY Service
@@ -1081,7 +1081,7 @@ install_node() {
     fi
     config_ok || fail 'Xray 配置校验失败。'
 
-    write_xray_service || fail '写入 Xray systemd 服务失败。'
+    write_xray_service "$SERVICE" || fail '写入 Xray systemd 服务失败。'
 
     step '[5/5] 启动服务并检查监听端口…'
     systemctl daemon-reload
