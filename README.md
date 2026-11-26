@@ -52,13 +52,7 @@
 wget -O /root/vless-reality-setup.sh https://raw.githubusercontent.com/Soulleslie/vless-reality-vision/main/install.sh && chmod +x /root/vless-reality-setup.sh && /root/vless-reality-setup.sh
 ```
 
-需要对比开发分支时，可用以下命令验证（建议全新的测试 VPS）：
-
-```bash
-wget -O /root/vless-reality-setup.sh https://raw.githubusercontent.com/Soulleslie/vless-reality-vision/feat/self-domain-security/install.sh && chmod +x /root/vless-reality-setup.sh && /root/vless-reality-setup.sh
-```
-
-部署和加固在同一个脚本中，无需另外安装防护程序。日常安装和更新使用上面的 `main` 地址。完整验证与未实测项目见 [安全审查与测试报告](docs/SELF_DOMAIN_SECURITY_REPORT.md) 和 [基础部署测试报告](docs/SELF_DOMAIN_TEST_REPORT.md)。
+部署和加固在同一个脚本中，无需另外安装防护程序。安装和更新请始终使用上面的 `main` 地址；早期开发分支（如 `feat/self-domain-security`，停留在 v2.1.0）缺少之后的功能和修复，不要用于安装。完整验证与未实测项目见 [安全审查与测试报告](docs/SELF_DOMAIN_SECURITY_REPORT.md) 和 [基础部署测试报告](docs/SELF_DOMAIN_TEST_REPORT.md)。
 
 使用 curl：
 
@@ -91,7 +85,7 @@ GitHub 更新不会自动修改 VPS 上已运行的节点。原来通过本项�
 
 先下载并检查语法，再原子替换；下载失败时保留旧管理脚本，临时文件在退出时清理。此操作只替换管理脚本并查询状态，不重启 Xray，不修改 UUID、REALITY 密钥、端口、SNI、TFO、Encryption 或现有链接，也不会自动安装 Nginx/Certbot。已有自有域名节点的网页同样保持原样，不会因更新脚本而自动换版。
 
-如需升级 Xray 核心，另行执行 `vless-reality update`；核心升级会按原流程验证和重启，应使用直连 SSH。已有 v2.0 自有域名节点更新脚本后，继续执行下方的 `security-apply` 和 `security-check`。
+如需升级 Xray 核心，另行执行 `vless-reality update`；升级在 systemd 后台任务中验证、替换和重启，SSH 断开后仍会完成或恢复旧版本，建议仍使用直连 SSH。已有 v2.0 自有域名节点更新脚本后，继续执行下方的 `security-apply` 和 `security-check`。
 
 要给已有自有域名节点换随机网页，更新管理脚本后选择菜单 **27**，或执行 `vless-reality website-random`。这是明确的单独操作，更新脚本本身不会换网页，不需要卸载、重新安装或重新导入节点。
 
@@ -170,6 +164,8 @@ v2.5.0 新增菜单 29 和 `transport` 命令，支持已有节点在 TCP + Visi
 v2.5.1 保存并复用 XHTTP Path，切换验证加入备用 HTTPS 站点和时间预算。新增 `transport recover`，用于恢复断电或进程被强制终止时中断的切换。
 
 v2.5.2 让传输切换的代理连接和目标 TLS 握手用满单次 8 秒预算，避免原 3 秒连接超时过早回滚。总请求预算仍约 20 秒。后台日志记录测试站点和 curl 退出码，例如 `28` 表示超时。
+
+v2.6.0 修改端口、修改伪装域名、重新生成 UUID、轮换 REALITY 密钥和升级 Xray 改为 systemd 后台任务执行（任务名 `vless-reality-port`、`-sni`、`-uuid`、`-keys`、`-update`），与 TFO、VLESS Encryption、传输切换一致：即使 SSH 经过本节点并在 Xray 重启时断开，任务仍会完成验证或回滚；前台只负责输入与预检，结束后按实际配置核对结果。安装记录损坏时交互菜单不再直接退出，可继续选择 26 卸载。新安装的 Xray 服务增加 systemd 沙箱限制（`PrivateDevices`、内核/控制组保护、`RestrictAddressFamilies` 等），已有节点的服务文件不变。修改失败后不再遗留 UUID 修改的配置备份。
 
 ## 执行速度优化
 
