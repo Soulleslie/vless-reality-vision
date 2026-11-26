@@ -192,7 +192,7 @@ for stage in success absent-record same format source-mode source-owner source-l
     [[ "$(immutable)" == "$before" ]]
     [[ "$(sha256sum "$VLESS_CF_CREDENTIALS")" == "$source_before" ]]
     [[ -z "$(find "$SELF_DIR/work" -name 'token-backup.*')" && -z "$(find "$SELF_DIR" -name '.receipt.*' -o -name '.renew.*')" ]]
-    if rg -q -F -e "$OLD_TOKEN" -e "$NEW_TOKEN" "$CASE_DIR/result.log" "$SELF_DIR/logs"; then echo 'Token 泄漏到输出或日志'; exit 1; fi
+    if grep -rqF -e "$OLD_TOKEN" -e "$NEW_TOKEN" "$CASE_DIR/result.log" "$SELF_DIR/logs"; then echo 'Token 泄漏到输出或日志'; exit 1; fi
     [[ ! -e "$CASE_DIR/unexpected-service.calls" ]]
 done
 # 两个 Token 有前缀关系时也必须完整脱敏。

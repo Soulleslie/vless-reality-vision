@@ -81,7 +81,7 @@ if ! (VLESS_CF_CREDENTIALS="$TEST_DIR/new.ini" self_cf_token_rotate > "$TEST_DIR
 self_file_owned "$SELF_DIR/cloudflare.ini"; self_cf_renewal_binding
 kill -0 "$server_pid"; self_client_probe "$SNI" "$SERVER_IP"
 jq -e '.result=="passed"' "$SELF_DIR/renew-test.json" >/dev/null
-if rg -q -F -e "$OLD_TOKEN" -e "$NEW_TOKEN" -e "$DENIED_TOKEN" "$SELF_DIR/logs" "$TEST_DIR/change.log" "$TEST_DIR/denied.log"; then echo 'Token 日志脱敏失败'; exit 1; fi
+if grep -rqF -e "$OLD_TOKEN" -e "$NEW_TOKEN" -e "$DENIED_TOKEN" "$SELF_DIR/logs" "$TEST_DIR/change.log" "$TEST_DIR/denied.log"; then echo 'Token 日志脱敏失败'; exit 1; fi
 [[ -z "$(find "$SELF_DIR/work" -name 'token-backup.*')" && -z "$(find "$SELF_DIR/logs" -name 'token-probe.*')" ]]
 # 撤销模拟旧 Token；随后强制测试 CA 进入到期续期路径，仍执行原生产函数。
 python3 - "$TEST_DIR/provider.json" <<'PY_REVOKE'

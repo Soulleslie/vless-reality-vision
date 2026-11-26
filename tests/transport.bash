@@ -128,8 +128,8 @@ for PROBE_CASE in first backup direct unreachable; do
         direct) [[ "$rc/$count" == 1/3 ]] ;;
         unreachable) [[ "$rc/$count" == 3/4 ]] ;;
     esac
-    if rg -qv -- '--max-time (2|8) ' "$TEST_DIR/curls"; then echo '探测请求缺少时间上限'; exit 1; fi
-    if rg -- '--proxy ' "$TEST_DIR/curls" | rg -qv -- '--connect-timeout 8 --max-time 8 '; then
+    if grep -Eqv -- '--max-time (2|8) ' "$TEST_DIR/curls"; then echo '探测请求缺少时间上限'; exit 1; fi
+    if grep -F -- '--proxy ' "$TEST_DIR/curls" | grep -Fqv -- '--connect-timeout 8 --max-time 8 '; then
         echo '代理探测的 TLS 握手必须能使用完整请求预算'; exit 1
     fi
     if [[ "$PROBE_CASE" == first ]]; then [[ ! -s "$TEST_DIR/curl-diagnostics" ]]

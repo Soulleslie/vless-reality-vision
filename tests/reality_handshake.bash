@@ -83,8 +83,8 @@ for attempt in 1 2 3 4 5; do
     curl -fsS --connect-timeout 2 --max-time 4 --noproxy '' \
         --proxy "socks5h://127.0.0.1:${client_port}" \
         'http://127.0.0.1:18080/' -o /dev/null 2>/dev/null || true
-    if rg -q 'proxy/vless/inbound: received request' "$TEST_DIR/server.log" \
-        && rg -q 'Xtls Unpadding' "$TEST_DIR/server.log"; then
+    if grep -Fq 'proxy/vless/inbound: received request' "$TEST_DIR/server.log" \
+        && grep -Fq 'Xtls Unpadding' "$TEST_DIR/server.log"; then
         printf 'REALITY + Vision 握手通过（本地回环目标被 Xray 规则阻断）\n'
         exit 0
     fi

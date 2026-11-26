@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.5.2'
+SCRIPT_VERSION='2.6.0'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -591,6 +591,10 @@ config_xhttp_path() {
         select(xhttp_settings) | .path' "$CONFIG"
 }
 
+config_decryption() {
+    jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG"
+}
+
 config_uuid() {
     jq -er '[.inbounds[] | select(.protocol=="vless") |
         (if .streamSettings.network=="xhttp" then "" else "xtls-rprx-vision" end) as $flow |
@@ -892,6 +896,51 @@ write_config() {
     chmod 640 "$CONFIG"
 }
 
+# 新安装使用的 systemd 服务。ProtectSystem 保持 full，以兼容管理员在 /var 下另行配置的日志文件；
+# 其余限制只收紧 Xray 不需要的内核、设备和系统调用接口。卸载凭固定的 ExecStart 行确认归属，勿改其内容。
+write_xray_service() {
+    local destination="$1"
+    cat > "$destination" <<'EOF' || return 1
+[Unit]
+Description=Xray VLESS REALITY Service
+Documentation=https://github.com/XTLS/Xray-core
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xray
+Group=xray
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$destination"
+}
+
 install_node() {
     need_root
     [[ $# -le 6 ]] || fail "用法：$(cmd_name) install [端口] [伪装域名] [节点名称] [TFO:on|off] [VLESS加密:on|off] [模式:native|xorpub|random]"
@@ -1032,32 +1081,7 @@ install_node() {
     fi
     config_ok || fail 'Xray 配置校验失败。'
 
-    cat > "$SERVICE" <<'EOF'
-[Unit]
-Description=Xray VLESS REALITY Service
-Documentation=https://github.com/XTLS/Xray-core
-After=network-online.target nss-lookup.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=xray
-Group=xray
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
-Restart=on-failure
-RestartSec=3s
-LimitNOFILE=1048576
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=full
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    chmod 644 "$SERVICE"
+    write_xray_service "$SERVICE" || fail '写入 Xray systemd 服务失败。'
 
     step '[5/5] 启动服务并检查监听端口…'
     systemctl daemon-reload
@@ -1149,7 +1173,7 @@ status_node() {
     else
         warn "Vision flow：${flow:-未配置}"
     fi
-    server_enc="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG" 2>/dev/null || true)"
+    server_enc="$(config_decryption 2>/dev/null || true)"
     if [[ "$server_enc" == none && "$CLIENT_ENCRYPTION" == none ]]; then
         say 'VLESS Encryption：未开启'
     elif enc_mode="$(vlessenc_pair_mode "$server_enc" "$CLIENT_ENCRYPTION")"; then
@@ -1222,6 +1246,25 @@ commit_change() {
     fi
     rm -rf -- "$backup"
     fail '修改后的配置启动或链接保存失败，已恢复原配置。'
+}
+# 统一的节点修改事务：先备份配置和安装记录，再执行写入命令（其余参数）。
+# 写入失败立即恢复并删除备份；写入成功后由 commit_change 校验、按原状态重启并保存链接，失败同样回滚。
+node_change() {
+    local old_port="$1" description="$2" backup was_active=0
+    shift 2
+    if systemctl is-active --quiet xray; then was_active=1; fi
+    backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")" || fail '无法创建配置备份，未修改。'
+    if ! backup_state "$backup"; then
+        rm -rf -- "$backup"
+        fail '备份节点配置失败，未修改。'
+    fi
+    if ! "$@"; then
+        PORT="$old_port"
+        restore_state "$backup" "$was_active" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
+        rm -rf -- "$backup"
+        fail '写入修改失败，已恢复原配置。'
+    fi
+    commit_change "$backup" "$old_port" "$description" "$was_active"
 }
 
 transport_pending() { [[ -e "$CONFIG_DIR/.transport-pending" || -L "$CONFIG_DIR/.transport-pending" ]]; }
@@ -1413,10 +1456,32 @@ transport_apply() (
     if (( ! was_active )); then warn 'Xray 原为停止状态。配置已验证，实际连接需在启动后检查。'; fi
 )
 
+NODE_JOB_NOTE='此操作将重启 Xray；如果 SSH 经过此节点，连接可能中断。后台任务会继续执行，并在失败时自动回滚。建议使用 VPS 直连 SSH 或服务商控制台。'
+# 会重启 Xray 的修改都放进临时 systemd 任务：前台只负责输入、预检和结束后的结果核对；
+# 即使 SSH 经过本节点并在重启时断开，后台任务仍会完成验证、提交或回滚。
+run_node_job() {
+    local unit="$1" note="$2" script_path
+    shift 2
+    # 传输切换的恢复任务本身用于处理未完成记录，其余任务须等待恢复完成。
+    if transport_pending && [[ "$1" != __transport-recover ]]; then transport_pending_message; return 3; fi
+    need_command systemd-run
+    script_path="$(readlink -f -- "$SCRIPT_PATH")" || fail '无法找到当前管理脚本。'
+    [[ -f "$script_path" && -r "$script_path" ]] || fail '当前管理脚本不是可读取的普通文件。'
+    warn "$note"
+    say "后台任务：$unit；连接中断后重连，可运行 $(cmd_name) status 查看结果，或用 journalctl -u $unit 查看任务日志。"
+    systemd-run --quiet --wait --collect --unit="$unit" --property="SyslogIdentifier=$unit" \
+        /bin/bash "$script_path" "$@"
+}
+# 用法：run_node_job ... || node_job_failed 任务名 "$?"。状态 3 表示传输切换未完成，提示已显示，原样返回。
+node_job_failed() {
+    [[ "${2:-1}" != 3 ]] || exit 3
+    fail "后台任务未成功完成；任务会在失败时自动恢复原状态，请查看 journalctl -u $1 确认结果。"
+}
+
 transport_command() {
     need_root
     [[ $# -le 1 ]] || fail '用法：transport [status|tcp|xhttp|recover]'
-    local action="${1:-}" current='' script_path unit=vless-reality-transport job=()
+    local action="${1:-}" current='' unit=vless-reality-transport job=()
     if transport_pending && [[ "$action" != recover ]]; then
         transport_pending_message
         if [[ -n "$action" || ! -t 0 ]]; then return 3; fi
@@ -1441,13 +1506,8 @@ transport_command() {
         recover) job=(__transport-recover) ;;
         *) fail '用法：transport [status|tcp|xhttp|recover]' ;;
     esac
-    need_command systemd-run
-    script_path="$(readlink -f -- "$SCRIPT_PATH")" || fail '无法找到当前管理脚本。'
-    [[ -f "$script_path" && -r "$script_path" ]] || fail '当前管理脚本不可读。'
-    warn '切换或恢复运行中的节点可能重启 Xray。请使用 VPS 直连 SSH 或控制台。'
-    say "重连后可用 $(cmd_name) transport status 查看结果，或用 journalctl -u $unit 查看后台任务日志。"
-    systemd-run --quiet --wait --collect --unit="$unit" --property="SyslogIdentifier=$unit" \
-        /bin/bash "$script_path" "${job[@]}" || fail "传输任务失败，请查看 journalctl -u $unit。"
+    run_node_job "$unit" '切换或恢复运行中的节点可能重启 Xray；如果 SSH 经过此节点，连接可能中断。后台任务会继续执行，并在失败时自动恢复。' \
+        "${job[@]}" || fail "传输任务失败，请查看 journalctl -u $unit。"
     if [[ "$action" == recover ]]; then ok '传输恢复任务已结束。'; return 0; fi
     [[ "$(config_transport)" == "$action" ]] || fail '任务已结束，但当前传输已改变，请查看状态。'
     show_node
@@ -1517,7 +1577,7 @@ tfo_node() {
     need_root
     [[ $# -le 1 ]] || fail "用法：$(cmd_name) tfo [on|off]"
     load_metadata
-    local action="${1:-}" script_path unit
+    local action="${1:-}" unit=vless-reality-tfo
     if [[ -z "$action" ]]; then
         if config_tfo_enabled && kernel_tfo_server; then
             say 'TCP Fast Open：已开启'
@@ -1532,16 +1592,7 @@ tfo_node() {
         fi
     fi
     case "$action" in on|off) ;; *) fail "用法：$(cmd_name) tfo [on|off]" ;; esac
-    need_command systemd-run
-    need_command readlink
-    script_path="$(readlink -f -- "$SCRIPT_PATH")" || fail '无法找到当前管理脚本。'
-    [[ -f "$script_path" && -r "$script_path" ]] || fail '当前管理脚本不是可读取的普通文件。'
-    unit='vless-reality-tfo'
-    warn '切换 TFO 将重启 Xray；如果 SSH 经过此节点，连接可能中断。后台任务会继续执行。'
-    say "后台任务：$unit；重连后可运行 $(cmd_name) status 查看结果。"
-    if systemd-run --quiet --wait --collect --unit="$unit" \
-        --property=SyslogIdentifier=vless-reality-tfo \
-        /bin/bash "$script_path" __tfo-apply "$action"; then
+    if run_node_job "$unit" "$NODE_JOB_NOTE" __tfo-apply "$action"; then
         if [[ "$action" == on ]] && config_tfo_enabled && kernel_tfo_server; then
             ok 'TCP Fast Open 已开启。'
         elif [[ "$action" == off ]] && ! config_tfo_enabled && ! tfo_sysctl_is_ours; then
@@ -1563,7 +1614,7 @@ vlessenc_apply() {
     local action="$1" mode="${2:-}" current_mode='' backup was_active=0 old_port="$PORT" server_enc pair=()
     case "$action" in on|off) ;; *) fail '用法：vlessenc on [native|xorpub|random] 或 vlessenc off' ;; esac
     [[ "$action" == on || -z "$mode" ]] || fail '关闭加密时无需指定模式。'
-    server_enc="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG")" \
+    server_enc="$(config_decryption)" \
         || fail '无法读取服务端 VLESS Encryption 状态。'
     current_mode="$(vlessenc_pair_mode "$server_enc" "$CLIENT_ENCRYPTION" || true)"
     if [[ "$action" == on ]]; then
@@ -1610,8 +1661,8 @@ vlessenc_node() {
     need_root
     [[ $# -le 2 ]] || fail "用法：$(cmd_name) vlessenc on [native|xorpub|random] 或 vlessenc off"
     load_metadata
-    local action="${1:-}" mode="${2:-}" current_mode='' answer server_enc script_path unit='vless-reality-enc'
-    server_enc="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG")" \
+    local action="${1:-}" mode="${2:-}" current_mode='' answer server_enc unit='vless-reality-enc'
+    server_enc="$(config_decryption)" \
         || fail '无法读取服务端 VLESS Encryption 状态。'
     current_mode="$(vlessenc_pair_mode "$server_enc" "$CLIENT_ENCRYPTION" || true)"
     if [[ -z "$action" ]]; then
@@ -1642,18 +1693,10 @@ vlessenc_node() {
     elif [[ "$server_enc" == none && "$CLIENT_ENCRYPTION" == none ]]; then
         ok 'VLESS Encryption 已关闭。'; return 0
     fi
-    need_command systemd-run
-    need_command readlink
-    script_path="$(readlink -f -- "$SCRIPT_PATH")" || fail '无法找到当前管理脚本。'
-    [[ -f "$script_path" && -r "$script_path" ]] || fail '当前管理脚本不是可读取的普通文件。'
-    warn '切换 VLESS Encryption 将重启 Xray，旧客户端链接会失效；建议使用 VPS 直连 SSH 或服务商控制台，后台任务会完成修改或回滚。'
-    say "后台任务：$unit；若连接中断，重连后运行 $(cmd_name) status 查看结果。"
-    systemd-run --quiet --wait --collect --unit="$unit" \
-        --property=SyslogIdentifier=vless-reality-enc \
-        /bin/bash "$script_path" __vlessenc-apply "$action" "$mode" \
+    run_node_job "$unit" "切换 VLESS Encryption 后旧客户端链接会失效。$NODE_JOB_NOTE" __vlessenc-apply "$action" "$mode" \
         || fail "VLESS Encryption 后台任务失败；请查看 journalctl -u $unit。"
     load_metadata
-    server_enc="$(jq -r '[.inbounds[] | select(.protocol == "vless") | .settings.decryption][0] // "none"' "$CONFIG")"
+    server_enc="$(config_decryption)"
     if [[ "$action" == on && "$(vlessenc_pair_mode "$server_enc" "$CLIENT_ENCRYPTION" || true)" == "$mode" ]] \
         || [[ "$action" == off && "$server_enc" == none && "$CLIENT_ENCRYPTION" == none ]]; then
         show_node
@@ -1668,7 +1711,7 @@ change_port() {
     [[ $# -le 1 ]] || fail "用法：$(cmd_name) port [新端口]"
     load_metadata
     [[ "$NODE_MODE" != self ]] || fail '自有域名模式固定使用 TCP 443；端口修改只适用于普通模式。'
-    local raw="${1:-}" old_port="$PORT" backup was_active=0
+    local raw="${1:-}" old_port="$PORT"
     if [[ -z "$raw" ]]; then
         [[ -t 0 ]] || fail '非交互运行时请指定新端口。'
         read -r -p "当前端口 $PORT，请输入新端口：" raw || fail '已取消输入。'
@@ -1677,17 +1720,10 @@ change_port() {
     PORT="$((10#$raw))"
     (( PORT != old_port )) || fail '新端口与当前端口相同。'
     port_free "$PORT" || fail "本机 TCP $PORT 已被占用。"
-    if systemctl is-active --quiet xray; then was_active=1; fi
-    backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
-    backup_state "$backup"
-    if ! edit_config --argjson port "$PORT" '(.inbounds[] | select(.protocol == "vless") | .port) = $port' \
-        || ! write_marker; then
-        PORT="$old_port"
-        restore_state "$backup" "$was_active" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
-        rm -rf -- "$backup"
-        fail '修改端口文件失败，已恢复原配置。'
-    fi
-    commit_change "$backup" "$old_port" "端口已改为 TCP $PORT；请放行新端口，确认可用后再关闭旧端口 $old_port。" "$was_active"
+    node_change "$old_port" "端口已改为 TCP $PORT；请放行新端口，确认可用后再关闭旧端口 $old_port。" edit_port_config
+}
+edit_port_config() {
+    edit_config --argjson port "$PORT" '(.inbounds[] | select(.protocol == "vless") | .port) = $port' && write_marker
 }
 
 change_sni() {
@@ -1697,7 +1733,7 @@ change_sni() {
     if [[ "$NODE_MODE" == self ]]; then change_self_domain "$@"; return; fi
     self_operation_lock
     load_metadata
-    local new="${1:-}" old_port="$PORT" old_sni="$SNI" backup was_active=0 auto_sni=0
+    local new="${1:-}" old_port="$PORT" old_sni="$SNI" auto_sni=0
     if [[ -z "$new" ]]; then
         [[ -t 0 ]] || fail '非交互运行时请指定新伪装域名。'
         read -r -p "当前 SNI $SNI，请输入新域名（回车自动优选）：" new || fail '已取消输入。'
@@ -1719,59 +1755,130 @@ change_sni() {
     if (( ! auto_sni )); then
         target_tls_ok "$new" || fail "$new:443 未通过 TLS 1.3 与证书校验。"
     fi
-    if systemctl is-active --quiet xray; then was_active=1; fi
-    backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
-    backup_state "$backup"
     SNI="$new"
-    if ! edit_config --arg sni "$SNI" \
+    node_change "$old_port" "REALITY 伪装域名已改为 $SNI。" edit_sni_config
+}
+edit_sni_config() {
+    edit_config --arg sni "$SNI" \
         '(.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.target) = ($sni + ":443") |
          (.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.serverNames) = [$sni]' \
-        || ! write_marker; then
-        restore_state "$backup" "$was_active" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
-        rm -rf -- "$backup"
-        fail '修改 SNI 文件失败，已恢复原配置。'
-    fi
-    commit_change "$backup" "$old_port" "REALITY 伪装域名已改为 $SNI。" "$was_active"
+        && write_marker
 }
 
 change_uuid() {
     need_root
     self_operation_lock
     load_metadata
-    local new old old_port="$PORT" backup was_active=0
+    local new old
     old="$(config_uuid)" || fail '无法从配置读取旧 UUID。'
-    new="$($XRAY_BIN uuid)"
-    if systemctl is-active --quiet xray; then was_active=1; fi
-    backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
-    backup_state "$backup"
-    edit_config_private \
-        '($credentials | split("\n")) as $secret | (.inbounds[] | select(.protocol == "vless") | .settings.clients[] | select(.id == $secret[1]) | .id) = $secret[0]' "$new" "$old" \
-        || { restore_state "$backup" "$was_active" || fail "恢复失败，备份保留在 $backup。"; fail '写入配置失败。'; }
-    commit_change "$backup" "$old_port" 'UUID 已重新生成，旧链接立即失效。' "$was_active"
+    new="$($XRAY_BIN uuid)" || fail '无法生成新 UUID。'
+    [[ "$new" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ && "$new" != "$old" ]] || fail '生成的 UUID 无效。'
+    node_change "$PORT" 'UUID 已重新生成，旧链接立即失效。' edit_config_private \
+        '($credentials | split("\n")) as $secret | (.inbounds[] | select(.protocol == "vless") | .settings.clients[] | select(.id == $secret[1]) | .id) = $secret[0]' "$new" "$old"
 }
 
 rotate_keys() {
     need_root
     self_operation_lock
     load_metadata
-    local key_lines private old_port="$PORT" backup was_active=0
+    local key_lines
     mapfile -t key_lines < <(generate_reality_keys)
     (( ${#key_lines[@]} == 2 )) || fail 'REALITY 密钥生成失败。'
-    private="${key_lines[0]}"
     PUBLIC_KEY="${key_lines[1]}"
     SHORT_ID="$(openssl rand -hex 8)"
-    if systemctl is-active --quiet xray; then was_active=1; fi
-    backup="$(mktemp -d "$CONFIG_DIR/.change-backup.XXXXXX")"
-    backup_state "$backup"
-    if ! edit_config_private \
+    node_change "$PORT" 'REALITY 密钥和 Short ID 已轮换，旧链接立即失效。' edit_keys_config "${key_lines[0]}"
+}
+edit_keys_config() {
+    edit_config_private \
         '($credentials | split("\n")) as $secret | (.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.privateKey) = $secret[0] |
-         (.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.shortIds) = [$secret[1]]' "$private" "$SHORT_ID" \
-        || ! write_marker; then
-        restore_state "$backup" "$was_active" || fail "恢复旧配置或服务失败，备份保留在 $backup。"
-        rm -rf -- "$backup"
-        fail '修改 REALITY 密钥文件失败，已恢复原配置。'
+         (.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.shortIds) = [$secret[1]]' "$1" "$SHORT_ID" \
+        && write_marker
+}
+
+# 以下前台命令：在当前终端完成输入与预检，再由 run_node_job 在后台提交（含重启和回滚），
+# 结束后按实际配置核对结果。__*-apply 内部命令直接调用上面的事务函数。
+port_node() {
+    need_root
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) port [新端口]"
+    load_metadata
+    [[ "$NODE_MODE" != self ]] || fail '自有域名模式固定使用 TCP 443；端口修改只适用于普通模式。'
+    local raw="${1:-}" port old_port="$PORT" unit=vless-reality-port
+    if [[ -z "$raw" ]]; then
+        [[ -t 0 ]] || fail '非交互运行时请指定新端口。'
+        read -r -p "当前端口 $PORT，请输入新端口：" raw || fail '已取消输入。'
     fi
-    commit_change "$backup" "$old_port" 'REALITY 密钥和 Short ID 已轮换，旧链接立即失效。' "$was_active"
+    valid_port "$raw" || fail '端口必须是 1–65535 的数字。'
+    port="$((10#$raw))"
+    (( port != old_port )) || fail '新端口与当前端口相同。'
+    port_free "$port" || fail "本机 TCP $port 已被占用。"
+    run_node_job "$unit" "$NODE_JOB_NOTE" __port-apply "$port" || node_job_failed "$unit" "$?"
+    load_metadata
+    [[ "$PORT" == "$port" ]] || fail "后台任务已结束，但端口不是 TCP $port；请查看 journalctl -u $unit。"
+    show_node
+    ok "端口已改为 TCP $port；请放行新端口，确认可用后再关闭旧端口 $old_port。"
+}
+sni_node() {
+    need_root
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) sni [新域名|auto]"
+    load_metadata
+    if [[ "$NODE_MODE" == self ]]; then change_self_domain "$@"; return; fi
+    local new="${1:-}" old_sni="$SNI" unit=vless-reality-sni
+    if [[ -z "$new" ]]; then
+        [[ -t 0 ]] || fail '非交互运行时请指定新伪装域名。'
+        read -r -p "当前 SNI $SNI，请输入新域名（回车自动优选）：" new || fail '已取消输入。'
+        new="${new:-auto}"
+    fi
+    new="${new,,}"
+    # 自动优选在前台测速并显示结果，后台任务只提交已选定的域名。
+    if [[ "$new" == auto ]]; then
+        select_fastest_sni || fail '候选域名均不可用，请手动指定伪装域名。'
+        new="$SNI"
+        SNI="$old_sni"
+        if [[ "$new" == "$SNI" ]]; then ok "当前域名 $SNI 已是本次测试的最优选项，无需修改。"; return 0; fi
+    else
+        valid_host "$new" || fail '伪装域名格式不正确。'
+        [[ "$new" != "$SNI" ]] || fail '新域名与当前域名相同。'
+        target_tls_ok "$new" || fail "$new:443 未通过 TLS 1.3 与证书校验。"
+    fi
+    run_node_job "$unit" "$NODE_JOB_NOTE" __sni-apply "$new" || node_job_failed "$unit" "$?"
+    load_metadata
+    [[ "$SNI" == "$new" ]] || fail "后台任务已结束，但伪装域名不是 $new；请查看 journalctl -u $unit。"
+    show_node
+    ok "REALITY 伪装域名已改为 $SNI。"
+}
+uuid_node() {
+    need_root
+    load_metadata
+    local old unit=vless-reality-uuid
+    old="$(config_uuid)" || fail '无法从配置读取当前 UUID。'
+    run_node_job "$unit" "$NODE_JOB_NOTE" __uuid-apply || node_job_failed "$unit" "$?"
+    [[ "$(config_uuid)" != "$old" ]] || fail "后台任务已结束，但 UUID 未改变；请查看 journalctl -u $unit。"
+    show_node
+    ok 'UUID 已重新生成，旧链接立即失效。'
+}
+rotate_keys_node() {
+    need_root
+    load_metadata
+    local old="$PUBLIC_KEY" unit=vless-reality-keys
+    run_node_job "$unit" "$NODE_JOB_NOTE" __keys-apply || node_job_failed "$unit" "$?"
+    load_metadata
+    [[ "$PUBLIC_KEY" != "$old" ]] || fail "后台任务已结束，但 REALITY 密钥未改变；请查看 journalctl -u $unit。"
+    show_node
+    ok 'REALITY 密钥和 Short ID 已轮换，旧链接立即失效。'
+}
+update_node() {
+    need_root
+    load_metadata
+    local before after unit=vless-reality-update
+    before="$(installed_version)"
+    run_node_job "$unit" '升级会替换 Xray 程序并重启服务；如果 SSH 经过此节点，连接可能中断。后台任务会继续执行，失败时自动恢复旧版本。' \
+        __update-apply || node_job_failed "$unit" "$?"
+    after="$(installed_version)"
+    if [[ "$after" != "$before" ]]; then
+        ok "Xray 已从 ${before:-未知版本} 升级到 ${after:-未知版本}。"
+    else
+        ok "Xray 版本未变化：${after:-未知}（已是官方最新稳定版，或高于官方稳定版而未降级）。"
+    fi
 }
 
 rename_node() {
@@ -3380,7 +3487,7 @@ check_self() {
     return 0
 }
 change_self_domain() {
-    local domain="${1:-}" script_path
+    local domain="${1:-}"
     if [[ -z "$domain" ]]; then
         [[ -t 0 ]] || fail '请指定新自有域名；不支持 auto。'
         self_prompt_domain || { say '已取消修改。'; return 0; }
@@ -3390,10 +3497,8 @@ change_self_domain() {
     valid_host "$domain" || fail '新自有域名格式无效；自有域名模式不允许 auto。'
     [[ "$domain" != "$SNI" ]] || { ok '域名未改变。'; return 0; }
     self_dns_precheck "$domain" || fail '新域名预检未通过；原节点保持不变。'
-    script_path="$(readlink -f "$SCRIPT_PATH")" || fail '找不到当前脚本。'
-    warn '即将申请新证书并重启 Xray；请使用 VPS 直连 SSH。成功后须重新导入链接。'
-    systemd-run --quiet --wait --collect --unit=vless-reality-self-change \
-        /bin/bash "$script_path" __self-domain "$domain" || fail '域名修改失败；查看 journalctl -u vless-reality-self-change。'
+    run_node_job vless-reality-self-change "即将申请新证书，成功后须重新导入链接。$NODE_JOB_NOTE" __self-domain "$domain" \
+        || fail '域名修改失败；查看 journalctl -u vless-reality-self-change。'
     show_node
 }
 self_domain_apply() (
@@ -3564,7 +3669,7 @@ fallback_command() {
     need_root; load_metadata
     [[ "$NODE_MODE" == self ]] || fail '此开关仅适用于自有域名模式。'
     [[ $# -le 1 ]] || fail '用法：fallback-limit [status|on|off]'
-    local action="${1:-}" script_path
+    local action="${1:-}"
     if [[ -z "$action" ]]; then
         fallback_status
         [[ -t 0 ]] || return 0
@@ -3577,10 +3682,8 @@ fallback_command() {
         warn '开启后使用随机阈值和速率；普通 HTTPS 网站也属于回落流量。'
         if [[ -t 0 ]]; then confirm '确认开启？[y/N]：' || return 0; fi
     fi
-    script_path="$(readlink -f "$SCRIPT_PATH")" || fail '无法找到管理脚本。'
-    warn '修改会重启 Xray；请使用直连 SSH。临时 systemd 任务会继续验证或回滚。'
-    systemd-run --quiet --wait --collect --unit=vless-reality-fallback \
-        /bin/bash "$script_path" __fallback-apply "$action" || fail '切换失败；查看 journalctl -u vless-reality-fallback。'
+    run_node_job vless-reality-fallback "$NODE_JOB_NOTE" __fallback-apply "$action" \
+        || fail '切换失败；查看 journalctl -u vless-reality-fallback。'
     fallback_status
 }
 # 将前一开发版本的自有域名站点升级到本版本安全模板，不更换 UUID、密钥或证书。
@@ -3887,6 +3990,11 @@ menu_status() {
         warn ' 当前状态：● 节点文件不完整；可选择 26 重试卸载'
         return 0
     fi
+    # 安装记录损坏时 load_metadata 会退出；先在子 shell 中校验，菜单仍可进入卸载等操作。
+    if ! (load_metadata); then
+        warn ' 当前状态：● 安装记录无效（原因见上方）；可选择 26 卸载后重新安装'
+        return 0
+    fi
     local state color label
     state="$(systemctl is-active xray 2>/dev/null || true)"
     case "$state" in
@@ -3954,10 +4062,10 @@ menu_action() {
         1) install_node ;; 2) install_self ;;
         3) show_node ;; 4) status_node ;;
         5) start_node ;; 6) stop_node ;; 7) restart_node ;;
-        8) warn '操作后旧链接立即失效。'; change_uuid ;;
-        9) warn '操作后旧链接立即失效。'; rotate_keys ;;
-        10) change_port ;; 11) rename_node ;; 12) address_node ;; 13) update_xray ;;
-        14) change_sni ;; 15) show_fastest_sni ;; 16) tfo_node ;; 17) vlessenc_node ;;
+        8) warn '操作后旧链接立即失效。'; uuid_node ;;
+        9) warn '操作后旧链接立即失效。'; rotate_keys_node ;;
+        10) port_node ;; 11) rename_node ;; 12) address_node ;; 13) update_node ;;
+        14) sni_node ;; 15) show_fastest_sni ;; 16) tfo_node ;; 17) vlessenc_node ;;
         18) website_status ;; 19) cert_command status ;; 20) cert_command renew-test ;;
         21) check_self ;; 22) security_check ;; 23) fallback_command ;; 24) security_apply ;;
         25) log_node ;; 26) uninstall_node ;; 27) website_random ;; 28) cert_command token ;;
@@ -3968,11 +4076,11 @@ menu_action() {
 # 新交互菜单仅由 menu_action 分派；非交互建议使用 install-self/show/uninstall 等命名命令。
 legacy_numeric_action() {
     case "$1" in
-        1) install_node ;; 2) uninstall_node ;; 3) update_xray ;;
+        1) install_node ;; 2) uninstall_node ;; 3) update_node ;;
         4) start_node ;; 5) stop_node ;; 6) restart_node ;;
-        7) change_port ;; 8) change_sni ;;
-        9) warn '操作后旧链接立即失效。'; change_uuid ;;
-        10) warn '操作后旧链接立即失效。'; rotate_keys ;;
+        7) port_node ;; 8) sni_node ;;
+        9) warn '操作后旧链接立即失效。'; uuid_node ;;
+        10) warn '操作后旧链接立即失效。'; rotate_keys_node ;;
         11) rename_node ;; 12) refresh_ip ;; 13) show_node ;;
         14) status_node ;; 15) log_node ;; 16) show_fastest_sni ;;
         17) tfo_node ;; 19) vlessenc_node ;;
@@ -4027,22 +4135,27 @@ main() {
         transport) shift; transport_command "$@" ;;
         __transport-apply) shift; transport_apply "$@" ;;
         __transport-recover) transport_recover ;;
-        port) shift; change_port "$@" ;;
-        sni) shift; change_sni "$@" ;;
+        port) shift; port_node "$@" ;;
+        __port-apply) shift; change_port "$@" ;;
+        sni) shift; sni_node "$@" ;;
+        __sni-apply) shift; change_sni "$@" ;;
         sni-best) show_fastest_sni ;;
         tfo) shift; tfo_node "$@" ;;
         __tfo-apply) shift; tfo_apply "$@" ;;
         vlessenc) shift; vlessenc_node "$@" ;;
         __vlessenc-apply) shift; vlessenc_apply "$@" ;;
-        uuid) change_uuid ;;
-        rotate-keys) rotate_keys ;;
+        uuid) uuid_node ;;
+        __uuid-apply) change_uuid ;;
+        rotate-keys) rotate_keys_node ;;
+        __keys-apply) rotate_keys ;;
         rename) shift; rename_node "$@" ;;
         refresh-ip) refresh_ip ;;
         start) start_node ;;
         stop) stop_node ;;
         restart) restart_node ;;
         log|logs) shift; log_node "$@" ;;
-        update) update_xray ;;
+        update) update_node ;;
+        __update-apply) update_xray ;;
         uninstall) uninstall_node ;;
         [1-9]|1[0-7]|19|2[0-7])
             need_root
