@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.6.0'
+SCRIPT_VERSION='2.7.0'
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 XRAY_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 XRAY_BIN='/usr/local/bin/xray'
@@ -20,6 +20,8 @@ SERVICE='/etc/systemd/system/xray.service'
 MANAGER='/root/vless-reality-setup.sh'
 SHORTCUT='/usr/local/bin/vless-reality'
 SHORTCUT_TAG='# vless-reality-setup shortcut'
+MANAGER_URL='https://raw.githubusercontent.com/Soulleslie/vless-reality-vision/main/install.sh'
+MANAGER_TAG='VLESS + REALITY + Vision 节点管理脚本'
 LINK_FILE='/root/vless-reality-link.txt'
 TFO_SYSCTL='/etc/sysctl.d/99-vless-reality-tfo.conf'
 TFO_TAG='# vless-reality-setup: TCP Fast Open'
@@ -263,6 +265,10 @@ disable_kernel_tfo() {
     rm -f -- "$TFO_SYSCTL"
 }
 
+normalize_xray_version() {
+    [[ "$1" =~ ^v?([0-9]+[.][0-9]+[.][0-9]+)$ ]] || return 1
+    printf 'v%s' "${BASH_REMATCH[1]}"
+}
 arch_asset() {
     case "$(dpkg --print-architecture 2>/dev/null)" in
         amd64) printf 'Xray-linux-64.zip' ;;
@@ -791,7 +797,7 @@ clean_checker_stage() (
 clean_runtime_residue() (
     local entry owner dir file
     shopt -s nullglob
-    for entry in "${LINK_FILE}".?????? "${XRAY_BIN%/*}"/.xray-update.??????; do
+    for entry in "${LINK_FILE}".?????? "${XRAY_BIN%/*}"/.xray-update.?????? "${MANAGER%/*}"/.vless-reality-setup.??????; do
         [[ -f "$entry" && ! -L "$entry" ]] || continue
         owner="$(stat -c %u -- "$entry")" || return 1
         if [[ "$owner" != "$EUID" ]]; then
@@ -1868,18 +1874,77 @@ rotate_keys_node() {
 }
 update_node() {
     need_root
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) update [版本，如 v26.1.18]"
     load_metadata
-    local before after unit=vless-reality-update
+    local before after target='' unit=vless-reality-update
     before="$(installed_version)"
+    if [[ -n "${1:-}" && "$1" != latest ]]; then
+        target="$(normalize_xray_version "$1")" || fail '版本号格式应为 v26.1.18 或 26.1.18。'
+        if [[ "${target#v}" == "$before" ]]; then ok "当前已是 Xray $before。"; return 0; fi
+        if [[ "$before" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] && dpkg --compare-versions "${target#v}" lt "$before"; then
+            warn "将从 $before 回退到 ${target#v}。替换前会先用目标版本校验当前配置；不兼容（如该版本不支持 XHTTP 或 VLESS Encryption）时不会替换。"
+            if [[ -t 0 ]]; then confirm '确认回退？[y/N]：' || { say '已取消。'; return 0; }; fi
+        fi
+    fi
     run_node_job "$unit" '升级会替换 Xray 程序并重启服务；如果 SSH 经过此节点，连接可能中断。后台任务会继续执行，失败时自动恢复旧版本。' \
-        __update-apply || node_job_failed "$unit" "$?"
+        __update-apply ${target:+"$target"} || node_job_failed "$unit" "$?"
     after="$(installed_version)"
-    if [[ "$after" != "$before" ]]; then
+    if [[ -n "$target" ]]; then
+        [[ "$after" == "${target#v}" ]] || fail "后台任务已结束，但 Xray 版本是 ${after:-未知}，不是 ${target#v}；请查看 journalctl -u $unit。"
+        ok "Xray 已从 ${before:-未知版本} 切换到 $after。"
+    elif [[ "$after" != "$before" ]]; then
         ok "Xray 已从 ${before:-未知版本} 升级到 ${after:-未知版本}。"
     else
         ok "Xray 版本未变化：${after:-未知}（已是官方最新稳定版，或高于官方稳定版而未降级）。"
     fi
 }
+# 菜单入口：回车保持原行为（升级到最新稳定版），也可输入版本号回退。命令行 update 不提示。
+update_menu() {
+    need_root
+    load_metadata
+    local answer
+    say "当前 Xray 版本：$(installed_version || true)"
+    say '可用版本见 https://github.com/XTLS/Xray-core/releases（只接受正式稳定版）。'
+    read -r -p '输入要安装的版本号（如 v26.1.18）；直接回车升级到最新稳定版：' answer || return 0
+    update_node ${answer:+"$answer"}
+}
+
+# 更新管理脚本本身：下载 main 分支脚本，校验后原子替换。不重启 Xray，不修改节点配置或链接。
+# 用重命名替换，正在运行的旧进程继续读取原文件，不受影响。
+script_version_of() {
+    local version
+    version="$(sed -n "s/^SCRIPT_VERSION='\([0-9][0-9]*[.][0-9][0-9]*[.][0-9][0-9]*\)'\$/\1/p" "$1" | sed -n 1p)" || return 1
+    [[ -n "$version" ]] || return 1
+    printf '%s' "$version"
+}
+manager_update() (
+    need_root
+    [[ $# == 0 ]] || fail "用法：$(cmd_name) self-update"
+    need_command curl
+    [[ -f "$MANAGER" && ! -L "$MANAGER" ]] || fail "未找到管理脚本 $MANAGER；请按 README 重新下载。"
+    grep -qF -- "$MANAGER_TAG" "$MANAGER" || fail "$MANAGER 不是本项目的管理脚本，未修改。"
+    # 替换脚本不触碰节点；传输切换未完成时也允许更新，以便取得可能的修复。
+    self_operation_lock allow-transport-pending
+    local tmp current remote
+    current="$(script_version_of "$MANAGER")" || fail '无法读取当前管理脚本的版本号。'
+    tmp="$(mktemp "${MANAGER%/*}/.vless-reality-setup.XXXXXX")" || fail '无法创建临时文件。'
+    trap 'rm -f -- "$tmp"' EXIT
+    say '正在下载 main 分支的管理脚本…'
+    curl -fL --proto '=https' --tlsv1.2 --retry 2 --connect-timeout 10 --max-time 60 -o "$tmp" "$MANAGER_URL" \
+        || fail '下载管理脚本失败；原脚本未修改。'
+    bash -n "$tmp" 2>/dev/null || fail '下载内容未通过语法检查；原脚本未修改。'
+    grep -qF -- "$MANAGER_TAG" "$tmp" || fail '下载内容不是本项目的管理脚本；原脚本未修改。'
+    remote="$(script_version_of "$tmp")" || fail '下载内容缺少有效版本号；原脚本未修改。'
+    if cmp -s -- "$tmp" "$MANAGER"; then ok "管理脚本已是最新：v$current。"; return 0; fi
+    if dpkg --compare-versions "$remote" lt "$current"; then
+        fail "main 分支版本 v$remote 低于当前 v$current（当前脚本可能来自测试分支）；未降级。"
+    fi
+    timeout 20 bash "$tmp" help >/dev/null 2>&1 || fail '新脚本无法正常启动；原脚本未修改。'
+    if ! chmod 700 "$tmp" || ! mv -f -- "$tmp" "$MANAGER"; then fail '替换管理脚本失败；原脚本未修改。'; fi
+    if [[ "$remote" == "$current" ]]; then ok "管理脚本已更新（版本号仍为 v$remote，内容有修订）。"
+    else ok "管理脚本已从 v$current 更新到 v$remote。"; fi
+    say 'Xray 未重启，节点配置、链接和证书均未改变。'
+)
 
 rename_node() {
     need_root
@@ -1996,8 +2061,14 @@ refresh_ip() (
     commit_address_change "$ADDR_MODE" "$ADDR_DOMAIN" "$ip"
 )
 
+# 用法：update_xray [vX.Y.Z]。不带参数升级到最新稳定版（不降级）；指定版本时切换到该稳定版，允许回退。
 update_xray() {
     need_root
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) update [版本，如 v26.1.18]"
+    local selector=latest
+    if [[ -n "${1:-}" && "$1" != latest ]]; then
+        selector="$(normalize_xray_version "$1")" || fail '版本号格式应为 v26.1.18 或 26.1.18。'
+    fi
     self_operation_lock
     load_metadata
     ensure_dependencies
@@ -2008,17 +2079,17 @@ update_xray() {
     trap '[[ -z "$TEMP_BIN" ]] || rm -f -- "$TEMP_BIN"; [[ -z "$TEMP_DIR" ]] || rm -rf -- "$TEMP_DIR"' EXIT
     asset="$(arch_asset)"
     archive="$TEMP_DIR/xray.zip"
-    fetch_release_metadata latest "$asset"
+    fetch_release_metadata "$selector" "$asset"
     if [[ "$current" == "$RELEASE_VERSION" ]]; then
-        ok "当前已是官方最新稳定版：$current"
+        if [[ "$selector" == latest ]]; then ok "当前已是官方最新稳定版：$current"; else ok "当前已是 Xray $current。"; fi
         return 0
     fi
-    if [[ "$current" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] \
+    if [[ "$selector" == latest && "$current" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] \
         && dpkg --compare-versions "$current" gt "$RELEASE_VERSION"; then
         warn "当前版本 $current 高于官方最新稳定版 ${RELEASE_VERSION}，未执行降级。"
         return 0
     fi
-    say "准备从 ${current:-未知} 升级到 ${RELEASE_VERSION}…"
+    say "准备从 ${current:-未知} 切换到 ${RELEASE_VERSION}…"
     download_verified_release "$archive"
     unzip -q "$archive" xray -d "$TEMP_DIR"
     candidate="$TEMP_DIR/xray"
@@ -3978,7 +4049,8 @@ VLESS + REALITY + Vision 节点管理脚本 v${SCRIPT_VERSION}
   refresh-ip                   刷新公网 IPv4 缓存和链接，保持 IP/域名选择
   start|stop|restart           管理服务
   log [-f|行数]                查看日志
-  update                       升级 Xray-core
+  update [版本]                升级 Xray-core 到最新稳定版，或切换到指定稳定版（可回退）
+  self-update                  更新本管理脚本（不重启 Xray、不改节点）
   uninstall                    卸载并清理
 EOF
 }
@@ -4052,6 +4124,7 @@ show_menu() {
     say ' 27. 更换自有域名随机网页（节点信息不变）'
     say ' 28. 更换 Cloudflare API Token（验证证书续期）'
     say ' 29. 切换节点传输（TCP + Vision / XHTTP）'
+    say ' 30. 更新管理脚本（节点不变）'
     say ' 00. 退出'
     say '=================================='
     menu_status
@@ -4064,12 +4137,12 @@ menu_action() {
         5) start_node ;; 6) stop_node ;; 7) restart_node ;;
         8) warn '操作后旧链接立即失效。'; uuid_node ;;
         9) warn '操作后旧链接立即失效。'; rotate_keys_node ;;
-        10) port_node ;; 11) rename_node ;; 12) address_node ;; 13) update_node ;;
+        10) port_node ;; 11) rename_node ;; 12) address_node ;; 13) update_menu ;;
         14) sni_node ;; 15) show_fastest_sni ;; 16) tfo_node ;; 17) vlessenc_node ;;
         18) website_status ;; 19) cert_command status ;; 20) cert_command renew-test ;;
         21) check_self ;; 22) security_check ;; 23) fallback_command ;; 24) security_apply ;;
         25) log_node ;; 26) uninstall_node ;; 27) website_random ;; 28) cert_command token ;;
-        29) transport_command ;; *) return 2 ;;
+        29) transport_command ;; 30) manager_update ;; *) return 2 ;;
     esac
 }
 # 命令行历史数字参数保留原语义，避免旧自动化把卸载误解为安装等操作。
@@ -4092,17 +4165,23 @@ interactive_menu() {
     if [[ ! -t 0 ]]; then print_help; return 0; fi
     need_root
     if [[ -f "$MARKER" ]]; then ensure_shortcut quiet || true; fi
-    local choice rc
+    local choice rc manager_before
     while true; do
         show_menu
-        read -r -p '请输入数字 [1-29，00 退出]：' choice || { say; return 0; }
-        case "$choice" in 00|q|Q) return 0 ;; [1-9]|[12][0-9]) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
+        read -r -p '请输入数字 [1-30，00 退出]：' choice || { say; return 0; }
+        case "$choice" in 00|q|Q) return 0 ;; [1-9]|[12][0-9]|30) ;; *) warn '请输入菜单中的数字。'; sleep 1; continue ;; esac
         say
+        manager_before="$(stat -c %i -- "$MANAGER" 2>/dev/null || true)"
         set +e
         ( set -e; menu_action "$choice" )
         rc=$?
         set -e
         [[ "$choice" == 26 && ! -f "$MANAGER" ]] && return 0
+        # 本菜单进程仍运行旧代码；管理脚本被替换后退出，提示重新进入新版菜单。
+        if [[ "$choice" == 30 && "$manager_before" != "$(stat -c %i -- "$MANAGER" 2>/dev/null || true)" ]]; then
+            say; ok "请重新运行 $(cmd_name) 进入新版菜单。"
+            return 0
+        fi
         (( rc == 0 )) || say
         say
         read -r -p '* 按回车返回主菜单 *' || return 0
@@ -4154,8 +4233,9 @@ main() {
         stop) stop_node ;;
         restart) restart_node ;;
         log|logs) shift; log_node "$@" ;;
-        update) update_node ;;
-        __update-apply) update_xray ;;
+        update) shift; update_node "$@" ;;
+        __update-apply) shift; update_xray "$@" ;;
+        self-update) shift; manager_update "$@" ;;
         uninstall) uninstall_node ;;
         [1-9]|1[0-7]|19|2[0-7])
             need_root

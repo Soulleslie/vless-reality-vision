@@ -105,6 +105,25 @@ update_xray() { printf '26.2.0' > "$TEST_DIR/version"; }
 [[ "$(update_node 2>&1)" == *'Xray 已从 26.1.1 升级到 26.2.0'* && "$(< "$JOB_LOG")" == 'vless-reality-update __update-apply' ]]
 update_xray() { :; }
 [[ "$(update_node 2>&1)" == *'Xray 版本未变化：26.2.0'* ]]
+# 指定版本：可回退；版本号带或不带 v 均可，后台任务只接收规范化后的 vX.Y.Z。
+update_xray() { [[ $# == 1 && "$1" == v* ]] && printf '%s' "${1#v}" > "$TEST_DIR/version"; }
+: > "$JOB_LOG"
+output="$(update_node 26.1.1 2>&1)"
+[[ "$(< "$JOB_LOG")" == 'vless-reality-update __update-apply v26.1.1' && "$(< "$TEST_DIR/version")" == 26.1.1 ]]
+[[ "$output" == *'将从 26.2.0 回退到 26.1.1'* && "$output" == *'Xray 已从 26.2.0 切换到 26.1.1'* ]]
+: > "$JOB_LOG"
+[[ "$(update_node v26.3.0 2>&1)" == *'Xray 已从 26.1.1 切换到 26.3.0'* && "$(< "$JOB_LOG")" == 'vless-reality-update __update-apply v26.3.0' ]]
+# 目标即当前版本、格式错误：不启动后台任务。
+: > "$JOB_LOG"
+[[ "$(update_node v26.3.0 2>&1)" == *'当前已是 Xray 26.3.0'* ]]
+for bad in 26.3 v26.3.0-beta latest2 ../26.1.1; do
+    if (update_node "$bad" >/dev/null 2>&1); then echo "应拒绝版本号 $bad"; exit 1; fi
+done
+[[ ! -s "$JOB_LOG" ]]
+# 后台任务结束但版本不是目标版本：不能报告成功。
+update_xray() { :; }
+output="$( (update_node v26.4.0) 2>&1 )" && exit 1
+[[ "$output" == *'不是 26.4.0'* && "$output" != *'切换到'* ]]
 
 # 传输切换未完成时拒绝启动其他后台任务，只允许恢复任务。
 fixture

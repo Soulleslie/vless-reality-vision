@@ -26,9 +26,9 @@ case "${1:-}" in
         interactive_menu; exit 0 ;;
 esac
 
-# 保持旧 1..28 的操作，新增 29；显示不能重复或乱序。
+# 保持旧 1..29 的操作，新增 30；显示不能重复或乱序。
 numbers="$(show_menu | awk '/^[[:space:]]+[0-9]+\./ {number=$1; sub(/\.$/, "", number); print number}')"
-[[ "$numbers" == "$(printf '%s\n' {1..29} 00)" ]]
+[[ "$numbers" == "$(printf '%s\n' {1..30} 00)" ]]
 
 # 安装与卸载不允许因为重排而反向分派；命令行旧数字仍保持旧语义。
 install_self() { say install-self; }; uninstall_node() { say uninstall; }
@@ -51,14 +51,16 @@ rc=0; (main 28 >/dev/null 2>&1) || rc=$?; [[ "$rc" == 2 ]]
 rc=0; (main 29 >/dev/null 2>&1) || rc=$?; [[ "$rc" == 2 ]]
 [[ "$(main install-self)" == install-self && "$(main show)" == show ]]
 rc=0; (main 18 >/dev/null 2>&1) || rc=$?; [[ "$rc" == 2 ]]
-rc=0; menu_action 30 || rc=$?; [[ "$rc" == 2 ]]
+manager_update() { say self-update; }; update_menu() { say update-menu; }
+[[ "$(menu_action 30)" == self-update && "$(main self-update)" == self-update && "$(menu_action 13)" == update-menu ]]
+rc=0; menu_action 31 || rc=$?; [[ "$rc" == 2 ]]
 
 # 真实终端输入：新 2 返回菜单，新 26 在成功删除管理入口后直接退出。
 printf -v child_command 'bash %q --child-install' "$ROOT/tests/menu.bash"
-output="$(printf '30\n2\n\n00\n' | TERM=xterm-256color script -q -e -c "$child_command" /dev/null)"
+output="$(printf '31\n2\n\n00\n' | TERM=xterm-256color script -q -e -c "$child_command" /dev/null)"
 [[ "$output" == *'请输入菜单中的数字。'* && "$output" == *'TEST: install-self'* ]]
 [[ "$output" == *'1. 安装普通 REALITY'*'1. 安装普通 REALITY'* ]]
-[[ "$output" == *'请输入数字 [1-29，00 退出]'* ]]
+[[ "$output" == *'请输入数字 [1-30，00 退出]'* ]]
 [[ "$output" != *$'\033[3J'* ]] # 保留滚动历史，不能清除刚才的安装错误。
 printf -v child_command 'bash %q --child-uninstall' "$ROOT/tests/menu.bash"
 output="$(printf '26\n' | script -q -e -c "$child_command" /dev/null)"
